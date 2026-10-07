@@ -128,7 +128,7 @@ jobs:
           cache-dependency-path: docs/requirements.txt
       - name: Install documentation dependencies
         run: python -m pip install -r docs/requirements.txt
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version-file: docs/.nvmrc
           cache: npm
