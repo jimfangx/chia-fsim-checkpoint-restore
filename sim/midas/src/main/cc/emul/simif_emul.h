@@ -120,6 +120,11 @@ public:
   // Pointers to inter-context QSFP communication channels
   std::vector<std::unique_ptr<qsfp_t>> qsfp;
 
+  // Enumerate the audited AXI component owners with stable configuration-order
+  // identities. This is a subset of runtime state: harness/PRNG/thread/driver/
+  // scheduler/stream-engine/QSFP owners and a coherent freeze remain required.
+  std::vector<std::pair<std::string, checkpoint_owner_t *>> checkpoint_axi_owners();
+
   /**
    * Return the wrapper around the CPU-managed stream AXI interface.
    */

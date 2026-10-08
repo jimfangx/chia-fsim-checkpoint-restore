@@ -4,14 +4,14 @@
 #define __MMIO_H
 
 #include "core/config.h"
+#include "core/checkpoint.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <queue>
+#include <utility>
 #include <vector>
-
-#include "core/config.h"
 
 struct mmio_req_addr_t {
   size_t id;
@@ -24,21 +24,21 @@ struct mmio_req_addr_t {
 };
 
 struct mmio_req_data_t {
-  char *data;
+  std::vector<char> data;
   size_t strb;
   bool last;
 
-  mmio_req_data_t(char *data_, size_t strb_, bool last_)
-      : data(data_), strb(strb_), last(last_) {}
+  mmio_req_data_t(std::vector<char> data_, size_t strb_, bool last_)
+      : data(std::move(data_)), strb(strb_), last(last_) {}
 };
 
 struct mmio_resp_data_t {
   size_t id;
-  char *data;
+  std::vector<char> data;
   bool last;
 
-  mmio_resp_data_t(size_t id_, char *data_, bool last_)
-      : id(id_), data(data_), last(last_) {}
+  mmio_resp_data_t(size_t id_, std::vector<char> data_, bool last_)
+      : id(id_), data(std::move(data_)), last(last_) {}
 };
 
 /**
@@ -50,7 +50,7 @@ struct mmio_resp_data_t {
  *  Used for CPU-mastered AXI4 (aka, DMA), and MMIO requests (see simif_t::read,
  *  simif_t::write).
  */
-class mmio_t final {
+class mmio_t final : public checkpoint_owner_t {
 public:
   mmio_t(const AXI4Config &conf)
       : conf(conf), read_inflight(false), write_inflight(false) {
@@ -58,6 +58,13 @@ public:
   }
 
   ~mmio_t() = default;
+
+  // Component payload only. Both execution contexts must be frozen by the
+  // future runtime coordinator; this does not serialize driver call stacks.
+  std::string checkpoint_schema() const override { return "firesim.mmio.full.v1"; }
+  std::vector<uint8_t> save_checkpoint() const override;
+  void validate_checkpoint(const std::vector<uint8_t> &) const override;
+  void load_checkpoint(const std::vector<uint8_t> &) override;
 
   bool aw_valid() { return !aw.empty() && !write_inflight; }
   size_t aw_id() { return aw_valid() ? aw.front().id : 0; }
@@ -74,7 +81,7 @@ public:
   bool w_valid() { return !w.empty(); }
   size_t w_strb() { return w_valid() ? w.front().strb : 0; }
   bool w_last() { return w_valid() ? w.front().last : false; }
-  void *w_data() { return w_valid() ? w.front().data : &dummy_data[0]; }
+  void *w_data() { return w_valid() ? w.front().data.data() : dummy_data.data(); }
 
   bool r_ready() { return read_inflight; }
   bool b_ready() { return write_inflight; }

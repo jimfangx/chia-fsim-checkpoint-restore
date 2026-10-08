@@ -149,6 +149,19 @@ simif_emul_t::simif_emul_t(const TargetConfig &config,
 
 simif_emul_t::~simif_emul_t() {}
 
+std::vector<std::pair<std::string, checkpoint_owner_t *>>
+simif_emul_t::checkpoint_axi_owners() {
+  std::vector<std::pair<std::string, checkpoint_owner_t *>> owners{
+      {"runtime/mmio", master.get()}};
+  for (size_t i = 0; i < slave.size(); ++i)
+    owners.emplace_back("runtime/functional-memory/" + std::to_string(i), slave[i].get());
+  if (cpu_managed_stream_io)
+    owners.emplace_back("runtime/cpu-managed-axi4", &cpu_managed_stream_io->cpu_managed_axi4);
+  if (fpga_managed_stream_io)
+    owners.emplace_back("runtime/fpga-managed-memory", &fpga_managed_stream_io->cpu_mem);
+  return owners;
+}
+
 void simif_emul_t::start_driver(simulation_t &sim) {
   // Set up the simulation thread.
   finished = false;
