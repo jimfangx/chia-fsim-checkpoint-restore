@@ -98,11 +98,27 @@ object SimulatorStateInventory {
                 add(s"$path.${r.name}", name, "register", r.tpe, 1,
                   r.clock.serialize, r.reset.serialize, "firrtl-register-v1")
               case mem: DefMemory =>
-                // Implicit emitter pipelines must have become explicit registers by this boundary.
-                if (mem.readLatency != 0 || mem.writeLatency != 1 || mem.readwriters.nonEmpty)
+                // PassthroughSimpleSyncReadMems leaves simple synchronous ports
+                // for VerilogEmitter to implement. Inventory its stored address
+                // (new/undefined reads) or data (old reads and readwriters),
+                // using the emitter's own field types and lowered names. Do not
+                // lower the memory again: that changes its emitted state layout.
+                if (mem.readLatency > 1 || mem.readLatency < 0 || mem.writeLatency != 1 ||
+                    (mem.readwriters.nonEmpty &&
+                      (mem.readLatency != 1 || mem.readUnderWrite == ReadUnderWrite.New)))
                   fail(s"hidden memory pipeline at $path.${mem.name}")
                 add(s"$path.${mem.name}", name, "memory", mem.dataType, mem.depth,
                   "memory-port-clocks", "none", "firrtl-memory-v1")
+                def pipeline(port: String, field: String): Unit = {
+                  val ref = firrtl.passes.MemPortUtils.memPortField(mem, port, field)
+                  val emittedName = firrtl.passes.LowerTypes.loweredName(ref)
+                  add(s"$path.$emittedName", name, "register", ref.tpe, 1,
+                    s"${mem.name}.$port.clk", "none", "firrtl-emitter-memory-pipeline-v1")
+                }
+                if (mem.readLatency == 1) {
+                  mem.readers.foreach(r => pipeline(r, if (mem.readUnderWrite == ReadUnderWrite.Old) "data" else "addr"))
+                  mem.readwriters.foreach(rw => pipeline(rw, "rdata"))
+                }
               case i: WDefInstance => walk(i.module, s"$path.${i.name}", ancestors + name)
               case i: WDefInstanceConnector => walk(i.module, s"$path.${i.name}", ancestors + name)
               case _: CDefMemory | _: CDefMPort | _: Conditionally => fail(s"non-lowered state at $path")

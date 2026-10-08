@@ -54,7 +54,7 @@ class SimulatorStateInventorySpec extends AnyFlatSpec {
 
   it should "inventory synchronous memory pipeline registers introduced by emitter prerequisites" in {
     val src = source.replace("read-latency => 0", "read-latency => 1")
-    intercept[IllegalArgumentException](SimulatorStateInventory.discover(lower(src)))
+    assert(entries(lower(src)).exists(e => (e \ "adapter") == JString("firrtl-emitter-memory-pipeline-v1")))
     val state = emitted(src)
     sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { dir =>
       java.nio.file.Files.write(java.nio.file.Paths.get(dir, "simulator-pipeline-reference.fir"),
@@ -64,6 +64,64 @@ class SimulatorStateInventorySpec extends AnyFlatSpec {
     assert(es.exists(e => (e \ "hierarchy").values.toString.contains("pipe")))
     assert(es.count(e => (e \ "kind") == JString("memory")) == 1)
     assert((es.find(e => (e \ "kind") == JString("memory")).get \ "depth") == JInt(8))
+  }
+
+  it should "account exactly for emitter passthrough read and readwrite storage" in {
+    for ((port, policy) <- Seq(("reader", "old"), ("reader", "new"), ("reader", "undefined"),
+                              ("readwriter", "old"), ("readwriter", "undefined"))) {
+      val readwrite = port == "readwriter"
+      val src = s"""circuit Top :
+  module Top :
+    input clock : Clock
+    input enable : UInt<1>
+    input address : UInt<3>
+    input data : UInt<9>
+    input write : UInt<1>
+    output result : UInt<9>
+    mem ram :
+      data-type => UInt<9>
+      depth => 5
+      read-latency => 1
+      write-latency => 1
+      $port => p
+      ${if (readwrite) "" else "writer => w"}
+      read-under-write => $policy
+    ram.p.clk <= clock
+    ram.p.en <= enable
+    ram.p.addr <= address
+    ${if (readwrite) "ram.p.wmode <= write\n    ram.p.wmask <= UInt<1>(1)\n    ram.p.wdata <= data"
+      else "ram.w.clk <= clock\n    ram.w.en <= write\n    ram.w.addr <= address\n    ram.w.mask <= UInt<1>(1)\n    ram.w.data <= data"}
+    result <= ram.p.${if (readwrite) "rdata" else "data"}
+"""
+      val initial = lower(src).copy(annotations = Seq(
+        firrtl.passes.memlib.PassthroughSimpleSyncReadMemsAnnotation,
+        firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter]),
+      ))
+      val emittedState = new Compiler(Seq(Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm).execute(initial)
+      val state = new firrtl.SystemVerilogEmitter().transforms.foldLeft(emittedState) {
+        case (s, transform) => transform.runTransform(s)
+      }
+      val es = entries(state)
+      val field = if (readwrite) "rdata" else if (policy == "old") "data" else "addr"
+      assert(es.size == 2)
+      val pipeline = es.find(e => (e \ "hierarchy") == JString(s"Top.ram_p_$field")).get
+      assert((pipeline \ "width") == JInt(if (field == "addr") 3 else 9))
+      assert((pipeline \ "adapter") == JString("firrtl-emitter-memory-pipeline-v1"))
+      sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { dir =>
+        val base = java.nio.file.Paths.get(dir, s"passthrough-$port-$policy")
+        def save(suffix: String, text: String): Unit = java.nio.file.Files.write(
+          java.nio.file.Paths.get(base.toString + suffix), text.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+        save(".fir", state.circuit.serialize)
+        save(".json", SimulatorStateInventory.discover(state))
+        save(".sv", emittedState.annotations.collectFirst {
+          case firrtl.EmittedVerilogCircuitAnnotation(v) => v.value
+        }.get)
+      }
+    }
+    val complex = lower(source.replace("read-latency => 0", "read-latency => 2"))
+    intercept[IllegalArgumentException](SimulatorStateInventory.discover(complex))
+    intercept[IllegalArgumentException](SimulatorStateInventory.discover(
+      lower(source.replace("write-latency => 1", "write-latency => 2"))))
   }
 
   it should "reject opaque state and altered clock-gate implementations instead of guessing by name" in {
