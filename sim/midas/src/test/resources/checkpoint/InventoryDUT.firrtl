@@ -1,0 +1,85 @@
+circuit Harness :
+  module Leaf :
+    input clock : Clock
+    input reset : UInt<1>
+    input data : UInt<9>
+    output value : UInt<9>
+    reg saved : UInt<9>, clock with :
+      reset => (reset, UInt<9>(0))
+    saved <= data
+    value <= saved
+
+  module InventoryDUT :
+    input clock : Clock
+    input reset : UInt<1>
+    input data : UInt<9>
+    input addr : UInt<3>
+    input wen : UInt<1>
+    output count : UInt<9>
+    output phase : UInt<2>
+    output array0 : UInt<9>
+    output array1 : UInt<9>
+    output array2 : UInt<9>
+    output left : UInt<9>
+    output right : UInt<9>
+    output ram : UInt<9>
+    reg counter : UInt<9>, clock with :
+      reset => (reset, UInt<9>(0))
+    reg fsm : UInt<2>, clock with :
+      reset => (reset, UInt<2>(0))
+    reg bank : UInt<9>[3], clock with :
+      reset => (reset, bank)
+    counter <= add(counter, UInt<1>(1))
+    fsm <= mux(eq(fsm, UInt<2>(2)), UInt<2>(0), add(fsm, UInt<1>(1)))
+    bank[0] <= data
+    bank[1] <= add(data, UInt<1>(1))
+    bank[2] <= add(data, UInt<2>(2))
+    mem sram :
+      data-type => UInt<9>
+      depth => 8
+      reader => r
+      writer => w
+      read-latency => 0
+      write-latency => 1
+      read-under-write => undefined
+    sram.r.clk <= clock
+    sram.r.en <= UInt<1>(1)
+    sram.r.addr <= addr
+    sram.w.clk <= clock
+    sram.w.en <= wen
+    sram.w.addr <= addr
+    sram.w.data <= data
+    sram.w.mask <= UInt<1>(1)
+    inst a of Leaf
+    inst b of Leaf
+    a.clock <= clock
+    a.reset <= reset
+    a.data <= data
+    b.clock <= clock
+    b.reset <= reset
+    b.data <= add(data, UInt<1>(1))
+    count <= counter
+    phase <= fsm
+    array0 <= bank[0]
+    array1 <= bank[1]
+    array2 <= bank[2]
+    left <= a.value
+    right <= b.value
+    ram <= sram.r.data
+
+  module Harness :
+    input clock : Clock
+    input reset : UInt<1>
+    input data : UInt<9>
+    input addr : UInt<3>
+    input wen : UInt<1>
+    output result : UInt<9>
+    reg harnessOnly : UInt<1>, clock
+    harnessOnly <= not(harnessOnly)
+    inst dut of InventoryDUT
+    dut.clock <= clock
+    dut.reset <= reset
+    dut.data <= data
+    dut.addr <= addr
+    dut.wen <= wen
+    result <= dut.ram

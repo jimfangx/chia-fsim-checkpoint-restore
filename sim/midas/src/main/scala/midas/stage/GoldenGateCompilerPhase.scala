@@ -47,7 +47,10 @@ class GoldenGateCompilerPhase extends Phase {
     )
     logger.info("Pre-GG Target Transformation Ordering\n")
     logger.info(targetLoweringCompiler.prettyPrint("  "))
-    val loweredTarget          = targetLoweringCompiler.execute(state)
+    // The dependency-based Compiler does not update the legacy CircuitState.form field.
+    val loweredTarget = midas.checkpoint.SemanticStateInventory(
+      targetLoweringCompiler.execute(state).copy(form = firrtl.LowForm)
+    )
 
     // Run Golden Gate transformations, introducing host-decoupling and generating additional simulator RTL
     val simulator =
