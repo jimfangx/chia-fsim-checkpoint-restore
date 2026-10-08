@@ -75,6 +75,33 @@ class SemanticStateInventorySpec extends AnyFlatSpec {
     intercept[IllegalArgumentException](SemanticStateInventory.discover(s.copy(form = ChirrtlForm), "Harness.dut"))
   }
 
+  it should "reject incomplete, reordered, reshaped or ambiguous banked bindings before emission" in {
+    val s = lower(source)
+    val root = SemanticCheckpointRootAnnotation("Harness.dut")
+    val bindings = entries(manifest()).zipWithIndex.map { case (e, slot) =>
+      StateAccessEntry((e \ "state_id").values.toString, 0, slot,
+        (e \ "width").asInstanceOf[JInt].num.toInt, (e \ "depth").asInstanceOf[JInt].num.toInt)
+    }
+    def bind(es: Seq[StateAccessEntry], path: String = "Harness.dut") =
+      s.copy(annotations = Seq(root, SemanticBankedAccessAnnotation(path, es)))
+    val result = SemanticStateInventory(bind(bindings))
+    val sidecar = result.annotations.collectFirst {
+      case a: GoldenGateOutputFileAnnotation if a.fileSuffix == ".semantic-access.json" => parse(a.body)
+    }.get
+    assert((sidecar \ "state_manifest_sha256") == JString(SemanticStateInventory.sha256(manifest())))
+    assert((sidecar \ "state").asInstanceOf[JArray].arr.size == 8)
+    Seq(bindings.dropRight(1), bindings.reverse, bindings :+ bindings.head,
+      bindings.updated(0, bindings.head.copy(width = 8)),
+      bindings.updated(1, bindings(1).copy(slot = bindings.head.slot))).foreach { es =>
+      intercept[IllegalArgumentException](SemanticStateInventory(bind(es)))
+    }
+    intercept[IllegalArgumentException](SemanticStateInventory(bind(bindings, "Harness.other")))
+    intercept[IllegalArgumentException](SemanticStateInventory(s.copy(annotations =
+      Seq(SemanticBankedAccessAnnotation("Harness.dut", bindings)))))
+    intercept[IllegalArgumentException](bindings.head.copy(width = 65))
+    intercept[IllegalArgumentException](bindings.head.copy(depth = 0))
+  }
+
   it should "resolve memory clock validity guarded by that port's enable without accepting conditional clocks" in {
     val guarded = source.replace("sram.w.clk <= clock", "sram.w.clk <= validif(wen, clock)")
     assert(entries(manifest(guarded)) == entries(manifest()))

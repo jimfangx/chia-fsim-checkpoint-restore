@@ -11,7 +11,7 @@ import firrtl.annotations.NoTargetAnnotation
 import firrtl.options.{HasShellOptions, ShellOption, Unserializable}
 import midas.stage.GoldenGateOutputFileAnnotation
 import org.json4s._
-import org.json4s.native.JsonMethods.{compact, render}
+import org.json4s.native.JsonMethods.{compact, parse, render}
 import firrtl.options.Dependency
 import firrtl.stage.Forms
 import firrtl.stage.transforms.Compiler
@@ -209,10 +209,34 @@ object SemanticStateInventory {
 
   def apply(state: CircuitState): CircuitState = {
     val roots = state.annotations.collect { case SemanticCheckpointRootAnnotation(path) => path }
-    if (roots.isEmpty) state
+    val access = state.annotations.collect { case a: SemanticBankedAccessAnnotation => a }
+    if (roots.isEmpty) {
+      if (access.nonEmpty) fail("banked access requires an explicit semantic inventory root")
+      state
+    }
     else {
       if (roots.size != 1) fail("exactly one explicit DUT root is required")
       val manifest = discover(state, roots.head)
+      val accessFiles = if (access.isEmpty) Seq.empty else {
+        if (access.size != 1 || access.head.root != roots.head) fail("banked binding root/count mismatch")
+        val binding = access.head.entries
+        val entries = (parse(manifest) \ "state").asInstanceOf[JArray].arr
+        val expected = entries.map(e => ((e \ "state_id").values.toString,
+          (e \ "width").asInstanceOf[JInt].num.toInt, (e \ "depth").asInstanceOf[JInt].num.toInt))
+        if (binding.map(e => (e.stateID, e.width, e.depth)) != expected)
+          fail("banked binding omits, adds, reorders, or reshapes semantic state")
+        if (binding.map(e => (e.bank, e.slot)).distinct.size != binding.size)
+          fail("duplicate banked client slot")
+        val body = canonical(JObject(List(
+          "access_version" -> JInt(1), "protocol" -> JString("banked64-v1"),
+          "dut_root" -> JString(roots.head), "state_manifest_sha256" -> JString(sha256(manifest)),
+          "state" -> JArray(binding.map(e => JObject(List(
+            "state_id" -> JString(e.stateID), "bank" -> JInt(e.bank), "slot" -> JInt(e.slot),
+            "width" -> JInt(e.width), "depth" -> JInt(e.depth),
+          ))).toList),
+        )))
+        Seq(GoldenGateOutputFileAnnotation(body, ".semantic-access.json"))
+      }
       // Emit a DUT-only ordinary RTL reference from this exact pre-FAME IR.
       // No bridges, host clocks, or simulator state participate in its build.
       val modules = state.circuit.modules.map(m => m.name -> m).toMap
@@ -253,7 +277,7 @@ object SemanticStateInventory {
             "direction" -> JString(if (port.direction == Input) "input" else "output")))
         }.toList),
       )))
-      state.copy(annotations = state.annotations ++ Seq(
+      state.copy(annotations = state.annotations ++ accessFiles ++ Seq(
         GoldenGateOutputFileAnnotation(manifest, ".semantic-state.json"),
         GoldenGateOutputFileAnnotation(state.circuit.serialize, ".semantic-reference.fir"),
         GoldenGateOutputFileAnnotation(clean, ".semantic-clean.sv"),
