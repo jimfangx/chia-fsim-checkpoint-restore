@@ -10,10 +10,12 @@ public:
     poke("io_addr", 0);
     poke("io_wen", 0);
     target_reset();
-    expect("io_count", 0);
-    expect("io_phase", 0);
-    expect("io_left", 0);
-    expect("io_right", 0);
+    // A literal zero can select expect(bool, const char *) via null-pointer
+    // conversion. An explicit signal type selects the value-checking overload.
+    expect(std::string_view{"io_count"}, 0);
+    expect(std::string_view{"io_phase"}, 0);
+    expect(std::string_view{"io_left"}, 0);
+    expect(std::string_view{"io_right"}, 0);
 
     // Every step advances one target cycle, irrespective of host/model stalls.
     for (uint32_t i = 0; i < 8; ++i) {
