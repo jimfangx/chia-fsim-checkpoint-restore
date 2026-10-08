@@ -11,18 +11,22 @@ header := $(GENERATED_DIR)/$(BASE_FILE_NAME).const.h
 simulator_verilog := $(GENERATED_DIR)/$(BASE_FILE_NAME).sv
 simulator_xdc := $(GENERATED_DIR)/$(BASE_FILE_NAME).synthesis.xdc
 
+# Request the inventory outputs as well, so enabling discovery also rebuilds
+# an existing simulator generated without discovery.
+semantic_outputs := $(if $(SEMANTIC_CHECKPOINT_ROOT),$(addprefix $(GENERATED_DIR)/$(BASE_FILE_NAME),.semantic-state.json .semantic-reference.fir),)
+
 # Pre-simulation-mapping annotations which includes all Bridge Annotations
 # extracted used to generate new runtime configurations.
 fame_annos := $(GENERATED_DIR)/post-bridge-extraction.json
 
 .PHONY: verilog compile
-verilog: $(simulator_verilog)
-compile: $(simulator_verilog)
+verilog: $(simulator_verilog) $(semantic_outputs)
+compile: $(simulator_verilog) $(semantic_outputs)
 
 # Disable FIRRTL 1.4 deduplication because it creates multiple failures
 # Run the 1.3 version instead (checked-in). If dedup must be completely disabled,
 # pass --no-legacy-dedup as well
-$(simulator_verilog) $(simulator_xdc) $(header) $(fame_annos) &: $(FIRRTL_FILE) $(ANNO_FILE) $(FIRESIM_MAIN_CP)
+$(simulator_verilog) $(simulator_xdc) $(header) $(fame_annos) $(semantic_outputs) &: $(FIRRTL_FILE) $(ANNO_FILE) $(FIRESIM_MAIN_CP)
 	$(call run_jar_scala_main,$(firesim_base_dir),$(FIRESIM_MAIN_CP),midas.stage.GoldenGateMain,\
 		-i $(FIRRTL_FILE) \
 		-td $(GENERATED_DIR) \
@@ -31,6 +35,7 @@ $(simulator_verilog) $(simulator_xdc) $(header) $(fame_annos) &: $(FIRRTL_FILE) 
 		-ggcs $(PLATFORM_CONFIG) \
 		--output-filename-base $(BASE_FILE_NAME) \
 		--allow-unrecognized-annotations \
+		$(if $(SEMANTIC_CHECKPOINT_ROOT),--semantic-checkpoint-root $(SEMANTIC_CHECKPOINT_ROOT),) \
 		--no-dedup)
 	grep -sh ^ $(GENERATED_DIR)/firrtl_black_box_resource_files.f | \
 		xargs cat >> $(simulator_verilog) # Append blackboxes to FPGA wrapper, if any

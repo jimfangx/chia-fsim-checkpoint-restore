@@ -86,6 +86,10 @@ object SemanticStateInventory {
       if (ancestors(m.name)) fail(s"recursive hierarchy at $hierarchy")
       val body = statements(m.body)
       val drivers = mutable.Map.empty[String, Expression]
+      val combinationalAliases = body.collect {
+        case DefNode(_, name, _) => name
+        case DefWire(_, name, _) => name
+      }.toSet
       body.foreach {
         case Connect(_, loc, expr) =>
           if (drivers.contains(loc.serialize)) fail(s"multiple drivers at $hierarchy.${loc.serialize}")
@@ -101,6 +105,34 @@ object SemanticStateInventory {
           case None => drivers.get(name) match {
             case Some(alias) if alias.tpe == ClockType => clock(alias, seen + name)
             case _ => fail(s"derived, gated, or undriven clock at $hierarchy.$name")
+          }
+        }
+      }
+      def enableIdentity(e: Expression, seen: Set[String] = Set.empty): String = {
+        val name = e.serialize
+        if (seen(name)) fail(s"enable alias cycle at $hierarchy.$name")
+        e match {
+          case Mux(cond, UIntLiteral(one, IntWidth(w1)), UIntLiteral(zero, IntWidth(w0)), _)
+              if one == 1 && zero == 0 && w1 == 1 && w0 == 1 => enableIdentity(cond, seen + name)
+          case _ => drivers.get(name) match {
+            case Some(alias) if combinationalAliases(name) && e.tpe == UIntType(IntWidth(1)) =>
+              enableIdentity(alias, seen + name)
+            case _ => name
+          }
+        }
+      }
+      def memoryClock(e: Expression, enable: Expression, seen: Set[String] = Set.empty): String = {
+        val name = e.serialize
+        if (seen(name)) fail(s"memory clock alias cycle at $hierarchy.$name")
+        e match {
+          // Conditional Chisel writes use validif(enable, clock), with enable
+          // often lowered through nodes and mux(enable, 1, 0). Only that exact
+          // Boolean identity permits stripping the clock validity guard.
+          case ValidIf(cond, value, ClockType) if enableIdentity(cond) == enableIdentity(enable) => clock(value)
+          case _ => drivers.get(name) match {
+            case Some(alias) if alias.tpe == ClockType && !clocks.contains(name) =>
+              memoryClock(alias, enable, seen + name)
+            case _ => clock(e)
           }
         }
       }
@@ -136,7 +168,8 @@ object SemanticStateInventory {
           if (ports.isEmpty) fail(s"portless memory at $hierarchy.${mem.name}")
           val portClocks = ports.map { port =>
             drivers.get(s"${mem.name}.$port.clk") match {
-              case Some(e) => clock(e)
+              case Some(e) => memoryClock(e, drivers.getOrElse(s"${mem.name}.$port.en",
+                fail(s"missing memory enable at $hierarchy.${mem.name}.$port")))
               case None => fail(s"missing memory clock at $hierarchy.${mem.name}.$port")
             }
           }.distinct

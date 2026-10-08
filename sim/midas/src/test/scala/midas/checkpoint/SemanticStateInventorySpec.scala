@@ -71,6 +71,27 @@ class SemanticStateInventorySpec extends AnyFlatSpec {
     intercept[IllegalArgumentException](SemanticStateInventory.discover(s.copy(form = ChirrtlForm), "Harness.dut"))
   }
 
+  it should "resolve memory clock validity guarded by that port's enable without accepting conditional clocks" in {
+    val guarded = source.replace("sram.w.clk <= clock", "sram.w.clk <= validif(wen, clock)")
+    assert(entries(manifest(guarded)) == entries(manifest()))
+    val loweredChisel = source
+      .replace("sram.w.clk <= clock", "node writeClock = validif(wen, clock)\n    sram.w.clk <= writeClock")
+      .replace("sram.w.en <= wen", "node writeEnable = mux(wen, UInt<1>(1), UInt<1>(0))\n    sram.w.en <= writeEnable")
+    assert(entries(manifest(loweredChisel)) == entries(manifest()))
+    val unrelated = source.replace("sram.w.clk <= clock", "sram.w.clk <= validif(bits(data, 0, 0), clock)")
+    val error = intercept[IllegalArgumentException](manifest(unrelated))
+    assert(error.getMessage.contains("clock"), error.getMessage)
+    val delayedEnable = source
+      .replace("reg counter : UInt<9>, clock with :",
+        "reg delayedEnable : UInt<1>, clock\n    delayedEnable <= wen\n    reg counter : UInt<9>, clock with :")
+      .replace("sram.w.clk <= clock", "sram.w.clk <= validif(delayedEnable, clock)")
+    // A register's next-state driver is not a combinational alias of its value.
+    intercept[IllegalArgumentException](manifest(delayedEnable))
+    val registerClock = source.replace("reg counter : UInt<9>, clock with :",
+      "reg counter : UInt<9>, validif(wen, clock) with :")
+    intercept[IllegalArgumentException](manifest(registerClock))
+  }
+
   it should "reject opaque state, async reset, derived clocks, multiple clocks, and hidden memory pipelines" in {
     val opaque = source.replace("module Leaf :", "extmodule Leaf :")
       .replace("    reg saved : UInt<9>, clock with :\n      reset => (reset, UInt<9>(0))\n    saved <= data\n    value <= saved", "    defname = OpaqueLeaf")
