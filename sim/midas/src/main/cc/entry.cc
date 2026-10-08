@@ -69,6 +69,25 @@ int entry(int argc, char **argv) {
   // NOLINTEND
   /* clang-format on */
 
+  // Fail before simulation construction/init/MMIO: generated RTL alone is
+  // never a full simulator checkpoint. Adapters and the atomic runtime cut
+  // are still required. Do not silently ignore a requested save or restore.
+  for (const auto &arg : args) {
+    if (arg == "+fs-checkpoint-preflight" ||
+        arg.rfind("+fs-checkpoint=", 0) == 0 ||
+        arg.rfind("+fs-restore=", 0) == 0) {
+      try {
+        registry.checkpoint_preflight();
+        throw std::runtime_error("unsupported metasim runtime checkpoint cut/restore");
+      } catch (const std::exception &error) {
+        fprintf(stderr, "FS_CHECKPOINT_UNSUPPORTED: %s\n", error.what());
+        // VCS's simulator_entry ignores entry's return value at this stage.
+        // Use an explicit failure exit, also valid for the other platforms.
+        std::exit(EXIT_FAILURE);
+      }
+    }
+  }
+
   // Create the simulation instance.
   simulation = create_simulation(simif, *widget_registry_ptr, args);
 

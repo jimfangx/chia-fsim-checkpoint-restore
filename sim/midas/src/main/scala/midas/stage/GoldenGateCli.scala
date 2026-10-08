@@ -16,6 +16,7 @@ trait GoldenGateCli { this: Shell =>
     ConfigStringAnnotation,
     OutputBaseFilenameAnnotation,
     midas.checkpoint.SemanticCheckpointRootAnnotation,
+    midas.checkpoint.SimulatorCheckpointInventoryAnnotation,
     firrtl.stage.FirrtlFileAnnotation,
     firrtl.stage.FirrtlSourceAnnotation,
     firrtl.transforms.NoCircuitDedupAnnotation,

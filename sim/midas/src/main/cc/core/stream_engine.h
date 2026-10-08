@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <vector>
+#include "core/checkpoint.h"
 
 class FPGAToCPUStreamDriver {
 public:
@@ -24,7 +25,7 @@ public:
   virtual void flush() = 0;
 };
 
-class StreamEngine {
+class StreamEngine : public checkpoint_owner_t {
 public:
   /**
    * @brief Initialiases MMIO-related structures.

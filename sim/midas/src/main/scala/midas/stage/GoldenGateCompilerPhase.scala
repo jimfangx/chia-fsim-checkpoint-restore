@@ -95,8 +95,16 @@ class GoldenGateCompilerPhase extends Phase {
     logger.info("Final Emission Transformation Ordering\n")
     logger.info(emitter.prettyPrint("  "))
 
-    emitter
-      .execute(postLoweredSimulator)
-      .annotations
+    val emitted = emitter.execute(postLoweredSimulator)
+    // The emitter returns its input circuit; reproduce its private lowering
+    // on that input solely for read-only inventory, keeping emitted RTL and
+    // compiler behavior unchanged. Do not rerun user HostTransforms here.
+    if (emitted.annotations.exists(_.isInstanceOf[midas.checkpoint.SimulatorCheckpointInventoryAnnotation])) {
+      val emissionIR = new firrtl.SystemVerilogEmitter().transforms.foldLeft(emitted) {
+        case (s, transform) => transform.runTransform(s)
+      }
+      val inventoried = midas.checkpoint.SimulatorStateInventory(emissionIR)
+      emitted.annotations ++ inventoried.annotations.drop(emissionIR.annotations.size)
+    } else emitted.annotations
   }
 }

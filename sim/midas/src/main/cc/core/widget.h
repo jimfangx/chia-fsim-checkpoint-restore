@@ -4,6 +4,7 @@
 #define __WIDGET_H
 
 #include <cstdlib>
+#include "core/checkpoint.h"
 
 class widget_t;
 class widget_registry_t;
@@ -21,7 +22,7 @@ bool widget_isa(widget_t *widget);
  * A per-class kind uniquely identifies each widget types and allows them
  * to be classified and retrieved from the registry.
  */
-class widget_t {
+class widget_t : public checkpoint_owner_t {
 public:
   /**
    * Constructor for widgets.

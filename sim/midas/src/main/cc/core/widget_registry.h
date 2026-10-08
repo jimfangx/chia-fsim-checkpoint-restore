@@ -16,6 +16,7 @@ class FASEDMemoryTimingModel;
 class bridge_driver_t;
 class widget_t;
 class StreamEngine;
+class checkpoint_owner_t;
 
 /**
  * Unique class responsible for the creating and ownership of all bridges.
@@ -100,6 +101,11 @@ public:
   void add_widget(bridge_driver_t *widget);
   void add_widget(StreamEngine *widget);
 
+  // Includes core widgets and both stream engines, not just bridge drivers.
+  // Owner indices follow generated constructor order; pointer/hash iteration
+  // never forms a checkpoint identity.
+  void checkpoint_preflight() const;
+
 private:
   // Mapping from bridge kinds to the list of bridges of that kind.
   using widget_list_t = std::vector<std::unique_ptr<widget_t>>;
@@ -119,6 +125,7 @@ private:
    * List of all bridges, maintained in a deterministic order.
    */
   std::vector<bridge_driver_t *> all_bridges;
+  std::vector<checkpoint_owner_t *> checkpoint_widgets;
 };
 
 #endif // __BRIDGE_REGISTRY_H
