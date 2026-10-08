@@ -4,6 +4,7 @@
 #define __EMUL_MM_H
 
 #include "core/config.h"
+#include "core/checkpoint.h"
 
 #include <cstring>
 #include <queue>
@@ -11,10 +12,11 @@
 
 #include "core/config.h"
 
-class mm_t {
+class mm_t : public checkpoint_owner_t {
 public:
   mm_t(const AXI4Config conf)
-      : conf(conf), word_size(conf.beat_bytes()), data(nullptr), size(0) {}
+      : conf(conf), word_size(conf.beat_bytes()), data(nullptr), size(0),
+        line_size(0) {}
 
   virtual void init(size_t sz, int lsz);
 
@@ -88,7 +90,19 @@ struct mm_rresp_t {
 
 class mm_magic_t final : public mm_t {
 public:
-  mm_magic_t(const AXI4Config &conf) : mm_t(conf), store_inflight(false) {}
+  mm_magic_t(const AXI4Config &conf)
+      : mm_t(conf), store_inflight(false), store_addr(0), store_id(0),
+        store_size(0), store_count(0), cycle(0) {}
+
+  // Owner payload only: the future full-runtime coordinator must freeze both
+  // contexts, bind this schema/geometry into its integrity-checked container,
+  // and validate ALL owners before loading any. No tick or MMIO occurs here.
+  std::string checkpoint_schema() const override {
+    return "firesim.mm_magic.full.v1";
+  }
+  std::vector<uint8_t> save_checkpoint() const override;
+  void validate_checkpoint(const std::vector<uint8_t> &) const override;
+  void load_checkpoint(const std::vector<uint8_t> &) override;
 
   void init(size_t sz, int lsz) override;
 
