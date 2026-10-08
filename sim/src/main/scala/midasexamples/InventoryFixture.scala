@@ -4,7 +4,7 @@ package firesim.midasexamples
 import chisel3._
 import org.chipsalliance.cde.config.Parameters
 
-/** Executable counterpart of checkpoint/InventoryDUT.firrtl. No capture hardware. */
+/** Semantic replay fixture: arrays/SRAM and a pipelined memory response under backpressure. */
 class InventoryFixtureLeaf extends Module {
   val io = IO(new Bundle {
     val data = Input(UInt(9.W))
@@ -20,6 +20,13 @@ class InventoryFixtureDUT extends Module {
     val data = Input(UInt(9.W))
     val addr = Input(UInt(3.W))
     val wen = Input(Bool())
+    val reqValid = Input(Bool())
+    val respReady = Input(Bool())
+    val reqReady = Output(Bool())
+    val respValid = Output(Bool())
+    val respData = Output(UInt(9.W))
+    val queued = Output(Bool())
+    val outstanding = Output(Bool())
     val count = Output(UInt(9.W))
     val phase = Output(UInt(2.W))
     val array0 = Output(UInt(9.W))
@@ -36,6 +43,40 @@ class InventoryFixtureDUT extends Module {
   val sram = Mem(8, UInt(9.W))
   val a = Module(new InventoryFixtureLeaf)
   val b = Module(new InventoryFixtureLeaf)
+
+  // One request queue, a two-cycle memory operation, and a held response.
+  // These are ordinary target registers, never drained for a checkpoint.
+  val qValid = RegInit(false.B)
+  val qAddr = Reg(UInt(3.W))
+  val busy = RegInit(false.B)
+  val delay = Reg(UInt(2.W))
+  val pendingData = Reg(UInt(9.W))
+  val responseValid = RegInit(false.B)
+  val responseData = Reg(UInt(9.W))
+  io.reqReady := !qValid
+  io.queued := qValid
+  io.outstanding := busy
+  io.respValid := responseValid
+  io.respData := responseData
+  when(io.reqValid && io.reqReady) {
+    qValid := true.B
+    qAddr := io.addr
+  }
+  when(qValid && !busy && !responseValid) {
+    qValid := false.B
+    busy := true.B
+    delay := 2.U
+    pendingData := sram.read(qAddr)
+  }
+  when(busy) {
+    delay := delay - 1.U
+    when(delay === 1.U) {
+      busy := false.B
+      responseValid := true.B
+      responseData := pendingData
+    }
+  }
+  when(responseValid && io.respReady) { responseValid := false.B }
 
   counter := counter + 1.U
   fsm := Mux(fsm === 2.U, 0.U, fsm + 1.U)

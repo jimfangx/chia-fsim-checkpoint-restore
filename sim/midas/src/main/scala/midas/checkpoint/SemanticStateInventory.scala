@@ -12,6 +12,9 @@ import firrtl.options.{HasShellOptions, ShellOption, Unserializable}
 import midas.stage.GoldenGateOutputFileAnnotation
 import org.json4s._
 import org.json4s.native.JsonMethods.{compact, render}
+import firrtl.options.Dependency
+import firrtl.stage.Forms
+import firrtl.stage.transforms.Compiler
 
 /** Explicit instance selection excludes harness/bridge state without name heuristics. */
 case class SemanticCheckpointRootAnnotation(path: String) extends NoTargetAnnotation with Unserializable
@@ -210,9 +213,51 @@ object SemanticStateInventory {
     else {
       if (roots.size != 1) fail("exactly one explicit DUT root is required")
       val manifest = discover(state, roots.head)
+      // Emit a DUT-only ordinary RTL reference from this exact pre-FAME IR.
+      // No bridges, host clocks, or simulator state participate in its build.
+      val modules = state.circuit.modules.map(m => m.name -> m).toMap
+      def instances(s: Statement): Seq[WDefInstance] = {
+        val found = mutable.ArrayBuffer.empty[WDefInstance]
+        def visit(x: Statement): Unit = {
+          x match { case i: WDefInstance => found += i; case _ => }
+          x.foreachStmt(visit)
+        }
+        visit(s)
+        found.toSeq
+      }
+      var selected = modules(state.circuit.main).asInstanceOf[Module]
+      roots.head.split("\\.").tail.foreach { name =>
+        selected = modules(instances(selected.body).find(_.name == name).get.module).asInstanceOf[Module]
+      }
+      val reachable = mutable.Set.empty[String]
+      def include(name: String): Unit = if (reachable.add(name)) {
+        instances(modules(name).asInstanceOf[Module].body).foreach(i => include(i.module))
+      }
+      include(selected.name)
+      val cleanCircuit = state.circuit.copy(main = selected.name, modules = state.circuit.modules.filter(m => reachable(m.name)))
+      val clean = new Compiler(Seq(Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm).execute(
+        CircuitState(cleanCircuit, firrtl.LowForm, Seq(firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter])))
+      ).getEmittedCircuit.value
+      val boundary = canonical(JObject(List(
+        "boundary_version" -> JInt(1), "dut_module" -> JString(selected.name),
+        "dut_root" -> JString(roots.head), "clock" -> JString("clock"),
+        "sample_phase" -> JString("before_rising_edge"),
+        "ports" -> JArray(selected.ports.map { port =>
+          val width = port.tpe match {
+            case ClockType if port.name == "clock" && port.direction == Input => BigInt(1)
+            case UIntType(IntWidth(w)) => w
+            case SIntType(IntWidth(w)) => w
+            case _ => fail(s"unsupported boundary type at ${port.name}")
+          }
+          JObject(List("name" -> JString(port.name), "width" -> JInt(width),
+            "direction" -> JString(if (port.direction == Input) "input" else "output")))
+        }.toList),
+      )))
       state.copy(annotations = state.annotations ++ Seq(
         GoldenGateOutputFileAnnotation(manifest, ".semantic-state.json"),
         GoldenGateOutputFileAnnotation(state.circuit.serialize, ".semantic-reference.fir"),
+        GoldenGateOutputFileAnnotation(clean, ".semantic-clean.sv"),
+        GoldenGateOutputFileAnnotation(boundary, ".semantic-boundary.json"),
       ))
     }
   }

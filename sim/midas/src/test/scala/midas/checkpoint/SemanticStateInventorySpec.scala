@@ -40,6 +40,10 @@ class SemanticStateInventorySpec extends AnyFlatSpec {
     assert((ram \ "width") == JInt(9) && (ram \ "depth") == JInt(8))
     assert(files(".semantic-reference.fir") == state.circuit.serialize)
     assert((parse(text) \ "reference_sha256") == JString(SemanticStateInventory.sha256(state.circuit.serialize)))
+    assert(files(".semantic-clean.sv").contains("module InventoryDUT("))
+    assert(!files(".semantic-clean.sv").contains("module Harness("))
+    assert((parse(files(".semantic-boundary.json")) \ "dut_module") == JString("InventoryDUT"))
+    assert((parse(files(".semantic-boundary.json")) \ "ports").asInstanceOf[JArray].arr.size == 13)
 
     // Real compiler artifacts for cross-language codec and ordinary clean RTL VCS tests.
     sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { dir =>

@@ -13,7 +13,7 @@ simulator_xdc := $(GENERATED_DIR)/$(BASE_FILE_NAME).synthesis.xdc
 
 # Request the inventory outputs as well, so enabling discovery also rebuilds
 # an existing simulator generated without discovery.
-semantic_outputs := $(if $(SEMANTIC_CHECKPOINT_ROOT),$(addprefix $(GENERATED_DIR)/$(BASE_FILE_NAME),.semantic-state.json .semantic-reference.fir),)
+semantic_outputs := $(if $(SEMANTIC_CHECKPOINT_ROOT),$(addprefix $(GENERATED_DIR)/$(BASE_FILE_NAME),.semantic-state.json .semantic-reference.fir .semantic-clean.sv .semantic-boundary.json),)
 
 # Pre-simulation-mapping annotations which includes all Bridge Annotations
 # extracted used to generate new runtime configurations.

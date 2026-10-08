@@ -17,7 +17,7 @@ $(vcs) $(vcs_post_synth) $(vcs_debug) $(vcs_post_synth_debug): export CXXFLAGS :
 # Conservatively set --no-as-needed in case --as-needed is defined in LDFLAGS.
 $(vcs) $(vcs_post_synth) $(vcs_debug) $(vcs_post_synth_debug): export LDFLAGS := $(LDFLAGS) -Wl,--no-as-needed $(common_ld_flags) -Wl,-rpath='$$$$ORIGIN'
 
-vcs_driver_deps := $(header) $(DRIVER_CC) $(DRIVER_H) $(midas_cc) $(midas_h)
+vcs_driver_deps := $(header) $(DRIVER_CC) $(DRIVER_H) $(midas_cc) $(midas_h) $(VCS_EXTRA_V)
 
 define make_vcs
 	$(MAKE) -C $(simif_dir) $(1) \

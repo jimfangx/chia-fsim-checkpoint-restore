@@ -25,7 +25,7 @@ vcs_flags := \
 	$(SIM_PREPROC_DEFINES) \
 	$(vcs_flags)
 
-vcs_v := $(emul_v) $(sim_wrapper_v)
+vcs_v := $(emul_v) $(sim_wrapper_v) $(VCS_EXTRA_V)
 vcs_cc := $(emul_cc) $(sim_harness)
 
 ################################################################################

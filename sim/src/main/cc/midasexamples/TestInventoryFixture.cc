@@ -9,6 +9,8 @@ public:
     poke("io_data", 0);
     poke("io_addr", 0);
     poke("io_wen", 0);
+    poke("io_reqValid", 0);
+    poke("io_respReady", 0);
     target_reset();
     // A literal zero can select expect(bool, const char *) via null-pointer
     // conversion. An explicit signal type selects the value-checking overload.
@@ -40,6 +42,38 @@ public:
       expect("io_count", 9 + i);
       expect("io_phase", (9 + i) % 3);
     }
+
+    // Fill the response slot, leave the request queue occupied, and hold
+    // backpressure. Capture may occur at any of these edges, without draining.
+    poke("io_addr", 3);
+    poke("io_reqValid", 1);
+    step(1);
+    expect("io_queued", 1);
+    poke("io_reqValid", 0);
+    step(1);
+    expect("io_outstanding", 1);
+    poke("io_addr", 5);
+    poke("io_reqValid", 1);
+    step(1);
+    expect("io_queued", 1);
+    expect("io_outstanding", 1);
+    poke("io_reqValid", 0);
+    step(1);
+    expect("io_respValid", 1);
+    expect("io_respData", 0x103);
+    expect("io_queued", 1);
+    step(4);
+    expect("io_respValid", 1);
+    expect("io_respData", 0x103);
+    expect("io_queued", 1);
+    // Release the held response and execute the queued operation.
+    poke("io_respReady", 1);
+    step(4);
+    expect("io_respValid", 1);
+    expect("io_respData", 0x105);
+    step(1);
+    expect(std::string_view{"io_respValid"}, 0);
+    step(3);
   }
 };
 
