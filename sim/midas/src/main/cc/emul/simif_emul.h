@@ -59,6 +59,14 @@ public:
    */
   void start_driver(simulation_t &sim);
 
+  // Rebuild just the dispatcher after separately loading every component at
+  // a low-clock returned-operation cut. Runs to the next normal yield without
+  // an initial AXI tick, delay draw, fastloadmem or simulation initialization.
+  // The caller must publish outgoing banks and refresh incoming banks before
+  // the first rising edge. Not a whole-runtime checkpoint loading API.
+  bool start_restored_driver(simulation_t &sim, uint32_t bits,
+                             const uint32_t *banks);
+
   /**
    * Transfers control to the simulator on a tick.
    *
@@ -182,6 +190,8 @@ protected:
   void load_mems(const char *fname);
 
 private:
+  bool driver_started = false;
+  bool start_driver_impl(simulation_t &sim, bool restored);
   driver_boundary_diagnostic_t driver_diagnostic;
   // Published only while to_sim has parked VCS in DPI. This does not mean
   // RTL/NBA settlement: it certifies software ownership access on the driver.

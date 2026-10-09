@@ -174,11 +174,34 @@ simif_emul_t::checkpoint_axi_owners() {
 }
 
 void simif_emul_t::start_driver(simulation_t &sim) {
+  start_driver_impl(sim, false);
+}
+
+bool simif_emul_t::start_restored_driver(simulation_t &sim, uint32_t bits,
+                                         const uint32_t *banks) {
+  if (driver_started || driver_diagnostic.requested() ||
+      cpu_managed_stream_io || fpga_managed_stream_io || !qsfp.empty())
+    throw std::runtime_error("unsupported/nonfresh restored dispatcher destination");
+  harness_observation_t::require_clock_phase(bits, banks, true);
+  for (const uint32_t flag_bit : {bits - 66, bits - 67})
+    if ((banks[flag_bit / 32] >> (flag_bit % 32)) & 1)
+      throw std::runtime_error("restored dispatcher requires reset/finish deasserted");
+  sim.require_restored_dispatcher();
+  host_timing.validate_checkpoint(host_timing.save_checkpoint());
+  return start_driver_impl(sim, true);
+}
+
+bool simif_emul_t::start_driver_impl(simulation_t &sim, bool restored) {
+  if (driver_started)
+    throw std::runtime_error("driver dispatcher already started");
+  if (!restored)
+    sim.require_fresh_dispatcher();
   if (driver_diagnostic.requested() && !sim.simulation_supports_steps()) {
     fprintf(stderr, "FS_DRIVER_BOUNDARY_ERROR: unsupported incremental simulation driver\n");
     std::exit(EXIT_FAILURE);
   }
   // Set up the simulation thread.
+  driver_started = true;
   finished = false;
   exit_code = EXIT_FAILURE;
   {
@@ -187,11 +210,12 @@ void simif_emul_t::start_driver(simulation_t &sim) {
     rtlsim_flag = false;
 
     // Spawn the target thread.
-    thread = std::thread([&] {
-      do_tick();
+    thread = std::thread([&, restored] {
+      if (!restored)
+        do_tick();
 
       // Load memories before initialising the simulation.
-      if (!load_mem_path.empty()) {
+      if (!restored && !load_mem_path.empty()) {
         fprintf(stdout,
                 "[fast loadmem] loadmem path exists, load simulation memories "
                 "without loadmem_t widget, path = %s\n",
@@ -226,8 +250,11 @@ void simif_emul_t::start_driver(simulation_t &sim) {
     // Wait for the target thread to yield and enter the RTL simulator.
     // The target thread is waken up when the DPI tick function is
     // ready to transfer data to it.
-    rtlsim_cond.wait(lock, [&] { return rtlsim_flag; });
+    // A restored terminal cut can finish without yielding. Waiting only for
+    // rtlsim_flag would deadlock that valid zero-edge continuation.
+    rtlsim_cond.wait(lock, [&] { return rtlsim_flag || finished; });
   }
+  return finished;
 }
 
 void simif_emul_t::wait_write(mmio_t &mmio) {
@@ -338,11 +365,13 @@ int simif_emul_t::end() {
 
 void simif_emul_t::do_tick() {
   require_no_driver_capture();
-  driver_flag = false;
-  rtlsim_flag = true;
-
+  {
+    std::unique_lock<std::mutex> lock(driver_mutex);
+    driver_flag = false;
+  }
   {
     std::unique_lock<std::mutex> lock(rtlsim_mutex);
+    rtlsim_flag = true;
     rtlsim_cond.notify_one();
   }
   {
@@ -352,11 +381,15 @@ void simif_emul_t::do_tick() {
 }
 
 bool simif_emul_t::to_sim() {
-  rtlsim_flag = false;
-  driver_flag = true;
-
+  if (!driver_started)
+    throw std::runtime_error("driver dispatcher has not started");
+  {
+    std::unique_lock<std::mutex> lock(rtlsim_mutex);
+    rtlsim_flag = false;
+  }
   {
     std::unique_lock<std::mutex> lock(driver_mutex);
+    driver_flag = true;
     driver_context_active = true;
     driver_cond.notify_one();
   }

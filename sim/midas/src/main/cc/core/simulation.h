@@ -118,6 +118,12 @@ public:
   using run_boundary_t = std::function<void(simulation_t &, bool)>;
   int execute_simulation_flow(const run_boundary_t &boundary = {});
 
+  // Component bootstrap only: the coordinator must separately restore all
+  // generated, harness and native owners at the low-clock completed-operation
+  // cut. Certifies a freshly loaded flow, never a suspended C++ call stack.
+  void require_restored_dispatcher();
+  void require_fresh_dispatcher() const;
+
 private:
   // This adapter owns only simulation_t's fields and flow. Concrete driver
   // fields, bridge outputs and the dispatcher/harness remain separate owners.
@@ -147,6 +153,7 @@ private:
   flow_phase_t flow_phase = flow_phase_t::constructed;
   bool flow_on_stack = false;
   bool flow_poisoned = false;
+  bool base_checkpoint_loaded = false;
   bool run_done = false;
   widget_checkpoint_state_t flow_call;
   base_checkpoint_t base_checkpoint{*this};

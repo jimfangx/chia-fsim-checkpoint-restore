@@ -121,6 +121,29 @@ int simulation_t::execute_simulation_flow(const run_boundary_t &boundary) {
   }
 }
 
+void simulation_t::require_restored_dispatcher() {
+  require_checkpoint_boundary();
+  if (flow_on_stack || !base_checkpoint_loaded)
+    throw std::runtime_error("dispatcher bootstrap requires a freshly loaded flow");
+  // Fail before starting a worker or submitting MMIO for an unknown concrete
+  // driver, callback, or widget. Each component still has its own load hook.
+  auto owners = checkpoint_driver_owners();
+  const auto widgets = checkpoint_widget_owners();
+  owners.insert(owners.end(), widgets.begin(), widgets.end());
+  for (const auto &[id, owner] : owners) {
+    if (!owner || owner->checkpoint_schema().empty())
+      throw std::runtime_error("unsupported dispatcher owner: " + id);
+    const auto payload = owner->save_checkpoint();
+    owner->validate_checkpoint(payload);
+  }
+}
+
+void simulation_t::require_fresh_dispatcher() const {
+  if (flow_on_stack || flow_poisoned || base_checkpoint_loaded ||
+      flow_phase != flow_phase_t::constructed)
+    throw std::runtime_error("ordinary dispatcher start requires a fresh flow");
+}
+
 int simulation_t::execute_simulation_flow_impl(const run_boundary_t &boundary) {
   // Reject before initialization/MMIO if a coordinator requests boundaries
   // from a driver that cannot return at completed host operations.
@@ -297,6 +320,7 @@ void simulation_t::base_checkpoint_t::load_checkpoint(
   sim.start_hcycle = hcycle;
   sim.run_done = payload[payload.size() - 24];
   sim.flow_phase = flow_phase_t::running;
+  sim.base_checkpoint_loaded = true;
 }
 
 void simulation_t::wait_for_init() {
