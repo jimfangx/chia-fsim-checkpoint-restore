@@ -105,64 +105,93 @@ simulation_t::checkpoint_widget_owners() {
 }
 
 int simulation_t::execute_simulation_flow(const run_boundary_t &boundary) {
+  if (flow_on_stack || flow_poisoned ||
+      (flow_phase != flow_phase_t::constructed &&
+       flow_phase != flow_phase_t::running))
+    throw std::runtime_error("reentrant/interrupted/completed simulation flow");
+  flow_on_stack = true;
+  try {
+    const int result = execute_simulation_flow_impl(boundary);
+    flow_on_stack = false;
+    return result;
+  } catch (...) {
+    flow_poisoned = true;
+    flow_on_stack = false;
+    throw;
+  }
+}
+
+int simulation_t::execute_simulation_flow_impl(const run_boundary_t &boundary) {
   // Reject before initialization/MMIO if a coordinator requests boundaries
   // from a driver that cannot return at completed host operations.
   if (boundary && !simulation_supports_steps())
     throw std::runtime_error("unsupported incremental simulation driver");
-  fprintf(stderr, "entered simulation flow execution\n");
-  wait_for_init();
-  fprintf(stderr, "finished waiting\n");
+  if (flow_phase == flow_phase_t::constructed) {
+    widget_checkpoint_state_t::call_t call(flow_call);
+    flow_phase = flow_phase_t::initializing;
+    fprintf(stderr, "entered simulation flow execution\n");
+    wait_for_init();
+    fprintf(stderr, "finished waiting\n");
 
-  // following fingerprint logic uses 'exit' instead of 'return' to avoid
-  // issues w/ deconstructors not having initialized values
-  auto &master = registry.get_widget<master_t>();
-  if (check_fingerprint_only || write_fingerprint_only.has_value()) {
-    if (check_fingerprint_only && write_fingerprint_only.has_value()) {
-      fprintf(stderr, "Unable to both check/write FireSim fingerprint\n");
-      exit(EXIT_FAILURE);
+    // following fingerprint logic uses 'exit' instead of 'return' to avoid
+    // issues w/ deconstructors not having initialized values
+    auto &master = registry.get_widget<master_t>();
+    if (check_fingerprint_only || write_fingerprint_only.has_value()) {
+      if (check_fingerprint_only && write_fingerprint_only.has_value()) {
+        fprintf(stderr, "Unable to both check/write FireSim fingerprint\n");
+        exit(EXIT_FAILURE);
+      }
+
+      if (check_fingerprint_only && master.check_fingerprint()) {
+        fprintf(stderr, "Invalid FireSim fingerprint\n");
+        exit(EXIT_FAILURE);
+      }
+      if (write_fingerprint_only.has_value()) {
+        master.write_fingerprint(write_fingerprint_only.value());
+      }
+      exit(EXIT_SUCCESS);
+    } else {
+      if (master.check_fingerprint()) {
+        fprintf(stderr, "Invalid FireSim fingerprint\n");
+        exit(EXIT_FAILURE);
+      }
     }
 
-    if (check_fingerprint_only && master.check_fingerprint()) {
-      fprintf(stderr, "Invalid FireSim fingerprint\n");
-      exit(EXIT_FAILURE);
+    if (auto *fpga_stream = registry.get_fpga_stream_engine()) {
+      fpga_stream->init();
     }
-    if (write_fingerprint_only.has_value()) {
-      master.write_fingerprint(write_fingerprint_only.value());
+
+    if (auto *stream = registry.get_stream_engine()) {
+      stream->init();
     }
-    exit(EXIT_SUCCESS);
-  } else {
-    if (master.check_fingerprint()) {
-      fprintf(stderr, "Invalid FireSim fingerprint\n");
-      exit(EXIT_FAILURE);
-    }
+
+    init_dram();
+
+    simulation_init();
+
+    record_start_times();
+    fprintf(stderr, "Commencing simulation.\n");
+    flow_phase = flow_phase_t::running;
   }
-
-  if (auto *fpga_stream = registry.get_fpga_stream_engine()) {
-    fpga_stream->init();
-  }
-
-  if (auto *stream = registry.get_stream_engine()) {
-    stream->init();
-  }
-
-  init_dram();
-
-  simulation_init();
-
-  record_start_times();
-  fprintf(stderr, "Commencing simulation.\n");
   int exit_code;
   if (simulation_supports_steps()) {
-    bool done;
-    do {
-      done = simulation_run_step();
+    while (!run_done) {
+      {
+        widget_checkpoint_state_t::call_t call(flow_call);
+        run_done = simulation_run_step();
+      }
       if (boundary)
-        boundary(*this, done);
-    } while (!done);
+        boundary(*this, run_done);
+    }
+    widget_checkpoint_state_t::call_t call(flow_call);
+    flow_phase = flow_phase_t::finalizing;
     exit_code = simulation_run_finalize();
   } else {
+    widget_checkpoint_state_t::call_t call(flow_call);
     exit_code = simulation_run();
+    flow_phase = flow_phase_t::finalizing;
   }
+  widget_checkpoint_state_t::call_t call(flow_call);
   fprintf(stderr, "\nSimulation complete.\n");
   record_end_times();
 
@@ -185,7 +214,89 @@ int simulation_t::execute_simulation_flow(const run_boundary_t &boundary) {
 
   print_simulation_performance_summary();
 
+  flow_phase = flow_phase_t::completed;
   return timeout ? EXIT_FAILURE : exit_code;
+}
+
+widget_checkpoint_config_t simulation_t::checkpoint_configuration() const {
+  widget_checkpoint_config_t config(8,
+                                    {do_zero_out_dram,
+                                     check_fingerprint_only,
+                                     write_fingerprint_only.has_value(),
+                                     write_fingerprint_only.value_or(0),
+                                     simulation_supports_steps()});
+  config.text(target_name);
+  config.text(load_mem_path);
+  const auto owners = registry.checkpoint_owners();
+  config.word(owners.size());
+  for (const auto &[id, owner] : owners) {
+    config.text(id);
+    config.text(owner->checkpoint_schema());
+  }
+  return config;
+}
+
+void simulation_t::require_checkpoint_boundary() const {
+  flow_call.require_idle();
+  if (flow_poisoned || flow_phase != flow_phase_t::running ||
+      !simulation_supports_steps() || check_fingerprint_only ||
+      write_fingerprint_only || !start_hcycle || end_hcycle || end_time ||
+      end_tcycle)
+    throw std::runtime_error(
+        "unsupported simulation lifecycle checkpoint boundary");
+}
+
+std::vector<uint8_t> simulation_t::base_checkpoint_t::save_checkpoint() const {
+  sim.require_checkpoint_boundary();
+  auto config = sim.checkpoint_configuration();
+  config.word(1); // initialized, running; terminal output has not started
+  config.word(sim.run_done);
+  config.word(sim.start_time);
+  config.word(*sim.start_hcycle);
+  return std::move(config.bytes);
+}
+
+void simulation_t::base_checkpoint_t::validate_checkpoint(
+    const std::vector<uint8_t> &payload) const {
+  sim.flow_call.require_idle();
+  if (sim.flow_poisoned || !sim.simulation_supports_steps() ||
+      sim.check_fingerprint_only || sim.write_fingerprint_only ||
+      (sim.flow_phase != flow_phase_t::constructed &&
+       sim.flow_phase != flow_phase_t::running))
+    throw std::runtime_error(
+        "unsupported simulation lifecycle restore destination");
+  auto config = sim.checkpoint_configuration();
+  if (payload.size() != config.bytes.size() + 32 ||
+      !std::equal(config.bytes.begin(), config.bytes.end(), payload.begin()) ||
+      payload[config.bytes.size()] != 1 ||
+      std::any_of(payload.begin() + config.bytes.size() + 1,
+                  payload.begin() + config.bytes.size() + 8,
+                  [](uint8_t value) { return value != 0; }) ||
+      payload[config.bytes.size() + 8] > 1 ||
+      std::any_of(payload.begin() + config.bytes.size() + 9,
+                  payload.begin() + config.bytes.size() + 16,
+                  [](uint8_t value) { return value != 0; }))
+    throw std::runtime_error(
+        "simulation lifecycle configuration/payload mismatch");
+}
+
+void simulation_t::base_checkpoint_t::load_checkpoint(
+    const std::vector<uint8_t> &payload) {
+  validate_checkpoint(payload);
+  if (sim.flow_on_stack || sim.flow_phase != flow_phase_t::constructed)
+    throw std::runtime_error("simulation lifecycle load requires a fresh flow");
+  const size_t offset = payload.size() - 16;
+  uint64_t start = 0, hcycle = 0;
+  for (unsigned i = 0; i < 8; ++i) {
+    start |= uint64_t(payload[offset + i]) << (8 * i);
+    hcycle |= uint64_t(payload[offset + 8 + i]) << (8 * i);
+  }
+  // No timestamp, MMIO, initialization, file output or target edge on load.
+  // The historical wall-clock baseline is reporting state, never target time.
+  sim.start_time = start;
+  sim.start_hcycle = hcycle;
+  sim.run_done = payload[payload.size() - 24];
+  sim.flow_phase = flow_phase_t::running;
 }
 
 void simulation_t::wait_for_init() {

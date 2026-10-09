@@ -8,8 +8,9 @@
 #include <string>
 #include <vector>
 
-#include "core/timing.h"
 #include "core/checkpoint.h"
+#include "core/timing.h"
+#include "core/widget_checkpoint.h"
 #include <utility>
 
 class simif_t;
@@ -36,6 +37,8 @@ public:
                const std::vector<std::string> &args);
 
   virtual ~simulation_t() = default;
+  simulation_t(const simulation_t &) = delete;
+  simulation_t &operator=(const simulation_t &) = delete;
 
   // Driver inventory, not a complete runtime inventory. The simulation owner
   // remains unsupported until initialization/finalization/configuration and
@@ -43,7 +46,8 @@ public:
   // separately supported components without claiming full driver support.
   virtual std::vector<std::pair<std::string, checkpoint_owner_t *>>
   checkpoint_driver_owners() {
-    return {{"runtime/simulation", this}};
+    return {{"runtime/simulation", this},
+            {"runtime/simulation/base", &base_checkpoint}};
   }
   std::vector<std::pair<std::string, checkpoint_owner_t *>>
   checkpoint_widget_owners();
@@ -115,6 +119,38 @@ public:
   int execute_simulation_flow(const run_boundary_t &boundary = {});
 
 private:
+  // This adapter owns only simulation_t's fields and flow. Concrete driver
+  // fields, bridge outputs and the dispatcher/harness remain separate owners.
+  class base_checkpoint_t final : public checkpoint_owner_t {
+  public:
+    explicit base_checkpoint_t(simulation_t &sim) : sim(sim) {}
+    std::string checkpoint_schema() const override {
+      return "firesim.simulation.base.v1";
+    }
+    std::vector<uint8_t> save_checkpoint() const override;
+    void validate_checkpoint(const std::vector<uint8_t> &) const override;
+    void load_checkpoint(const std::vector<uint8_t> &) override;
+
+  private:
+    simulation_t &sim;
+  };
+  widget_checkpoint_config_t checkpoint_configuration() const;
+  void require_checkpoint_boundary() const;
+  int execute_simulation_flow_impl(const run_boundary_t &boundary);
+  enum class flow_phase_t {
+    constructed,
+    initializing,
+    running,
+    finalizing,
+    completed
+  };
+  flow_phase_t flow_phase = flow_phase_t::constructed;
+  bool flow_on_stack = false;
+  bool flow_poisoned = false;
+  bool run_done = false;
+  widget_checkpoint_state_t flow_call;
+  base_checkpoint_t base_checkpoint{*this};
+
   /**
    * Waits until the hardware is initialised.
    *
@@ -170,8 +206,8 @@ private:
    */
   std::optional<uint32_t> write_fingerprint_only;
 
-  midas_time_t start_time;
-  midas_time_t end_time;
+  midas_time_t start_time = 0;
+  midas_time_t end_time = 0;
   std::optional<uint64_t> start_hcycle;
   std::optional<uint64_t> end_hcycle;
   uint64_t end_tcycle = 0;
