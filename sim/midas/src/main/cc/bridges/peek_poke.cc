@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 
 #include "peek_poke.h"
+#include <memory>
 
 char peek_poke_t::KIND;
 
@@ -14,6 +15,7 @@ peek_poke_t::peek_poke_t(simif_t &simif,
       outputs(std::move(outputs)) {}
 
 void peek_poke_t::poke(std::string_view id, uint32_t value, bool blocking) {
+  widget_checkpoint_state_t::call_t call(checkpoint_state);
   req_timeout = false;
   req_unstable = false;
 
@@ -29,6 +31,7 @@ void peek_poke_t::poke(std::string_view id, uint32_t value, bool blocking) {
 }
 
 uint32_t peek_poke_t::peek(std::string_view id, bool blocking) {
+  widget_checkpoint_state_t::call_t call(checkpoint_state);
   req_timeout = false;
   req_unstable = false;
 
@@ -45,6 +48,7 @@ uint32_t peek_poke_t::peek(std::string_view id, bool blocking) {
 }
 
 void peek_poke_t::poke(std::string_view id, mpz_t &value) {
+  widget_checkpoint_state_t::call_t call(checkpoint_state);
   req_timeout = false;
   req_unstable = false;
 
@@ -54,6 +58,7 @@ void peek_poke_t::poke(std::string_view id, mpz_t &value) {
   size_t size;
   uint32_t *data =
       (uint32_t *)mpz_export(nullptr, &size, -1, sizeof(uint32_t), 0, 0, value);
+  std::unique_ptr<uint32_t, decltype(&free)> exported(data, &free);
   for (size_t i = 0; i < it->second.chunks; i++) {
     simif.write(it->second.address + (i * sizeof(uint32_t)),
                 i < size ? data[i] : 0);
@@ -61,6 +66,7 @@ void peek_poke_t::poke(std::string_view id, mpz_t &value) {
 }
 
 void peek_poke_t::peek(std::string_view id, mpz_t &value) {
+  widget_checkpoint_state_t::call_t call(checkpoint_state);
   req_timeout = false;
   req_unstable = false;
 
@@ -75,13 +81,31 @@ void peek_poke_t::peek(std::string_view id, mpz_t &value) {
   mpz_import(value, size, -1, sizeof(uint32_t), 0, 0, data);
 }
 
-bool peek_poke_t::is_done() { return simif.read(mmio_addrs.DONE); }
+bool peek_poke_t::is_done() {
+  widget_checkpoint_state_t::call_t call(checkpoint_state);
+  return simif.read(mmio_addrs.DONE);
+}
 
 void peek_poke_t::step(size_t n, bool blocking) {
+  widget_checkpoint_state_t::call_t call(checkpoint_state);
   simif.write(mmio_addrs.STEP, n);
 
   if (blocking) {
-    while (!is_done())
+    while (!simif.read(mmio_addrs.DONE))
       ;
   }
+}
+
+widget_checkpoint_config_t peek_poke_t::checkpoint_configuration() const {
+  widget_checkpoint_config_t config(5, {mmio_addrs.STEP, mmio_addrs.DONE,
+                                       mmio_addrs.PRECISE_PEEKABLE});
+  for (const auto *ports : {&inputs, &outputs}) {
+    config.word(ports->size());
+    for (const auto &[name, port] : *ports) {
+      config.text(name);
+      config.word(port.address);
+      config.word(port.chunks);
+    }
+  }
+  return config;
 }

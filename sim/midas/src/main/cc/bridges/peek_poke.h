@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "core/simif.h"
+#include "core/widget_checkpoint.h"
 #include "core/timing.h"
 
 struct PEEKPOKEBRIDGEMODULE_struct {
@@ -26,6 +27,20 @@ struct PEEKPOKEBRIDGEMODULE_struct {
  */
 class peek_poke_t final : public widget_t {
 public:
+  // Audited host state only; generated RTL/MMIO remain separate owners.
+  std::string checkpoint_schema() const override { return "firesim.widget.peek-poke.v1"; }
+  std::vector<uint8_t> save_checkpoint() const override {
+    return checkpoint_state.save(checkpoint_configuration(), uint64_t(req_unstable) | (uint64_t(req_timeout) << 1));
+  }
+  void validate_checkpoint(const std::vector<uint8_t> &payload) const override {
+    checkpoint_state.validate(payload, checkpoint_configuration(), 3);
+  }
+  void load_checkpoint(const std::vector<uint8_t> &payload) override {
+    const auto flags = checkpoint_state.validate(payload, checkpoint_configuration(), 3);
+    req_unstable = flags & 1;
+    req_timeout = flags & 2;
+  }
+
   /// The identifier for the bridge type.
   static char KIND;
 
@@ -72,12 +87,14 @@ public:
   void step(size_t n, bool blocking);
 
 private:
+  widget_checkpoint_state_t checkpoint_state;
+  widget_checkpoint_config_t checkpoint_configuration() const;
   /// Base MMIO port mapping.
   const PEEKPOKEBRIDGEMODULE_struct mmio_addrs;
   /// Flag to indicate whether the last request was on an unstable value.
-  bool req_unstable;
+  bool req_unstable = false;
   /// Flag to indicate whether the last request timed out.
-  bool req_timeout;
+  bool req_timeout = false;
   /// Addresses of input ports.
   const PortMap inputs;
   /// Addresses of output ports.

@@ -3,6 +3,7 @@
 #include "loadmem.h"
 
 #include <fstream>
+#include <memory>
 
 #include "core/simif.h"
 
@@ -20,6 +21,7 @@ loadmem_t::loadmem_t(simif_t &simif,
 }
 
 void loadmem_t::load_mem_from_file(const std::string &filename) {
+  widget_checkpoint_state_t::call_t call(checkpoint_state);
   fprintf(stdout, "[loadmem] start loading file: %s\n", filename.c_str());
   std::ifstream file(filename.c_str());
   if (!file) {
@@ -32,22 +34,26 @@ void loadmem_t::load_mem_from_file(const std::string &filename) {
 
   size_t addr = 0;
   std::string line;
-  mpz_t data;
-  mpz_init(data);
+  struct data_t {
+    mpz_t value;
+    data_t() { mpz_init(value); }
+    ~data_t() { mpz_clear(value); }
+  } owned_data;
+  auto &data = owned_data.value;
   while (std::getline(file, line)) {
     assert(line.length() % chunk == 0);
     for (int j = line.length() - chunk; j >= 0; j -= chunk) {
       mpz_set_str(data, line.substr(j, chunk).c_str(), 16);
-      write_mem(addr, data);
+      write_mem_impl(addr, data);
       addr += chunk / 2;
     }
   }
-  mpz_clear(data);
   file.close();
   fprintf(stdout, "[loadmem] done\n");
 }
 
 void loadmem_t::read_mem(size_t addr, mpz_t &value) {
+  widget_checkpoint_state_t::call_t call(checkpoint_state);
   // NB: mpz_t variables may not export <size> <uint32_t> beats, if initialized
   // with an array of zeros.
   simif.write(mmio_addrs.R_ADDRESS_H, addr >> 32);
@@ -60,12 +66,18 @@ void loadmem_t::read_mem(size_t addr, mpz_t &value) {
 }
 
 void loadmem_t::write_mem(size_t addr, mpz_t &value) {
+  widget_checkpoint_state_t::call_t call(checkpoint_state);
+  write_mem_impl(addr, value);
+}
+
+void loadmem_t::write_mem_impl(size_t addr, mpz_t &value) {
   simif.write(mmio_addrs.W_ADDRESS_H, addr >> 32);
   simif.write(mmio_addrs.W_ADDRESS_L, addr & ((1ULL << 32) - 1));
   simif.write(mmio_addrs.W_LENGTH, 1);
   size_t size;
   uint32_t *data =
       (uint32_t *)mpz_export(nullptr, &size, -1, sizeof(uint32_t), 0, 0, value);
+  std::unique_ptr<uint32_t, decltype(&free)> exported(data, &free);
   for (size_t i = 0; i < mem_data_chunk; i++) {
     simif.write(mmio_addrs.W_DATA, i < size ? data[i] : 0);
   }
@@ -74,6 +86,7 @@ void loadmem_t::write_mem(size_t addr, mpz_t &value) {
 static size_t ceil_div(size_t a, size_t b) { return ((a)-1) / (b) + 1; }
 
 void loadmem_t::write_mem_chunk(size_t addr, mpz_t &value, size_t bytes) {
+  widget_checkpoint_state_t::call_t call(checkpoint_state);
   const unsigned mem_data_chunk_bytes = mem_data_chunk * sizeof(uint32_t);
 
   simif.write(mmio_addrs.W_ADDRESS_H, addr >> 32);
@@ -84,13 +97,22 @@ void loadmem_t::write_mem_chunk(size_t addr, mpz_t &value, size_t bytes) {
   size_t size;
   uint32_t *data =
       (uint32_t *)mpz_export(nullptr, &size, -1, sizeof(uint32_t), 0, 0, value);
+  std::unique_ptr<uint32_t, decltype(&free)> exported(data, &free);
   for (size_t i = 0; i < num_beats * mem_data_chunk; i++) {
     simif.write(mmio_addrs.W_DATA, i < size ? data[i] : 0);
   }
 }
 
 void loadmem_t::zero_out_dram() {
+  widget_checkpoint_state_t::call_t call(checkpoint_state);
   simif.write(mmio_addrs.ZERO_OUT_DRAM, 1);
   while (!simif.read(mmio_addrs.ZERO_FINISHED))
     ;
+}
+
+widget_checkpoint_config_t loadmem_t::checkpoint_configuration() const {
+  return {3, {mmio_addrs.W_ADDRESS_H, mmio_addrs.W_ADDRESS_L, mmio_addrs.W_LENGTH,
+              mmio_addrs.ZERO_OUT_DRAM, mmio_addrs.W_DATA, mmio_addrs.ZERO_FINISHED,
+              mmio_addrs.R_ADDRESS_H, mmio_addrs.R_ADDRESS_L, mmio_addrs.R_DATA,
+              mem_conf.id_bits, mem_conf.addr_bits, mem_conf.data_bits, mem_data_chunk}};
 }

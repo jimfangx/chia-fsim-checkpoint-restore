@@ -34,6 +34,12 @@ reset_pulse_t::reset_pulse_t(simif_t &sim,
 }
 
 void reset_pulse_t::init() {
+  widget_checkpoint_state_t::call_t call(checkpoint_state);
   write(mmio_addrs.pulseLength, this->pulse_length);
   write(mmio_addrs.doneInit, 1);
+}
+
+widget_checkpoint_config_t reset_pulse_t::checkpoint_configuration() const {
+  return {4, {mmio_addrs.pulseLength, mmio_addrs.doneInit, max_pulse_length,
+              default_pulse_length, pulse_length}};
 }
