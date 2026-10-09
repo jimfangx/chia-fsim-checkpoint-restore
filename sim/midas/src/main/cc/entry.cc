@@ -5,6 +5,10 @@
 #include "core/config.h"
 #include "core/simif.h"
 #include "core/simulation.h"
+#include "entry.h"
+#ifdef FS_CHECKPOINT_ENTRY
+#include "core/checkpoint_entry.h"
+#endif
 
 // NOLINTBEGIN
 #define GET_INCLUDES
@@ -33,11 +37,23 @@ create_simif(const TargetConfig &config, int argc, char **argv);
 std::unique_ptr<simif_t> simulator; // must exist for dpi.cc calls in emulation,
                                     // must be global to avoid deletion
 std::unique_ptr<simulation_t> simulation; // must be global to avoid deletion
+#ifdef FS_CHECKPOINT_ENTRY
+static std::unique_ptr<checkpoint_entry_t> checkpoint_entry;
+#endif
 
 // Entry point of the driver.
 int entry(int argc, char **argv) {
+#ifdef FS_CHECKPOINT_ENTRY
+  try {
+#endif
   // must have this exist for *.const.h
   std::vector<std::string> args(argv + 1, argv + argc);
+#ifdef FS_CHECKPOINT_ENTRY
+  checkpoint_entry = create_checkpoint_entry(args);
+  if (!checkpoint_entry)
+    throw std::runtime_error("enabled checkpoint entry has no capability");
+  puts("FS_CHECKPOINT_ENTRY_CONFIGURED before_platform=1");
+#endif
 
   // Create the hardware interface.
   simulator = create_simif(conf_target, argc, argv);
@@ -91,6 +107,22 @@ int entry(int argc, char **argv) {
   // Create the simulation instance.
   simulation = create_simulation(simif, *widget_registry_ptr, args);
 
+#ifdef FS_CHECKPOINT_ENTRY
+  puts("FS_CHECKPOINT_ENTRY_CONSTRUCTED before_run=1");
+  if (checkpoint_entry->prepare(simif, *simulation) ==
+      checkpoint_entry_t::action_t::restore_reserved) {
+    puts("FS_CHECKPOINT_ENTRY_RESERVED before_run=1");
+    return 0;
+  }
+#endif
+
   // Run the simulation with the given implementation.
   return simif.run(*simulation);
+#ifdef FS_CHECKPOINT_ENTRY
+  } catch (const std::exception &error) {
+    fprintf(stderr, "FS_CHECKPOINT_ENTRY_ERROR: %s\n", error.what());
+    // VCS ignores entry's return value. Never continue after a failed prepare.
+    std::exit(EXIT_FAILURE);
+  }
+#endif
 }

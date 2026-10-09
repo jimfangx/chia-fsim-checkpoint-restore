@@ -278,7 +278,9 @@ void fwd_put(qsfp_t &qsfp, uint32_t *io) {
 }
 } // namespace QSFP
 
-extern simif_emul_t *simulator;
+static simif_emul_t *metasim() {
+  return dynamic_cast<simif_emul_t *>(simulator.get());
+}
 
 // Publication is shared by ordinary ticks, parked continuations and fresh
 // bootstrap. It reads native outputs only, without consuming any AXI beat.
@@ -286,6 +288,8 @@ static void publish_outputs(uint32_t *ctrl_out, uint32_t *cpu_out,
                             uint32_t *fpga_out,
                             const std::array<uint32_t *, 4> &mem_out,
                             const std::array<uint32_t *, 2> &qsfp_in) {
+  auto *simulator = metasim();
+  if (!simulator) throw std::runtime_error("missing metasim output publisher");
   AXI4::rev_put(*simulator->master, ctrl_out);
   if (auto *cpu = simulator->get_cpu_managed_axi4()) AXI4::rev_put(*cpu, cpu_out);
   if (auto *fpga = simulator->get_fpga_managed_axi4()) AXI4::fwd_put(*fpga, fpga_out);
@@ -297,6 +301,7 @@ static void publish_outputs(uint32_t *ctrl_out, uint32_t *cpu_out,
 
 extern "C" {
 uint8_t simulator_restore_pending() {
+  auto *simulator = metasim();
   return simulator && simulator->restored_driver_pending();
 }
 
@@ -306,14 +311,14 @@ void simulator_restore_bootstrap(
     uint32_t *mem_0_out, uint32_t *mem_1_out, uint32_t *mem_2_out, uint32_t *mem_3_out,
     uint32_t *qsfp0_in, uint32_t *qsfp1_in) {
   try {
+    auto *simulator = metasim();
     if (!simulator) throw std::runtime_error("missing restored simulator");
     *fin = simulator->resume_restored_driver(bits, banks);
     publish_outputs(ctrl_out, cpu_out, fpga_out,
                     {mem_0_out, mem_1_out, mem_2_out, mem_3_out}, {qsfp0_in, qsfp1_in});
     if (*fin) {
       const int code = simulator->end();
-      delete simulator;
-      simulator = nullptr;
+      ::simulator.reset();
       if (code) exit(code);
     }
   } catch (const std::exception &error) {
@@ -324,10 +329,12 @@ void simulator_restore_bootstrap(
 }
 
 uint8_t simulator_checkpoint_pending() {
+  auto *simulator = metasim();
   return simulator && simulator->checkpoint_pending();
 }
 
 uint8_t simulator_checkpoint_lowclock() {
+  auto *simulator = metasim();
   return simulator && simulator->checkpoint_lowclock();
 }
 
@@ -339,6 +346,7 @@ void simulator_checkpoint_settled(
     uint32_t *mem_2_out, uint32_t *mem_3_out,
     uint32_t *qsfp0_in, uint32_t *qsfp1_in) {
   try {
+    auto *simulator = metasim();
     if (!simulator)
       throw std::runtime_error("missing simulator at settled boundary");
     *fin = simulator->checkpoint_settled(bits, banks);
@@ -348,8 +356,7 @@ void simulator_checkpoint_settled(
                     {mem_0_out, mem_1_out, mem_2_out, mem_3_out}, {qsfp0_in, qsfp1_in});
     if (*fin) {
       int code = simulator->end();
-      delete simulator;
-      simulator = nullptr;
+      ::simulator.reset();
       if (code)
         exit(code);
     }
@@ -386,6 +393,7 @@ void simulator_tick(
     /* OUTPUT */ uint32_t *qsfp0_in,
     /* OUTPUT */ uint32_t *qsfp1_in) {
   try {
+    auto *simulator = metasim();
     // The driver ucontext is initialized before spawning the VCS
     // context, so these pointers should be initialized.
     assert(simulator != nullptr);
@@ -421,8 +429,7 @@ void simulator_tick(
 
     if (*fin) {
       int exit_code = simulator->end();
-      delete simulator;
-      simulator = nullptr;
+      ::simulator.reset();
       if (exit_code)
         exit(exit_code);
     }
