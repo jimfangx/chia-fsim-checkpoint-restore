@@ -17,7 +17,8 @@
 
 simif_emul_t::simif_emul_t(const TargetConfig &config,
                            const std::vector<std::string> &args)
-    : simif_t(config), master(std::make_unique<mmio_t>(config.ctrl)) {
+    : simif_t(config), master(std::make_unique<mmio_t>(config.ctrl)),
+      driver_diagnostic(args) {
 
   // Parse arguments.
   memsize = 1L << config.mem.addr_bits;
@@ -168,6 +169,10 @@ simif_emul_t::checkpoint_axi_owners() {
 }
 
 void simif_emul_t::start_driver(simulation_t &sim) {
+  if (driver_diagnostic.requested() && !sim.simulation_supports_steps()) {
+    fprintf(stderr, "FS_DRIVER_BOUNDARY_ERROR: unsupported incremental simulation driver\n");
+    std::exit(EXIT_FAILURE);
+  }
   // Set up the simulation thread.
   finished = false;
   exit_code = EXIT_FAILURE;
@@ -190,7 +195,20 @@ void simif_emul_t::start_driver(simulation_t &sim) {
       }
 
       // Run the simulation flow.
-      exit_code = sim.execute_simulation_flow();
+      try {
+        simulation_t::run_boundary_t boundary;
+        if (driver_diagnostic.requested())
+          boundary = [this](simulation_t &driver, bool done) { capture_driver_boundary(driver, done); };
+        exit_code = sim.execute_simulation_flow(boundary);
+        driver_diagnostic.finish();
+      } catch (const std::exception &error) {
+        fprintf(stderr, "FS_DRIVER_BOUNDARY_ERROR: %s\n", error.what());
+        // VCS is waiting in DPI. Its exit handlers can wait for that thread,
+        // deadlocking a worker-thread std::exit(). Fail without exit handlers;
+        // the diagnostic is unpublished/closed before reaching this catch.
+        std::fflush(nullptr);
+        std::_Exit(EXIT_FAILURE);
+      }
 
       // Wake the target thread before returning from the simulation thread.
       {
@@ -218,6 +236,7 @@ void simif_emul_t::wait_read(mmio_t &mmio, void *data) {
 }
 
 void simif_emul_t::write(size_t addr, uint32_t data) {
+  require_no_driver_capture();
   uint64_t size = master->get_config().get_size();
   assert(size == 2 && "AXI4-lite control interface has unexpected size");
   uint64_t strb = (1 << master->get_config().strb_bits()) - 1;
@@ -226,6 +245,7 @@ void simif_emul_t::write(size_t addr, uint32_t data) {
 }
 
 uint32_t simif_emul_t::read(size_t addr) {
+  require_no_driver_capture();
   uint64_t size = master->get_config().get_size();
   assert(size == 2 && "AXI4-lite control interface has unexpected size");
   uint32_t data;
@@ -238,6 +258,7 @@ uint32_t simif_emul_t::read(size_t addr) {
 
 size_t simif_emul_t::CPUManagedStreamIOImpl::cpu_managed_axi4_read(
     size_t addr, char *data, size_t size) {
+  simif.require_no_driver_capture();
   const uint64_t beat_bytes = cpu_managed_axi4.get_config().beat_bytes();
   ssize_t len = (size - 1) / beat_bytes;
 
@@ -256,6 +277,7 @@ size_t simif_emul_t::CPUManagedStreamIOImpl::cpu_managed_axi4_read(
 
 size_t simif_emul_t::CPUManagedStreamIOImpl::cpu_managed_axi4_write(
     size_t addr, const char *data, size_t size) {
+  simif.require_no_driver_capture();
   const uint64_t beat_bytes = cpu_managed_axi4.get_config().beat_bytes();
   ssize_t len = (size - 1) / beat_bytes;
   const size_t remaining = size - len * beat_bytes;
@@ -310,6 +332,7 @@ int simif_emul_t::end() {
 }
 
 void simif_emul_t::do_tick() {
+  require_no_driver_capture();
   driver_flag = false;
   rtlsim_flag = true;
 
@@ -329,11 +352,57 @@ bool simif_emul_t::to_sim() {
 
   {
     std::unique_lock<std::mutex> lock(driver_mutex);
+    driver_context_active = true;
     driver_cond.notify_one();
   }
   {
     std::unique_lock<std::mutex> lock(rtlsim_mutex);
     rtlsim_cond.wait(lock, [&] { return rtlsim_flag || finished; });
   }
+  driver_context_active = false;
   return finished;
+}
+
+void simif_emul_t::capture_driver_boundary(simulation_t &sim, bool done) {
+  if (std::this_thread::get_id() != thread.get_id() || !driver_context_active)
+    throw std::runtime_error(
+        "driver boundary capture outside parked DPI driver context");
+  require_no_driver_capture();
+  driver_capture_active = true;
+  try {
+    driver_boundary_diagnostic_t::owners_t owners;
+    if (driver_diagnostic.due()) {
+      owners = checkpoint_axi_owners();
+      owners.push_back(checkpoint_host_timing_owner());
+      const auto widgets = sim.checkpoint_widget_owners();
+      owners.insert(owners.end(), widgets.begin(), widgets.end());
+      const auto drivers = sim.checkpoint_driver_owners();
+      owners.insert(owners.end(), drivers.begin(), drivers.end());
+      // Every missing category remains explicit. In particular, parked DPI
+      // is not settled RTL; harness AXI latches/NBA/clock phase are not
+      // captured.
+      owners.emplace_back("generated/rtl", nullptr);
+      owners.emplace_back("runtime/harness", nullptr);
+      owners.emplace_back("runtime/execution-context", nullptr);
+      if (cpu_managed_stream_io)
+        owners.emplace_back("runtime/cpu-managed-stream-io", nullptr);
+      if (fpga_managed_stream_io)
+        owners.emplace_back("runtime/fpga-managed-stream-io", nullptr);
+      for (size_t i = 0; i < qsfp.size(); ++i)
+        owners.emplace_back("runtime/qsfp/" + std::to_string(i), nullptr);
+    }
+    driver_diagnostic.observe(owners);
+    if (done)
+      driver_diagnostic.finish();
+    driver_capture_active = false;
+  } catch (...) {
+    driver_capture_active = false;
+    throw;
+  }
+}
+
+void simif_emul_t::require_no_driver_capture() const {
+  if (driver_capture_active)
+    throw std::runtime_error(
+        "MMIO/RTL advancement during driver boundary capture");
 }

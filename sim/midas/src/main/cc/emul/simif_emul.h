@@ -14,6 +14,7 @@
 #include "bridges/cpu_managed_stream.h"
 #include "bridges/fpga_managed_stream.h"
 #include "core/simif.h"
+#include "core/driver_boundary_diagnostic.h"
 #include "emul/mm.h"
 #include "emul/host_timing.h"
 #include "emul/mmio.h"
@@ -174,6 +175,14 @@ protected:
   void load_mems(const char *fname);
 
 private:
+  driver_boundary_diagnostic_t driver_diagnostic;
+  // Published only while to_sim has parked VCS in DPI. This does not mean
+  // RTL/NBA settlement: it certifies software ownership access on the driver.
+  std::atomic<bool> driver_context_active{false};
+  bool driver_capture_active = false;
+  void require_no_driver_capture() const;
+  void capture_driver_boundary(simulation_t &sim, bool done);
+
   class CPUManagedStreamIOImpl final : public CPUManagedStreamIO {
   public:
     CPUManagedStreamIOImpl(simif_emul_t &simif, const AXI4Config &config)

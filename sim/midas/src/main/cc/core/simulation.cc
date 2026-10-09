@@ -99,7 +99,16 @@ void simulation_t::simulation_finish() {
   }
 }
 
-int simulation_t::execute_simulation_flow() {
+std::vector<std::pair<std::string, checkpoint_owner_t *>>
+simulation_t::checkpoint_widget_owners() {
+  return registry.checkpoint_owners();
+}
+
+int simulation_t::execute_simulation_flow(const run_boundary_t &boundary) {
+  // Reject before initialization/MMIO if a coordinator requests boundaries
+  // from a driver that cannot return at completed host operations.
+  if (boundary && !simulation_supports_steps())
+    throw std::runtime_error("unsupported incremental simulation driver");
   fprintf(stderr, "entered simulation flow execution\n");
   wait_for_init();
   fprintf(stderr, "finished waiting\n");
@@ -142,7 +151,18 @@ int simulation_t::execute_simulation_flow() {
 
   record_start_times();
   fprintf(stderr, "Commencing simulation.\n");
-  const int exit_code = simulation_run();
+  int exit_code;
+  if (simulation_supports_steps()) {
+    bool done;
+    do {
+      done = simulation_run_step();
+      if (boundary)
+        boundary(*this, done);
+    } while (!done);
+    exit_code = simulation_run_finalize();
+  } else {
+    exit_code = simulation_run();
+  }
   fprintf(stderr, "\nSimulation complete.\n");
   record_end_times();
 

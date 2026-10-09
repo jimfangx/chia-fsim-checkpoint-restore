@@ -44,11 +44,17 @@ void widget_registry_t::add_widget(StreamEngine *widget) {
   }
 }
 
-void widget_registry_t::checkpoint_preflight() const {
+std::vector<std::pair<std::string, checkpoint_owner_t *>>
+widget_registry_t::checkpoint_owners() const {
+  std::vector<std::pair<std::string, checkpoint_owner_t *>> owners;
   for (size_t i = 0; i < checkpoint_widgets.size(); ++i) {
-    if (checkpoint_widgets[i]->checkpoint_schema().empty()) {
-      throw std::runtime_error("unsupported host checkpoint owner widget/" +
-                               std::to_string(i) + " (generated constructor order)");
-    }
+    owners.emplace_back("widget/" + std::to_string(i), checkpoint_widgets[i]);
   }
+  return owners;
+}
+
+void widget_registry_t::checkpoint_preflight() const {
+  for (const auto &[id, owner] : checkpoint_owners())
+    if (owner->checkpoint_schema().empty())
+      throw std::runtime_error("unsupported host checkpoint owner " + id + " (generated constructor order)");
 }

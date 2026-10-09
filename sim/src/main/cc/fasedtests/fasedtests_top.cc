@@ -17,6 +17,12 @@ public:
                   const std::vector<std::string> &args);
 
   int simulation_run() override;
+  bool simulation_supports_steps() const override { return true; }
+  bool simulation_run_step() override {
+    run_loop.advance(*this);
+    return run_loop.finished();
+  }
+  int simulation_run_finalize() override;
 
   bool simulation_timed_out() override { return !run_loop.target_done(); }
 
@@ -92,8 +98,14 @@ fasedtests_top_t::fasedtests_top_t(simif_t &simif,
 int fasedtests_top_t::simulation_run() {
   // Run the simulation until the target reports it is finished by setting
   // the done output flag or the desired number of cycles completes.
-  while (!run_loop.finished())
-    run_loop.advance(*this);
+  while (!simulation_run_step())
+    ;
+  return simulation_run_finalize();
+}
+
+int fasedtests_top_t::simulation_run_finalize() {
+  if (!run_loop.finished())
+    throw std::runtime_error("FCFS finalization before run-loop completion");
 
   // Iterate through all uarch values we want to validate.
   bool failed = false;

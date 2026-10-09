@@ -105,6 +105,7 @@ public:
   // Owner indices follow generated constructor order; pointer/hash iteration
   // never forms a checkpoint identity.
   void checkpoint_preflight() const;
+  std::vector<std::pair<std::string, checkpoint_owner_t *>> checkpoint_owners() const;
 
 private:
   // Mapping from bridge kinds to the list of bridges of that kind.

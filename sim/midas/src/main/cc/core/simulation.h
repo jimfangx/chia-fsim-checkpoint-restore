@@ -3,6 +3,7 @@
 #ifndef __SIMULATION_H
 #define __SIMULATION_H
 
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -44,6 +45,8 @@ public:
   checkpoint_driver_owners() {
     return {{"runtime/simulation", this}};
   }
+  std::vector<std::pair<std::string, checkpoint_owner_t *>>
+  checkpoint_widget_owners();
 
   /**
    * Simulation main loop.
@@ -57,6 +60,18 @@ public:
    * @return Exit code to return to the system.
    */
   virtual int simulation_run() = 0;
+
+  // Incremental dispatch is opt-in. A step returns true on completion and
+  // returns only after a whole synchronous host operation has committed.
+  // It must not retain a suspended MMIO/bridge/callback stack across calls.
+  // This interface does not certify RTL settlement or checkpoint support.
+  virtual bool simulation_supports_steps() const { return false; }
+  virtual bool simulation_run_step() {
+    throw std::runtime_error("unsupported incremental simulation driver");
+  }
+  virtual int simulation_run_finalize() {
+    throw std::runtime_error("unsupported incremental simulation finalization");
+  }
 
   /**
    * Simulation initialization.
@@ -94,7 +109,10 @@ public:
    *
    * Returns an exit code from the simulation.
    */
-  int execute_simulation_flow();
+  // The completion flag permits the coordinator to reject an unmet request
+  // before finalization/reporting. Callback work must not advance the target.
+  using run_boundary_t = std::function<void(simulation_t &, bool)>;
+  int execute_simulation_flow(const run_boundary_t &boundary = {});
 
 private:
   /**
