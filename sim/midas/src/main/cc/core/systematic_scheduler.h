@@ -6,7 +6,10 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "core/checkpoint.h"
 
 // Maximum step size in MIDAS's master is capped to width of the simulation bus
 constexpr uint64_t MAX_MIDAS_STEP = (1LL << sizeof(uint32_t) * 8) - 1;
@@ -20,11 +23,14 @@ constexpr uint64_t MAX_MIDAS_STEP = (1LL << sizeof(uint32_t) * 8) - 1;
 // simulator to the time of the desired task. The onus is on the parent class /
 // instantiator to ensure the simulator has advanced to the desired cycle
 // before running the scheduled task.
-class systematic_scheduler_t {
+class systematic_scheduler_t : public checkpoint_owner_t {
   using task_t = std::function<uint64_t()>;
   using task_tuple_t = struct {
     task_t task;
     uint64_t next_cycle;
+    uint64_t first_cycle;
+    std::string checkpoint_id;
+    checkpoint_owner_t *checkpoint_owner;
   };
 
 public:
@@ -32,6 +38,18 @@ public:
 
   // Adds a new task to scheduler.
   void register_task(uint64_t first_cycle, task_t &&task);
+  // The adapter must cover ALL callback/closure state and outlive the scheduler.
+  // Its payload is a separate owner, never a function or object address.
+  void register_checkpoint_task(const std::string &id, uint64_t first_cycle,
+                                task_t &&task, checkpoint_owner_t &owner);
+  // Component inventory only: the runtime coordinator must capture every
+  // returned owner at a coherent cut. current_cycle records issued credits,
+  // not completed target execution; pending step/driver state lives elsewhere.
+  std::vector<std::pair<std::string, checkpoint_owner_t *>> checkpoint_owners();
+  std::string checkpoint_schema() const override;
+  std::vector<uint8_t> save_checkpoint() const override;
+  void validate_checkpoint(const std::vector<uint8_t> &) const override;
+  void load_checkpoint(const std::vector<uint8_t> &) override;
   // Calculates the next simulation step by taking the min of all
   // tasks.next_cycle
   uint32_t get_largest_stepsize();
@@ -51,5 +69,12 @@ private:
   uint64_t current_cycle = 0;
 
   std::vector<task_tuple_t> tasks;
+  // Callbacks may yield to RTL through MMIO. Such suspended calls are not a
+  // restorable boundary. A throwing callback also makes the scheduler unsafe.
+  bool executing_tasks = false;
+  bool poisoned = false;
+  void require_checkpoint_boundary() const;
+  std::pair<uint64_t, std::vector<uint64_t>>
+  parse_checkpoint(const std::vector<uint8_t> &) const;
 };
 #endif // __SYSTEMATIC_SCHEDULER_H
