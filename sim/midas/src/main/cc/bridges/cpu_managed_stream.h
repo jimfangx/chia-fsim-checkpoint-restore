@@ -172,6 +172,18 @@ public:
       const std::vector<std::string> &args,
       std::vector<CPUManagedStreams::StreamParameters> &&from_cpu,
       std::vector<CPUManagedStreams::StreamParameters> &&to_cpu);
+
+  std::string checkpoint_schema() const override {
+    return "firesim.widget.cpu-managed-stream.v1";
+  }
+  std::vector<uint8_t> save_checkpoint() const override;
+  void validate_checkpoint(const std::vector<uint8_t> &) const override;
+  void load_checkpoint(const std::vector<uint8_t> &) override;
+
+private:
+  // CPU-managed drivers keep no host queue/read offset. Hardware queues and
+  // the AXI transport are separate owners, never omitted by this adapter.
+  const widget_checkpoint_config_t checkpoint_config;
 };
 
 #endif // __BRIDGES_CPU_MANAGED_STREAM_H

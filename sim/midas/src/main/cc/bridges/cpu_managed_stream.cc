@@ -5,6 +5,41 @@
 
 using namespace CPUManagedStreams;
 
+namespace {
+widget_checkpoint_config_t stream_config(
+    unsigned index, uint64_t beat_bytes,
+    const std::vector<StreamParameters> &from_cpu,
+    const std::vector<StreamParameters> &to_cpu) {
+  widget_checkpoint_config_t config(7, {index, beat_bytes});
+  // Direction and generated order are significant: runtime calls use indices.
+  for (const auto *streams : {&from_cpu, &to_cpu}) {
+    config.word(streams->size());
+    for (const auto &params : *streams) {
+      config.text(params.stream_name);
+      config.word(params.dma_addr);
+      config.word(params.count_addr);
+      config.word(params.fpga_buffer_size);
+      config.word(params.fpga_buffer_width_bytes);
+    }
+  }
+  return config;
+}
+} // namespace
+
+std::vector<uint8_t> CPUManagedStreamWidget::save_checkpoint() const {
+  return checkpoint_state.save(checkpoint_config, initialized);
+}
+
+void CPUManagedStreamWidget::validate_checkpoint(
+    const std::vector<uint8_t> &payload) const {
+  checkpoint_state.validate(payload, checkpoint_config, 1);
+}
+
+void CPUManagedStreamWidget::load_checkpoint(const std::vector<uint8_t> &payload) {
+  // Full validation precedes mutation; hooks perform no MMIO/DMA/init calls.
+  initialized = checkpoint_state.validate(payload, checkpoint_config, 1);
+}
+
 /**
  * @brief Enqueues as much as num_bytes of data into the associated stream
  *
@@ -94,7 +129,10 @@ CPUManagedStreamWidget::CPUManagedStreamWidget(
     unsigned index,
     const std::vector<std::string> &args,
     std::vector<CPUManagedStreams::StreamParameters> &&from_cpu,
-    std::vector<CPUManagedStreams::StreamParameters> &&to_cpu) {
+    std::vector<CPUManagedStreams::StreamParameters> &&to_cpu)
+    : checkpoint_config(stream_config(index,
+                                     simif.get_cpu_managed_stream_io().get_beat_bytes(),
+                                     from_cpu, to_cpu)) {
   assert(index == 0 && "only one managed stream engine is allowed");
 
   auto &io = simif.get_cpu_managed_stream_io();

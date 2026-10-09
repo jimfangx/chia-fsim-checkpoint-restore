@@ -6,6 +6,7 @@
 #include <memory>
 #include <vector>
 #include "core/checkpoint.h"
+#include "core/widget_checkpoint.h"
 
 class FPGAToCPUStreamDriver {
 public:
@@ -95,6 +96,10 @@ public:
   int fpga_to_cpu_cnt() { return fpga_to_cpu_streams.size(); }
 
 protected:
+  // Stream calls can suspend in MMIO/DMA with caller-owned buffers on their
+  // stack. Only explicitly audited concrete engines may certify idle state.
+  widget_checkpoint_state_t checkpoint_state;
+  bool initialized = false;
   std::vector<std::unique_ptr<FPGAToCPUStreamDriver>> fpga_to_cpu_streams;
   std::vector<std::unique_ptr<CPUToFPGAStreamDriver>> cpu_to_fpga_streams;
 };
