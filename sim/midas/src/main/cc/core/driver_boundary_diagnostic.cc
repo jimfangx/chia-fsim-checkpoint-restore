@@ -31,6 +31,11 @@ driver_boundary_diagnostic_t::driver_boundary_diagnostic_t(
     const std::vector<std::string> &args) {
   bool have_cut = false, have_path = false;
   for (const auto &arg : args) {
+    if (arg.rfind("+fs-driver-settled", 0) == 0) {
+      require(arg == "+fs-driver-settled" && !settled_capture,
+              "invalid/duplicate settled modifier");
+      settled_capture = true;
+    }
     if (arg.rfind("+fs-driver-cut=", 0) == 0) {
       require(!have_cut, "duplicate cut");
       have_cut = true;
@@ -50,6 +55,8 @@ driver_boundary_diagnostic_t::driver_boundary_diagnostic_t(
   }
   require(have_cut == have_path,
           "cut and diagnostic path must be supplied together");
+  require(!settled_capture || have_cut,
+          "settled modifier requires a diagnostic request");
 }
 
 void driver_boundary_diagnostic_t::observe(const owners_t &owners) {

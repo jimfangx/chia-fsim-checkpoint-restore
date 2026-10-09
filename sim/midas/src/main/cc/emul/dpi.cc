@@ -281,6 +281,48 @@ void fwd_put(qsfp_t &qsfp, uint32_t *io) {
 extern simif_emul_t *simulator;
 
 extern "C" {
+uint8_t simulator_checkpoint_pending() {
+  return simulator && simulator->checkpoint_pending();
+}
+
+void simulator_checkpoint_settled(
+    uint32_t bits, const uint32_t *banks, uint8_t *fin,
+    uint32_t *ctrl_out, uint32_t *cpu_managed_axi4_out,
+    uint32_t *fpga_managed_axi4_out,
+    uint32_t *mem_0_out, uint32_t *mem_1_out,
+    uint32_t *mem_2_out, uint32_t *mem_3_out,
+    uint32_t *qsfp0_in, uint32_t *qsfp1_in) {
+  try {
+    if (!simulator)
+      throw std::runtime_error("missing simulator at settled boundary");
+    *fin = simulator->checkpoint_settled(bits, banks);
+    // No second AXI tick: only publish the outputs produced by the resumed
+    // driver, just as the original uninterrupted simulator_tick would do.
+    AXI4::rev_put(*simulator->master, ctrl_out);
+    if (auto *cpu = simulator->get_cpu_managed_axi4())
+      AXI4::rev_put(*cpu, cpu_managed_axi4_out);
+    if (auto *fpga = simulator->get_fpga_managed_axi4())
+      AXI4::fwd_put(*fpga, fpga_managed_axi4_out);
+    std::array<uint32_t *, 4> mem_out{mem_0_out, mem_1_out, mem_2_out, mem_3_out};
+    for (size_t i = 0; i < simulator->slave.size(); ++i)
+      AXI4::fwd_put(*simulator->slave[i], mem_out[i]);
+    std::array<uint32_t *, 2> qsfp_in{qsfp0_in, qsfp1_in};
+    for (size_t i = 0; i < simulator->qsfp.size(); ++i)
+      QSFP::fwd_put(*simulator->qsfp[i], qsfp_in[i]);
+    if (*fin) {
+      int code = simulator->end();
+      delete simulator;
+      simulator = nullptr;
+      if (code)
+        exit(code);
+    }
+  } catch (const std::exception &error) {
+    fprintf(stderr, "FS_DRIVER_BOUNDARY_ERROR: %s\n", error.what());
+    std::fflush(nullptr);
+    std::_Exit(EXIT_FAILURE);
+  }
+}
+
 void simulator_tick(
     /* INPUT  */ const uint8_t reset,
     /* OUTPUT */ uint8_t *fin,

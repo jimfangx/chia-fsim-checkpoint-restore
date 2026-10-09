@@ -7,6 +7,7 @@
 #include "core/simulation.h"
 #include "emul/mm.h"
 #include "emul/mmio.h"
+#include "emul/harness_observation.h"
 #include <cassert>
 #include <climits>
 #include <cinttypes>
@@ -19,6 +20,10 @@ simif_emul_t::simif_emul_t(const TargetConfig &config,
                            const std::vector<std::string> &args)
     : simif_t(config), master(std::make_unique<mmio_t>(config.ctrl)),
       driver_diagnostic(args) {
+#ifndef VCS
+  if (driver_diagnostic.settled())
+    throw std::runtime_error("settled driver diagnostics require the VCS harness");
+#endif
 
   // Parse arguments.
   memsize = 1L << config.mem.addr_bits;
@@ -357,7 +362,7 @@ bool simif_emul_t::to_sim() {
   }
   {
     std::unique_lock<std::mutex> lock(rtlsim_mutex);
-    rtlsim_cond.wait(lock, [&] { return rtlsim_flag || finished; });
+    rtlsim_cond.wait(lock, [&] { return rtlsim_flag || finished || settled_pending; });
   }
   driver_context_active = false;
   return finished;
@@ -391,7 +396,21 @@ void simif_emul_t::capture_driver_boundary(simulation_t &sim, bool done) {
       for (size_t i = 0; i < qsfp.size(); ++i)
         owners.emplace_back("runtime/qsfp/" + std::to_string(i), nullptr);
     }
-    driver_diagnostic.observe(owners);
+    if (driver_diagnostic.settled() && driver_diagnostic.due()) {
+      // Publish the complete inventory before releasing VCS. The worker stays
+      // in this callback, with no suspended MMIO or host-delay operation.
+      std::unique_lock<std::mutex> lock(settled_mutex);
+      settled_owners = std::move(owners);
+      {
+        std::unique_lock<std::mutex> rtl_lock(rtlsim_mutex);
+        settled_pending = true;
+        rtlsim_cond.notify_one();
+      }
+      settled_cond.wait(lock, [&] { return !settled_pending; });
+      settled_owners.clear();
+    } else {
+      driver_diagnostic.observe(owners);
+    }
     if (done)
       driver_diagnostic.finish();
     driver_capture_active = false;
@@ -399,6 +418,30 @@ void simif_emul_t::capture_driver_boundary(simulation_t &sim, bool done) {
     driver_capture_active = false;
     throw;
   }
+}
+
+bool simif_emul_t::checkpoint_settled(uint32_t bits, const uint32_t *banks) {
+  if (std::this_thread::get_id() == thread.get_id() || driver_context_active ||
+      !settled_pending || !driver_capture_active)
+    throw std::runtime_error("settled capture outside parked driver boundary");
+  {
+    std::unique_lock<std::mutex> lock(settled_mutex);
+    harness_observation_t observation(bits, banks);
+    auto owners = settled_owners;
+    owners.emplace_back("diagnostic/harness-banks", &observation);
+    driver_diagnostic.observe(owners);
+    // Resume the existing operation dispatcher until its next normal yield.
+    // The DPI caller will refresh the output banks before the next RTL edge.
+    driver_context_active = true;
+    settled_pending = false;
+    settled_cond.notify_one();
+  }
+  {
+    std::unique_lock<std::mutex> lock(rtlsim_mutex);
+    rtlsim_cond.wait(lock, [&] { return rtlsim_flag || finished; });
+  }
+  driver_context_active = false;
+  return finished;
 }
 
 void simif_emul_t::require_no_driver_capture() const {

@@ -66,6 +66,12 @@ public:
    */
   bool to_sim();
 
+  // Return through DPI while the driver is parked at a completed operation.
+  // The harness invokes this after its rising-edge NBA updates, then resumes
+  // the same driver/DPI tick. Neither leg consumes a host timing tick.
+  bool checkpoint_pending() const { return settled_pending.load(); }
+  bool checkpoint_settled(uint32_t bits, const uint32_t *banks);
+
   /**
    * Transfers control to the target and lets the simulator wait for a tick.
    *
@@ -180,6 +186,10 @@ private:
   // RTL/NBA settlement: it certifies software ownership access on the driver.
   std::atomic<bool> driver_context_active{false};
   bool driver_capture_active = false;
+  std::atomic<bool> settled_pending{false};
+  std::mutex settled_mutex;
+  std::condition_variable settled_cond;
+  driver_boundary_diagnostic_t::owners_t settled_owners;
   void require_no_driver_capture() const;
   void capture_driver_boundary(simulation_t &sim, bool done);
 
