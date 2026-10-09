@@ -174,6 +174,8 @@ simif_emul_t::checkpoint_axi_owners() {
 }
 
 void simif_emul_t::start_driver(simulation_t &sim) {
+  if (loading_driver)
+    throw std::runtime_error("reserved restore destination cannot start ordinarily");
   if (restored_driver || restore_consumed)
     throw std::runtime_error("ordinary startup of an armed restored dispatcher");
   start_driver_impl(sim, false);
@@ -190,8 +192,26 @@ void simif_emul_t::require_restored_destination(simulation_t &sim) {
 void simif_emul_t::arm_restored_driver(simulation_t &sim) {
   if (restored_driver || restore_consumed)
     throw std::runtime_error("restored dispatcher already armed/consumed");
+  if (loading_driver && loading_driver != &sim)
+    throw std::runtime_error("reserved restore driver mismatch");
   require_restored_destination(sim);
+  loading_driver = nullptr;
   restored_driver = &sim;
+}
+
+void simif_emul_t::begin_restored_load(simulation_t &sim) {
+  if (loading_driver || restored_driver || restore_consumed || driver_started ||
+      driver_diagnostic.requested() || cpu_managed_stream_io || fpga_managed_stream_io ||
+      !qsfp.empty() || slave.size()>4)
+    throw std::runtime_error("unsupported/nonfresh restore loading destination");
+  sim.require_fresh_dispatcher();
+  if (!sim.simulation_supports_steps())
+    throw std::runtime_error("restore requires incremental simulation driver");
+  for (const auto &owners : {sim.checkpoint_driver_owners(), sim.checkpoint_widget_owners()})
+    for (const auto &[name, owner] : owners)
+      if (!owner || owner->checkpoint_schema().empty())
+        throw std::runtime_error("unsupported restore loading owner: " + name);
+  loading_driver = &sim;
 }
 
 bool simif_emul_t::resume_restored_driver(uint32_t bits, const uint32_t *banks) {
@@ -212,7 +232,7 @@ bool simif_emul_t::resume_restored_driver(uint32_t bits, const uint32_t *banks) 
 
 bool simif_emul_t::start_restored_driver(simulation_t &sim, uint32_t bits,
                                          const uint32_t *banks) {
-  if (restored_driver || restore_consumed)
+  if (restored_driver || loading_driver || restore_consumed)
     throw std::runtime_error("armed dispatcher must resume through the harness");
   require_restored_destination(sim);
   harness_observation_t::require_clock_phase(bits, banks, true);
