@@ -8,6 +8,9 @@
 #include "emul/mm.h"
 #include "emul/mmio.h"
 #include <cassert>
+#include <climits>
+#include <cinttypes>
+#include <limits>
 #include <memory>
 #include <string.h>
 #include <unistd.h>
@@ -23,6 +26,7 @@ simif_emul_t::simif_emul_t(const TargetConfig &config,
   int fpga_idx = 0;
   bool noc_part = false;
   bool comb_logic = false;
+  uint64_t maximum_host_delay = 1, fuzz_seed = 0;
   for (auto arg : args) {
     if (arg.find("+fastloadmem") == 0) {
       fastloadmem = true;
@@ -31,11 +35,11 @@ simif_emul_t::simif_emul_t(const TargetConfig &config,
       memsize = strtoll(arg.c_str() + 9, NULL, 10);
     }
     if (arg.find("+fuzz-host-timing=") == 0) {
-      maximum_host_delay = atoi(arg.c_str() + 18);
+      maximum_host_delay = host_timing_t::parse_unsigned(arg.substr(18), INT_MAX);
     }
     if (arg.find("+fuzz-seed=") == 0) {
-      fuzz_seed = strtoll(arg.c_str() + 11, NULL, 10);
-      fprintf(stderr, "Using custom fuzzer seed: %ld\n", fuzz_seed);
+      fuzz_seed = host_timing_t::parse_unsigned(arg.substr(11), std::numeric_limits<uint64_t>::max());
+      fprintf(stderr, "Using custom fuzzer seed: %" PRIu64 "\n", fuzz_seed);
     }
     if (arg.find("+loadmem=") == 0) {
       load_mem_path = arg.c_str() + 9;
@@ -54,6 +58,9 @@ simif_emul_t::simif_emul_t(const TargetConfig &config,
         noc_part = true;
     }
   }
+
+  // Validate delay configuration before any external partition setup.
+  host_timing = host_timing_t(maximum_host_delay, fuzz_seed);
 
   for (int i = 0; i < config.qsfp.num_channels; i++) {
     qsfp.emplace_back(std::make_unique<qsfp_t>(config.qsfp));
@@ -124,8 +131,6 @@ simif_emul_t::simif_emul_t(const TargetConfig &config,
 
   if (!fastloadmem)
     load_mem_path.clear();
-
-  fuzz_gen.seed(fuzz_seed);
 
   // Initialise memories.
   for (unsigned i = 0; i < config.mem_num_channels; ++i) {

@@ -56,9 +56,9 @@ override CXXFLAGS += -std=c++20
 sim_fpga_resource_models := $(v_dir)/BUFGCE.v
 
 emul_dir   := $(midas_dir)/emul
-emul_h     := $(driver_h) $(bridge_h) $(emul_dir)/simif_emul.h $(emul_dir)/mmio.h $(emul_dir)/mm.h $(midas_dir)/entry.h $(emul_dir)/qsfp.h
+emul_h     := $(driver_h) $(bridge_h) $(emul_dir)/simif_emul.h $(emul_dir)/host_timing.h $(emul_dir)/mmio.h $(emul_dir)/mm.h $(midas_dir)/entry.h $(emul_dir)/qsfp.h
 # This includes c sources and static libraries
-emul_cc    := $(DRIVER) $(bridge_cc) $(emul_dir)/simif_emul.cc $(emul_dir)/mmio.cc $(emul_dir)/mm.cc $(emul_dir)/dpi.cc $(midas_dir)/entry.cc $(emul_dir)/qsfp.cc
+emul_cc    := $(DRIVER) $(bridge_cc) $(emul_dir)/simif_emul.cc $(emul_dir)/host_timing.cc $(emul_dir)/mmio.cc $(emul_dir)/mm.cc $(emul_dir)/dpi.cc $(midas_dir)/entry.cc $(emul_dir)/qsfp.cc
 emul_v     := $(design_vh) $(DESIGN_V) $(sim_fpga_resource_models)
 
 TB := emul

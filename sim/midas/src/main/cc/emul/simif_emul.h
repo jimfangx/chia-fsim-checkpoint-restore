@@ -15,6 +15,7 @@
 #include "bridges/fpga_managed_stream.h"
 #include "core/simif.h"
 #include "emul/mm.h"
+#include "emul/host_timing.h"
 #include "emul/mmio.h"
 #include "emul/qsfp.h"
 
@@ -125,6 +126,12 @@ public:
   // scheduler/stream-engine/QSFP owners and a coherent freeze remain required.
   std::vector<std::pair<std::string, checkpoint_owner_t *>> checkpoint_axi_owners();
 
+  // A component subset, with no thread freeze or driver continuation claim.
+  // Hooks reject while advance_target is suspended, even if RTL is parked.
+  std::pair<std::string, checkpoint_owner_t *> checkpoint_host_timing_owner() {
+    return {"runtime/host-timing", &host_timing};
+  }
+
   /**
    * Return the wrapper around the CPU-managed stream AXI interface.
    */
@@ -140,15 +147,9 @@ public:
   }
 
 protected:
-  // The maximum number of cycles the RTL simulator can advance before
-  // switching back to the driver process. +fuzz-host-timings sets this to a
-  // value > 1, introducing random delays in axi4 tranactions that MMIO and
-  // bridge streams.
-  int maximum_host_delay = 1;
-
-  // random numbers
-  uint64_t fuzz_seed = 0;
-  std::mt19937_64 fuzz_gen;
+  // Full PRNG state and explicit pending host-delay progress. Configured by
+  // +fuzz-host-timing and +fuzz-seed; synchronous stack capture is unsupported.
+  host_timing_t host_timing;
 
   uint64_t memsize;
 
@@ -160,12 +161,10 @@ protected:
   /**
    * Advances the simulation by a random number of ticks.
    *
-   * The number of ticks is bounded by `maximum_host_delay`.
+   * The number of ticks is bounded by the configured maximum host delay.
    */
   inline void advance_target() {
-    unsigned nticks = fuzz_gen() % maximum_host_delay + 1;
-    for (unsigned i = 0; i < nticks; ++i)
-      do_tick();
+    host_timing.run_delay([this] { do_tick(); });
   }
 
   void wait_read(mmio_t &mmio, void *data);
