@@ -81,11 +81,12 @@ public:
     return flags;
   }
 
-private:
+public:
   void require_idle() const {
     if (active || poisoned)
       throw std::runtime_error("suspended/reentrant/interrupted widget operation");
   }
+private:
   bool active = false;
   bool poisoned = false;
 };

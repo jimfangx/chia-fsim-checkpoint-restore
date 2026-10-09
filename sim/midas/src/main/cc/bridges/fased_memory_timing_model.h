@@ -5,6 +5,7 @@
 
 #include "core/address_map.h"
 #include "core/bridge_driver.h"
+#include "core/widget_checkpoint.h"
 
 #include <fstream>
 #include <set>
@@ -77,8 +78,8 @@ public:
   void finish() override;
 
   std::string name;
-  uint64_t *range_bytes;
-  size_t nranges;
+  std::vector<uint64_t> range_bytes;
+  size_t nranges = 0;
 
 private:
   std::string enable = name + "Ranges_enable";
@@ -96,7 +97,7 @@ public:
   void profile() override {}
   void finish() override;
   std::string name;
-  uint64_t latency[HISTOGRAM_SIZE];
+  uint64_t latency[HISTOGRAM_SIZE] = {};
 
 private:
   std::string enable = name + "Hist_enable";
@@ -129,6 +130,13 @@ public:
   void finish() override;
   void profile();
 
+  std::string checkpoint_schema() const override {
+    return "firesim.widget.fased.v1";
+  }
+  std::vector<uint8_t> save_checkpoint() const override;
+  void validate_checkpoint(const std::vector<uint8_t> &) const override;
+  void load_checkpoint(const std::vector<uint8_t> &) override;
+
   const AddressMap &get_addr_map() const { return addr_map; }
 
 private:
@@ -141,6 +149,25 @@ private:
 
   std::vector<uint32_t> profile_reg_addrs;
   std::ofstream stats_file;
+  const unsigned model_number;
+  const std::string stats_path;
+  std::string stats_header;
+  std::string stats_history;
+  // A load changes logical output history without file I/O or MMIO. Replay
+  // that history at the next ordinary profile/finish operation.
+  bool stats_replay_pending = false;
+  uint64_t lifecycle = 0; // constructed=0, initialized=1, finished=2
+  widget_checkpoint_state_t checkpoint_state;
+  widget_checkpoint_config_t checkpoint_config() const;
+  struct decoded_checkpoint_t {
+    uint64_t lifecycle;
+    std::string history;
+    std::vector<std::vector<uint64_t>> histograms, ranges;
+  };
+  decoded_checkpoint_t decode_checkpoint(const std::vector<uint8_t> &) const;
+  void require_checkpointable() const;
+  void replay_stats();
+  void append_stats(const std::string &);
   std::vector<Histogram> histograms;
   std::vector<AddrRangeCounter> rangectrs;
   std::set<std::string> configuration_exclusion{"Hist_dataL",
