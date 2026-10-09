@@ -7,16 +7,27 @@
 #include "core/bridge_driver.h"
 #include "core/simulation.h"
 #include "core/systematic_scheduler.h"
+#include "core/stepped_run_loop.h"
 
-class fasedtests_top_t : public systematic_scheduler_t, public simulation_t {
+class fasedtests_top_t : public systematic_scheduler_t, public simulation_t,
+                         private stepped_run_loop_t::services_t {
 public:
   fasedtests_top_t(simif_t &simif,
-                   widget_registry_t &registry,
-                   const std::vector<std::string> &args);
+                  widget_registry_t &registry,
+                  const std::vector<std::string> &args);
 
   int simulation_run() override;
 
-  bool simulation_timed_out() override { return !done; }
+  bool simulation_timed_out() override { return !run_loop.target_done(); }
+
+  std::vector<std::pair<std::string, checkpoint_owner_t *>>
+  checkpoint_driver_owners() override {
+    auto owners = simulation_t::checkpoint_driver_owners();
+    auto scheduler_owners = systematic_scheduler_t::checkpoint_owners();
+    owners.insert(owners.end(), scheduler_owners.begin(), scheduler_owners.end());
+    owners.emplace_back("runtime/simulation/fased-run-loop", &run_loop);
+    return owners;
+  }
 
 private:
   /// Reference to the simulation interface.
@@ -27,16 +38,26 @@ private:
   std::vector<FASEDMemoryTimingModel *> models;
   /// Records all uarch events we want to validate.
   std::unordered_map<std::string, uint32_t> expected_uarchevent_values;
-  /// Flag to indicating that the target reported it is done.
-  bool done = false;
+  // Bind the bridge traversal once; registry construction is complete before
+  // this driver is created. Identity/order must also be bound by the outer
+  // manifest, not inferred from pointer values or bridge count alone.
+  const std::vector<bridge_driver_t *> bridges;
+  stepped_run_loop_t run_loop;
+  bool horizon_reached() override { return finished_scheduled_tasks(); }
+  void run_tasks() override { run_scheduled_tasks(); }
+  void issue_step() override { peek_poke.step(get_largest_stepsize(), false); }
+  bool step_done() override { return peek_poke.is_done(); }
+  void tick_bridge(uint64_t index) override { bridges.at(index)->tick(); }
+  bool sample_done() override { return peek_poke.sample_value("done"); }
 };
 
 fasedtests_top_t::fasedtests_top_t(simif_t &simif,
-                                   widget_registry_t &registry,
-                                   const std::vector<std::string> &args)
+                                 widget_registry_t &registry,
+                                 const std::vector<std::string> &args)
     : systematic_scheduler_t(args), simulation_t(registry, args), simif(simif),
       peek_poke(registry.get_widget<peek_poke_t>()),
-      models(registry.get_bridges<FASEDMemoryTimingModel>()) {
+      models(registry.get_bridges<FASEDMemoryTimingModel>()),
+      bridges(registry.get_all_bridges()), run_loop(bridges.size()) {
 
   // Cycles to advance before profiling instrumentation registers in models.
   std::optional<uint64_t> profile_interval;
@@ -57,11 +78,13 @@ fasedtests_top_t::fasedtests_top_t(simif_t &simif,
 
   // Add functions you'd like to periodically invoke on a paused simulator here.
   if (profile_interval) {
-    register_task(0, [&] {
-      for (auto *mod : registry.get_bridges<FASEDMemoryTimingModel>()) {
+    // The former reference capture retained a destroyed constructor-local
+    // optional. Capture the interval by value; profiling remains unaudited.
+    register_task(0, [this, interval = *profile_interval] {
+      for (auto *mod : models) {
         mod->profile();
       }
-      return *profile_interval;
+      return interval;
     });
   }
 }
@@ -69,19 +92,8 @@ fasedtests_top_t::fasedtests_top_t(simif_t &simif,
 int fasedtests_top_t::simulation_run() {
   // Run the simulation until the target reports it is finished by setting
   // the done output flag or the desired number of cycles completes.
-  while (!done && !finished_scheduled_tasks()) {
-    run_scheduled_tasks();
-    peek_poke.step(get_largest_stepsize(), false);
-    while (!peek_poke.is_done() && !done) {
-      for (auto *bridge : registry.get_all_bridges()) {
-        bridge->tick();
-      }
-      if (peek_poke.sample_value("done")) {
-        done = true;
-        break;
-      }
-    }
-  }
+  while (!run_loop.finished())
+    run_loop.advance(*this);
 
   // Iterate through all uarch values we want to validate.
   bool failed = false;

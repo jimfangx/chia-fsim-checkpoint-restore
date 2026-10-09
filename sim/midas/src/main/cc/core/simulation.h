@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "core/timing.h"
+#include "core/checkpoint.h"
+#include <utility>
 
 class simif_t;
 class widget_registry_t;
@@ -27,12 +29,21 @@ class clockmodule_t;
  *
  * - Via the LoadMem widget, this class sets up the initial contents of DRAM.
  */
-class simulation_t {
+class simulation_t : public checkpoint_owner_t {
 public:
   simulation_t(widget_registry_t &registry,
                const std::vector<std::string> &args);
 
   virtual ~simulation_t() = default;
+
+  // Driver inventory, not a complete runtime inventory. The simulation owner
+  // remains unsupported until initialization/finalization/configuration and
+  // every concrete driver field are audited. Derived drivers may append
+  // separately supported components without claiming full driver support.
+  virtual std::vector<std::pair<std::string, checkpoint_owner_t *>>
+  checkpoint_driver_owners() {
+    return {{"runtime/simulation", this}};
+  }
 
   /**
    * Simulation main loop.
