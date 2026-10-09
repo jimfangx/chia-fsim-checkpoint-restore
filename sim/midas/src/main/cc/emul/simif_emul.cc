@@ -174,20 +174,51 @@ simif_emul_t::checkpoint_axi_owners() {
 }
 
 void simif_emul_t::start_driver(simulation_t &sim) {
+  if (restored_driver || restore_consumed)
+    throw std::runtime_error("ordinary startup of an armed restored dispatcher");
   start_driver_impl(sim, false);
+}
+
+void simif_emul_t::require_restored_destination(simulation_t &sim) {
+  if (driver_started || driver_diagnostic.requested() ||
+      cpu_managed_stream_io || fpga_managed_stream_io || !qsfp.empty() || slave.size() > 4)
+    throw std::runtime_error("unsupported/nonfresh restored dispatcher destination");
+  sim.require_restored_dispatcher();
+  host_timing.validate_checkpoint(host_timing.save_checkpoint());
+}
+
+void simif_emul_t::arm_restored_driver(simulation_t &sim) {
+  if (restored_driver || restore_consumed)
+    throw std::runtime_error("restored dispatcher already armed/consumed");
+  require_restored_destination(sim);
+  restored_driver = &sim;
+}
+
+bool simif_emul_t::resume_restored_driver(uint32_t bits, const uint32_t *banks) {
+  if (!restored_driver || restore_consumed)
+    throw std::runtime_error("missing/consumed restored dispatcher");
+  auto &sim = *restored_driver;
+  // Any failure poisons this fresh process; it cannot use ordinary startup.
+  restored_driver = nullptr;
+  try {
+    bool result = start_restored_driver(sim, bits, banks);
+    restore_consumed = true;
+    return result;
+  } catch (...) {
+    restore_consumed = true;
+    throw;
+  }
 }
 
 bool simif_emul_t::start_restored_driver(simulation_t &sim, uint32_t bits,
                                          const uint32_t *banks) {
-  if (driver_started || driver_diagnostic.requested() ||
-      cpu_managed_stream_io || fpga_managed_stream_io || !qsfp.empty())
-    throw std::runtime_error("unsupported/nonfresh restored dispatcher destination");
+  if (restored_driver || restore_consumed)
+    throw std::runtime_error("armed dispatcher must resume through the harness");
+  require_restored_destination(sim);
   harness_observation_t::require_clock_phase(bits, banks, true);
   for (const uint32_t flag_bit : {bits - 66, bits - 67})
     if ((banks[flag_bit / 32] >> (flag_bit % 32)) & 1)
       throw std::runtime_error("restored dispatcher requires reset/finish deasserted");
-  sim.require_restored_dispatcher();
-  host_timing.validate_checkpoint(host_timing.save_checkpoint());
   return start_driver_impl(sim, true);
 }
 

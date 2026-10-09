@@ -202,6 +202,20 @@ import "DPI-C" function void simulator_checkpoint_settled(
   output qsfp_fwd_t qsfp_1_fwd_sync
 );
 
+import "DPI-C" function bit simulator_restore_pending();
+import "DPI-C" function void simulator_restore_bootstrap(
+  input int unsigned bits, input harness_banks_t banks, output bit fin,
+  output ctrl_rev_t ctrl_rev_sync,
+  output cpu_managed_axi4_rev_t cpu_managed_axi4_rev_sync,
+  output fpga_managed_axi4_fwd_t fpga_managed_axi4_fwd_sync,
+  output mem_fwd_t mem_0_fwd_sync,
+  output mem_fwd_t mem_1_fwd_sync,
+  output mem_fwd_t mem_2_fwd_sync,
+  output mem_fwd_t mem_3_fwd_sync,
+  output qsfp_fwd_t qsfp_0_fwd_sync,
+  output qsfp_fwd_t qsfp_1_fwd_sync
+);
+
 import "DPI-C" function void simulator_entry();
 
 module emul(
@@ -214,7 +228,14 @@ module emul(
   event checkpoint_settled_event;
   event checkpoint_output_refresh;
   event checkpoint_input_refresh;
+  bit checkpoint_entry_done = 0;
+  bit checkpoint_restore_waiting = 0;
+  bit checkpoint_restore_complete = 0;
   initial begin : host_clock_loop
+`ifdef VCS
+    wait (checkpoint_entry_done);
+    if (checkpoint_restore_waiting) wait (checkpoint_restore_complete);
+`endif
     while (!fin) begin
       clock = #(`CLOCK_PERIOD * 1000 / 2.0) ~clock;
     end
@@ -308,6 +329,10 @@ module emul(
 
   initial begin
     simulator_entry();
+`ifdef VCS
+    checkpoint_restore_waiting = simulator_restore_pending();
+`endif
+    checkpoint_entry_done = 1;
   end
 
   // Bind the top-level to the records carrying information in and out of it.
@@ -384,6 +409,70 @@ module emul(
   qsfp_fwd_t qsfp_0_fwd_sync;
   qsfp_fwd_t qsfp_1_fwd_sync;
 
+  function automatic harness_banks_t checkpoint_banks();
+    return {
+`ifdef DEBUG
+        trace_count,
+`else
+        64'b0,
+`endif
+        clock, reset, fin,
+        ctrl_fwd_sync,
+        cpu_managed_axi4_fwd_sync,
+        fpga_managed_axi4_rev_sync,
+        mem_0_rev_sync,
+        mem_1_rev_sync,
+        mem_2_rev_sync,
+        mem_3_rev_sync,
+        qsfp_0_rev_sync,
+        qsfp_1_rev_sync,
+        ctrl_rev_sync,
+        cpu_managed_axi4_rev_sync,
+        fpga_managed_axi4_fwd_sync,
+        mem_0_fwd_sync,
+        mem_1_fwd_sync,
+        mem_2_fwd_sync,
+        mem_3_fwd_sync,
+        qsfp_0_fwd_sync,
+        qsfp_1_fwd_sync,
+        ctrl_rev,
+        cpu_managed_axi4_rev,
+        fpga_managed_axi4_fwd,
+        mem_0_fwd,
+        mem_1_fwd,
+        mem_2_fwd,
+        mem_3_fwd,
+        qsfp_0_fwd,
+        qsfp_1_fwd};
+  endfunction
+
+  // Component loader invokes this only after all RTL/native/bank readbacks.
+  // Startup is held low while armed; the task releases it after NBA settlement.
+  // No native tick, host delay draw or target edge occurs during publication.
+  task checkpoint_resume_restored();
+    int unsigned bits;
+    bits = $bits(harness_banks_t);
+    if (!checkpoint_entry_done || !checkpoint_restore_waiting || checkpoint_restore_complete)
+      bits = 0;
+`ifdef DEBUG
+    bits = 0;
+`endif
+`ifdef GATE_LEVEL_SIM
+    bits = 0;
+`endif
+    // An invalid phase/mode goes through the explicit nonzero DPI failure,
+    // which also poisons an armed destination before creating any worker.
+    simulator_restore_bootstrap(bits, checkpoint_banks(),
+      fin, ctrl_rev_sync, cpu_managed_axi4_rev_sync, fpga_managed_axi4_fwd_sync,
+      mem_0_fwd_sync, mem_1_fwd_sync, mem_2_fwd_sync, mem_3_fwd_sync,
+      qsfp_0_fwd_sync, qsfp_1_fwd_sync);
+    -> checkpoint_output_refresh;
+    #1ps;
+    -> checkpoint_input_refresh;
+    #1ps;
+    checkpoint_restore_complete = 1;
+  endtask
+
   // To deal with the race conditions in Chisel-generated SystemVerilog, the
   // simulator inputs are latched out-of-phase, on the negative edge.
   // The `simulator_tick` function is delayed by one cycle relative to the DUT.
@@ -427,40 +516,7 @@ module emul(
       -> checkpoint_settled_event;
       // Allow read-only bound probes to run before the driver is released.
       #0;
-      simulator_checkpoint_settled($bits(harness_banks_t), {
-`ifdef DEBUG
-        trace_count,
-`else
-        64'b0,
-`endif
-        clock, reset, fin,
-        ctrl_fwd_sync,
-        cpu_managed_axi4_fwd_sync,
-        fpga_managed_axi4_rev_sync,
-        mem_0_rev_sync,
-        mem_1_rev_sync,
-        mem_2_rev_sync,
-        mem_3_rev_sync,
-        qsfp_0_rev_sync,
-        qsfp_1_rev_sync,
-        ctrl_rev_sync,
-        cpu_managed_axi4_rev_sync,
-        fpga_managed_axi4_fwd_sync,
-        mem_0_fwd_sync,
-        mem_1_fwd_sync,
-        mem_2_fwd_sync,
-        mem_3_fwd_sync,
-        qsfp_0_fwd_sync,
-        qsfp_1_fwd_sync,
-        ctrl_rev,
-        cpu_managed_axi4_rev,
-        fpga_managed_axi4_fwd,
-        mem_0_fwd,
-        mem_1_fwd,
-        mem_2_fwd,
-        mem_3_fwd,
-        qsfp_0_fwd,
-        qsfp_1_fwd},
+      simulator_checkpoint_settled($bits(harness_banks_t), checkpoint_banks(),
         fin,
         ctrl_rev_sync,
         cpu_managed_axi4_rev_sync,

@@ -280,7 +280,49 @@ void fwd_put(qsfp_t &qsfp, uint32_t *io) {
 
 extern simif_emul_t *simulator;
 
+// Publication is shared by ordinary ticks, parked continuations and fresh
+// bootstrap. It reads native outputs only, without consuming any AXI beat.
+static void publish_outputs(uint32_t *ctrl_out, uint32_t *cpu_out,
+                            uint32_t *fpga_out,
+                            const std::array<uint32_t *, 4> &mem_out,
+                            const std::array<uint32_t *, 2> &qsfp_in) {
+  AXI4::rev_put(*simulator->master, ctrl_out);
+  if (auto *cpu = simulator->get_cpu_managed_axi4()) AXI4::rev_put(*cpu, cpu_out);
+  if (auto *fpga = simulator->get_fpga_managed_axi4()) AXI4::fwd_put(*fpga, fpga_out);
+  for (size_t i = 0; i < simulator->slave.size(); ++i)
+    AXI4::fwd_put(*simulator->slave[i], mem_out.at(i));
+  for (size_t i = 0; i < simulator->qsfp.size(); ++i)
+    QSFP::fwd_put(*simulator->qsfp[i], qsfp_in.at(i));
+}
+
 extern "C" {
+uint8_t simulator_restore_pending() {
+  return simulator && simulator->restored_driver_pending();
+}
+
+void simulator_restore_bootstrap(
+    uint32_t bits, const uint32_t *banks, uint8_t *fin,
+    uint32_t *ctrl_out, uint32_t *cpu_out, uint32_t *fpga_out,
+    uint32_t *mem_0_out, uint32_t *mem_1_out, uint32_t *mem_2_out, uint32_t *mem_3_out,
+    uint32_t *qsfp0_in, uint32_t *qsfp1_in) {
+  try {
+    if (!simulator) throw std::runtime_error("missing restored simulator");
+    *fin = simulator->resume_restored_driver(bits, banks);
+    publish_outputs(ctrl_out, cpu_out, fpga_out,
+                    {mem_0_out, mem_1_out, mem_2_out, mem_3_out}, {qsfp0_in, qsfp1_in});
+    if (*fin) {
+      const int code = simulator->end();
+      delete simulator;
+      simulator = nullptr;
+      if (code) exit(code);
+    }
+  } catch (const std::exception &error) {
+    fprintf(stderr, "FS_RESTORE_BOOTSTRAP_ERROR: %s\n", error.what());
+    std::fflush(nullptr);
+    std::_Exit(EXIT_FAILURE);
+  }
+}
+
 uint8_t simulator_checkpoint_pending() {
   return simulator && simulator->checkpoint_pending();
 }
@@ -302,17 +344,8 @@ void simulator_checkpoint_settled(
     *fin = simulator->checkpoint_settled(bits, banks);
     // No second AXI tick: only publish the outputs produced by the resumed
     // driver, just as the original uninterrupted simulator_tick would do.
-    AXI4::rev_put(*simulator->master, ctrl_out);
-    if (auto *cpu = simulator->get_cpu_managed_axi4())
-      AXI4::rev_put(*cpu, cpu_managed_axi4_out);
-    if (auto *fpga = simulator->get_fpga_managed_axi4())
-      AXI4::fwd_put(*fpga, fpga_managed_axi4_out);
-    std::array<uint32_t *, 4> mem_out{mem_0_out, mem_1_out, mem_2_out, mem_3_out};
-    for (size_t i = 0; i < simulator->slave.size(); ++i)
-      AXI4::fwd_put(*simulator->slave[i], mem_out[i]);
-    std::array<uint32_t *, 2> qsfp_in{qsfp0_in, qsfp1_in};
-    for (size_t i = 0; i < simulator->qsfp.size(); ++i)
-      QSFP::fwd_put(*simulator->qsfp[i], qsfp_in[i]);
+    publish_outputs(ctrl_out, cpu_managed_axi4_out, fpga_managed_axi4_out,
+                    {mem_0_out, mem_1_out, mem_2_out, mem_3_out}, {qsfp0_in, qsfp1_in});
     if (*fin) {
       int code = simulator->end();
       delete simulator;
@@ -384,19 +417,7 @@ void simulator_tick(
     }
 
     *fin = simulator->to_sim();
-    AXI4::rev_put(*simulator->master, ctrl_out);
-    if (cpu_managed_axi4) {
-      AXI4::rev_put(*cpu_managed_axi4, cpu_managed_axi4_out);
-    }
-    if (fpga_managed_axi4) {
-      AXI4::fwd_put(*fpga_managed_axi4, fpga_managed_axi4_out);
-    }
-    for (size_t i = 0, n = simulator->slave.size(); i < n; ++i) {
-      AXI4::fwd_put(*simulator->slave[i], mem_out[i]);
-    }
-    for (size_t i = 0, n = simulator->qsfp.size(); i < n; ++i) {
-      QSFP::fwd_put(*simulator->qsfp[i], qsfp_in[i]);
-    }
+    publish_outputs(ctrl_out, cpu_managed_axi4_out, fpga_managed_axi4_out, mem_out, qsfp_in);
 
     if (*fin) {
       int exit_code = simulator->end();

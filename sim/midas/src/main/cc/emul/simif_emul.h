@@ -67,6 +67,13 @@ public:
   bool start_restored_driver(simulation_t &sim, uint32_t bits,
                              const uint32_t *banks);
 
+  // Component coordinator: arm only after loading/prevalidating every owner.
+  // The VCS harness holds its clock until its loader verifies the RTL/banks
+  // and invokes checkpoint_resume_restored. No production restore plusarg.
+  void arm_restored_driver(simulation_t &sim);
+  bool restored_driver_pending() const { return restored_driver != nullptr; }
+  bool resume_restored_driver(uint32_t bits, const uint32_t *banks);
+
   /**
    * Transfers control to the simulator on a tick.
    *
@@ -190,7 +197,10 @@ protected:
   void load_mems(const char *fname);
 
 private:
+  simulation_t *restored_driver = nullptr;
+  bool restore_consumed = false;
   bool driver_started = false;
+  void require_restored_destination(simulation_t &sim);
   bool start_driver_impl(simulation_t &sim, bool restored);
   driver_boundary_diagnostic_t driver_diagnostic;
   // Published only while to_sim has parked VCS in DPI. This does not mean
