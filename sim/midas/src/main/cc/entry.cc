@@ -6,9 +6,7 @@
 #include "core/simif.h"
 #include "core/simulation.h"
 #include "entry.h"
-#ifdef FS_CHECKPOINT_ENTRY
 #include "core/checkpoint_entry.h"
-#endif
 
 // NOLINTBEGIN
 #define GET_INCLUDES
@@ -43,16 +41,20 @@ static std::unique_ptr<checkpoint_entry_t> checkpoint_entry;
 
 // Entry point of the driver.
 int entry(int argc, char **argv) {
-#ifdef FS_CHECKPOINT_ENTRY
   try {
-#endif
   // must have this exist for *.const.h
   std::vector<std::string> args(argv + 1, argv + argc);
+  const auto request = checkpoint_request_t::parse(args);
 #ifdef FS_CHECKPOINT_ENTRY
   checkpoint_entry = create_checkpoint_entry(args);
   if (!checkpoint_entry)
     throw std::runtime_error("enabled checkpoint entry has no capability");
+  checkpoint_entry->authorize_request(request);
   puts("FS_CHECKPOINT_ENTRY_CONFIGURED before_platform=1");
+#else
+  if (request.durable())
+    throw std::runtime_error("unsupported metasim runtime checkpoint cut/restore "
+                             "(no public durable checkpoint capability)");
 #endif
 
   // Create the hardware interface.
@@ -85,32 +87,35 @@ int entry(int argc, char **argv) {
   // NOLINTEND
   /* clang-format on */
 
-  // Fail before simulation construction/init/MMIO: generated RTL alone is
-  // never a full simulator checkpoint. Adapters and the atomic runtime cut
-  // are still required. Do not silently ignore a requested save or restore.
-  for (const auto &arg : args) {
-    if (arg == "+fs-checkpoint-preflight" ||
-        arg.rfind("+fs-checkpoint=", 0) == 0 ||
-        arg.rfind("+fs-restore=", 0) == 0) {
-      try {
-        registry.checkpoint_preflight();
-        throw std::runtime_error("unsupported metasim runtime checkpoint cut/restore");
-      } catch (const std::exception &error) {
-        fprintf(stderr, "FS_CHECKPOINT_UNSUPPORTED: %s\n", error.what());
-        // VCS's simulator_entry ignores entry's return value at this stage.
-        // Use an explicit failure exit, also valid for the other platforms.
-        std::exit(EXIT_FAILURE);
-      }
-    }
+  // A capability cannot bypass unsupported generated widgets. Inventory-only
+  // preflight retains its diagnostic failure, without starting a simulation.
+  if (request.kind != checkpoint_request_t::kind_t::none) {
+    registry.checkpoint_preflight();
+    if (request.kind == checkpoint_request_t::kind_t::preflight)
+      throw std::runtime_error("unsupported metasim runtime checkpoint cut/restore");
   }
 
   // Create the simulation instance.
   simulation = create_simulation(simif, *widget_registry_ptr, args);
+  if (request.durable()) {
+    const auto owners = simulation->checkpoint_driver_owners();
+    if (owners.empty())
+      throw std::runtime_error("unsupported empty checkpoint driver inventory");
+    for (const auto &[name, owner] : owners)
+      if (!owner || owner->checkpoint_schema().empty())
+        throw std::runtime_error("unsupported checkpoint driver: " + name);
+  }
 
 #ifdef FS_CHECKPOINT_ENTRY
   puts("FS_CHECKPOINT_ENTRY_CONSTRUCTED before_run=1");
-  if (checkpoint_entry->prepare(simif, *simulation) ==
-      checkpoint_entry_t::action_t::restore_reserved) {
+  const auto action = checkpoint_entry->prepare(simif, *simulation, request);
+  if (request.kind == checkpoint_request_t::kind_t::restore &&
+      action != checkpoint_entry_t::action_t::restore_reserved)
+    throw std::runtime_error("checkpoint restore did not reserve fresh clocks");
+  if (request.kind == checkpoint_request_t::kind_t::capture &&
+      action != checkpoint_entry_t::action_t::run)
+    throw std::runtime_error("checkpoint capture reserved restore clocks");
+  if (action == checkpoint_entry_t::action_t::restore_reserved) {
     puts("FS_CHECKPOINT_ENTRY_RESERVED before_run=1");
     return 0;
   }
@@ -118,11 +123,13 @@ int entry(int argc, char **argv) {
 
   // Run the simulation with the given implementation.
   return simif.run(*simulation);
-#ifdef FS_CHECKPOINT_ENTRY
   } catch (const std::exception &error) {
+#ifdef FS_CHECKPOINT_ENTRY
     fprintf(stderr, "FS_CHECKPOINT_ENTRY_ERROR: %s\n", error.what());
+#else
+    fprintf(stderr, "FS_CHECKPOINT_UNSUPPORTED: %s\n", error.what());
+#endif
     // VCS ignores entry's return value. Never continue after a failed prepare.
     std::exit(EXIT_FAILURE);
   }
-#endif
 }
