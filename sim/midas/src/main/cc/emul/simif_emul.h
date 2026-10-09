@@ -70,6 +70,7 @@ public:
   // The harness invokes this after its rising-edge NBA updates, then resumes
   // the same driver/DPI tick. Neither leg consumes a host timing tick.
   bool checkpoint_pending() const { return settled_pending.load(); }
+  bool checkpoint_lowclock() const { return driver_diagnostic.lowclock(); }
   bool checkpoint_settled(uint32_t bits, const uint32_t *banks);
 
   /**

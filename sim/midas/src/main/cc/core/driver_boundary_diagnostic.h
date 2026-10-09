@@ -14,6 +14,7 @@ public:
   explicit driver_boundary_diagnostic_t(const std::vector<std::string> &args);
   bool requested() const { return !path.empty(); }
   bool settled() const { return settled_capture; }
+  bool lowclock() const { return lowclock_capture; }
   bool due() const { return requested() && completed + 1 == cut; }
   void observe(const owners_t &owners);
   void finish() const;
@@ -23,5 +24,6 @@ private:
   uint64_t cut = 0, completed = 0;
   bool captured = false, active = false, failed = false;
   bool settled_capture = false;
+  bool lowclock_capture = false;
 };
 #endif

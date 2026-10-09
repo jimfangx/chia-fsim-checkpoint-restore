@@ -424,6 +424,7 @@ bool simif_emul_t::checkpoint_settled(uint32_t bits, const uint32_t *banks) {
   if (std::this_thread::get_id() == thread.get_id() || driver_context_active ||
       !settled_pending || !driver_capture_active)
     throw std::runtime_error("settled capture outside parked driver boundary");
+  harness_observation_t::require_clock_phase(bits, banks, driver_diagnostic.lowclock());
   {
     std::unique_lock<std::mutex> lock(settled_mutex);
     harness_observation_t observation(bits, banks);

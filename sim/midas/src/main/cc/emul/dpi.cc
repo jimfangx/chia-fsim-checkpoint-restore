@@ -285,6 +285,10 @@ uint8_t simulator_checkpoint_pending() {
   return simulator && simulator->checkpoint_pending();
 }
 
+uint8_t simulator_checkpoint_lowclock() {
+  return simulator && simulator->checkpoint_lowclock();
+}
+
 void simulator_checkpoint_settled(
     uint32_t bits, const uint32_t *banks, uint8_t *fin,
     uint32_t *ctrl_out, uint32_t *cpu_managed_axi4_out,
