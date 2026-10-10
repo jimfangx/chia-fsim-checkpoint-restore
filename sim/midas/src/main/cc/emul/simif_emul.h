@@ -90,6 +90,9 @@ public:
   // the same driver/DPI tick. Neither leg consumes a host timing tick.
   bool checkpoint_pending() const { return settled_pending.load(); }
   bool checkpoint_lowclock() const { return driver_diagnostic.lowclock(); }
+  // Read-only native/VPI collection is allowed only on VCS's main thread
+  // while the completed-operation worker is parked at a low-clock cut.
+  void require_settled_checkpoint_capture() const;
   bool checkpoint_settled(uint32_t bits, const uint32_t *banks);
 
   /**

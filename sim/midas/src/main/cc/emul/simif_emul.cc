@@ -504,6 +504,13 @@ void simif_emul_t::capture_driver_boundary(simulation_t &sim, bool done) {
   }
 }
 
+void simif_emul_t::require_settled_checkpoint_capture() const {
+  if (std::this_thread::get_id() == thread.get_id() || driver_context_active ||
+      !settled_pending || !driver_capture_active || !driver_diagnostic.lowclock() ||
+      cpu_managed_stream_io || fpga_managed_stream_io || !qsfp.empty() || slave.size() > 4)
+    throw std::runtime_error("live capture outside parked low-clock driver boundary");
+}
+
 bool simif_emul_t::checkpoint_settled(uint32_t bits, const uint32_t *banks) {
   if (std::this_thread::get_id() == thread.get_id() || driver_context_active ||
       !settled_pending || !driver_capture_active)
