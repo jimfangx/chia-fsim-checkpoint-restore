@@ -20,15 +20,46 @@ struct checkpoint_request_t {
   kind_t kind = kind_t::none;
   std::string path;
   uint64_t operation = 0; // Completed host driver operations, never target cycles.
+  std::string directory;
+  uint64_t interval = 0, retention = 0;
+
+  bool periodic() const { return !directory.empty(); }
 
   bool durable() const {
-    return kind == kind_t::capture || kind == kind_t::restore;
+    return periodic() || kind == kind_t::capture || kind == kind_t::restore;
   }
 
   static checkpoint_request_t parse(const std::vector<std::string> &args) {
     checkpoint_request_t request;
     bool have_operation = false;
+    bool have_directory = false, have_interval = false, have_retention = false, have_level = false;
     for (const auto &arg : args) {
+      auto positive = [&](const std::string &prefix, bool &seen, uint64_t &number) {
+        if (seen || arg.rfind(prefix, 0) != 0)
+          throw std::runtime_error("malformed/duplicate periodic checkpoint option");
+        seen = true;
+        const auto value = arg.substr(prefix.size());
+        const auto parsed = std::from_chars(value.data(), value.data()+value.size(), number);
+        if (parsed.ec != std::errc{} || parsed.ptr != value.data()+value.size() || !number)
+          throw std::runtime_error("invalid periodic checkpoint value");
+      };
+      if (arg.rfind("+fs-checkpoint-interval", 0) == 0) {
+        positive("+fs-checkpoint-interval=", have_interval, request.interval); continue;
+      }
+      if (arg.rfind("+fs-checkpoint-retention", 0) == 0) {
+        positive("+fs-checkpoint-retention=", have_retention, request.retention); continue;
+      }
+      if (arg.rfind("+fs-checkpoint-directory", 0) == 0) {
+        const std::string prefix = "+fs-checkpoint-directory=";
+        if (have_directory || arg.rfind(prefix, 0) != 0 || arg.size() == prefix.size())
+          throw std::runtime_error("invalid/duplicate checkpoint directory");
+        have_directory = true; request.directory = arg.substr(prefix.size()); continue;
+      }
+      if (arg.rfind("+fs-checkpoint-level", 0) == 0) {
+        if (have_level || arg != "+fs-checkpoint-level=1")
+          throw std::runtime_error("periodic checkpoint requires independent Level-1 state");
+        have_level = true; continue;
+      }
       if (arg.rfind("+fs-checkpoint-operation", 0) == 0) {
         const std::string prefix = "+fs-checkpoint-operation=";
         if (have_operation || arg.rfind(prefix, 0) != 0)
@@ -56,11 +87,16 @@ struct checkpoint_request_t {
       } else {
         throw std::runtime_error("malformed Level-1 checkpoint request: " + arg);
       }
-      if (request.durable() && request.path.empty())
+      if ((request.kind == kind_t::capture || request.kind == kind_t::restore) && request.path.empty())
         throw std::runtime_error("empty Level-1 checkpoint path");
     }
     if (have_operation && request.kind != kind_t::capture)
       throw std::runtime_error("checkpoint operation schedule requires capture");
+    if (have_directory || have_interval || have_retention || have_level) {
+      if (!have_directory || !have_interval || !have_retention || !have_level ||
+          (request.kind != kind_t::none && request.kind != kind_t::restore))
+        throw std::runtime_error("periodic checkpoint requires directory, target interval, retention and level=1; no single capture/preflight");
+    }
     return request;
   }
 };

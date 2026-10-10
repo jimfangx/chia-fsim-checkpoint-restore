@@ -89,7 +89,7 @@ int entry(int argc, char **argv) {
 
   // A capability cannot bypass unsupported generated widgets. Inventory-only
   // preflight retains its diagnostic failure, without starting a simulation.
-  if (request.kind != checkpoint_request_t::kind_t::none) {
+  if (request.kind != checkpoint_request_t::kind_t::none || request.periodic()) {
     registry.checkpoint_preflight();
     if (request.kind == checkpoint_request_t::kind_t::preflight)
       throw std::runtime_error("unsupported metasim runtime checkpoint cut/restore");
