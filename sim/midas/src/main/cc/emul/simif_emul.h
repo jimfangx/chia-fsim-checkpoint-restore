@@ -89,15 +89,23 @@ public:
   // The harness invokes this after its rising-edge NBA updates, then resumes
   // the same driver/DPI tick. Neither leg consumes a host timing tick.
   bool checkpoint_pending() const { return settled_pending.load(); }
-  bool checkpoint_lowclock() const { return driver_diagnostic.lowclock(); }
+  bool checkpoint_lowclock() const { return checkpoint_polling || driver_diagnostic.lowclock(); }
   // Read-only native/VPI collection is allowed only on VCS's main thread
   // while the completed-operation worker is parked at a low-clock cut.
   void require_settled_checkpoint_capture() const;
   void schedule_checkpoint_operation(uint64_t operation) {
-    if (driver_started)
+    if (driver_started || checkpoint_polling)
       throw std::runtime_error("checkpoint schedule after worker startup");
     driver_diagnostic.arm_checkpoint_operation(operation);
     public_capture_required = true;
+  }
+  // Poll the audited target counter at every completed driver operation. The
+  // caller must acknowledge each settled callback, including a not-due cut.
+  // This scheduling state is host policy and is freshly configured on restore.
+  void schedule_checkpoint_polling() {
+    if (driver_started || checkpoint_polling || driver_diagnostic.requested())
+      throw std::runtime_error("invalid repeated checkpoint polling lifecycle");
+    checkpoint_polling = public_capture_required = true;
   }
   void acknowledge_checkpoint_publication();
   bool checkpoint_settled(uint32_t bits, const uint32_t *banks);
@@ -217,6 +225,7 @@ private:
   bool driver_started = false;
   bool public_capture_required = false;
   bool public_capture_published = false;
+  bool checkpoint_polling = false;
   void require_restored_destination(simulation_t &sim);
   bool start_driver_impl(simulation_t &sim, bool restored);
   driver_boundary_diagnostic_t driver_diagnostic;

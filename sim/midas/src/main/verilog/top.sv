@@ -515,11 +515,11 @@ module emul(
     );
 
 `ifdef VCS
-    if (simulator_checkpoint_pending()) begin
+    while (simulator_checkpoint_pending()) begin
       // Keep the returned-operation driver parked across the natural falling
       // edge when requested. No second native tick or rising target edge is
       // issued; generated clock-gate outputs and incoming latches settle low.
-      if (simulator_checkpoint_lowclock()) @(negedge clock);
+      if (simulator_checkpoint_lowclock() && clock) @(negedge clock);
       #1ps;
       -> checkpoint_settled_event;
       // Allow read-only bound probes to run before the driver is released.

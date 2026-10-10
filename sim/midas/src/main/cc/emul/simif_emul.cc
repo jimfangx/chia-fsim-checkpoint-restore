@@ -247,7 +247,7 @@ bool simif_emul_t::start_driver_impl(simulation_t &sim, bool restored) {
     throw std::runtime_error("driver dispatcher already started");
   if (!restored)
     sim.require_fresh_dispatcher();
-  if (driver_diagnostic.requested() && !sim.simulation_supports_steps()) {
+  if ((driver_diagnostic.requested() || checkpoint_polling) && !sim.simulation_supports_steps()) {
     fprintf(stderr, "FS_DRIVER_BOUNDARY_ERROR: unsupported incremental simulation driver\n");
     std::exit(EXIT_FAILURE);
   }
@@ -277,7 +277,7 @@ bool simif_emul_t::start_driver_impl(simulation_t &sim, bool restored) {
       // Run the simulation flow.
       try {
         simulation_t::run_boundary_t boundary;
-        if (driver_diagnostic.requested())
+        if (driver_diagnostic.requested() || checkpoint_polling)
           boundary = [this](simulation_t &driver, bool done) { capture_driver_boundary(driver, done); };
         exit_code = sim.execute_simulation_flow(boundary);
         driver_diagnostic.finish();
@@ -303,7 +303,7 @@ bool simif_emul_t::start_driver_impl(simulation_t &sim, bool restored) {
     // ready to transfer data to it.
     // A restored terminal cut can finish without yielding. Waiting only for
     // rtlsim_flag would deadlock that valid zero-edge continuation.
-    rtlsim_cond.wait(lock, [&] { return rtlsim_flag || finished; });
+    rtlsim_cond.wait(lock, [&] { return rtlsim_flag || finished || settled_pending; });
   }
   return finished;
 }
@@ -480,10 +480,11 @@ void simif_emul_t::capture_driver_boundary(simulation_t &sim, bool done) {
       for (size_t i = 0; i < qsfp.size(); ++i)
         owners.emplace_back("runtime/qsfp/" + std::to_string(i), nullptr);
     }
-    if (driver_diagnostic.settled() && driver_diagnostic.due()) {
+    if (checkpoint_polling || (driver_diagnostic.settled() && driver_diagnostic.due())) {
       // Publish the complete inventory before releasing VCS. The worker stays
       // in this callback, with no suspended MMIO or host-delay operation.
       std::unique_lock<std::mutex> lock(settled_mutex);
+      public_capture_published = false;
       settled_owners = std::move(owners);
       {
         std::unique_lock<std::mutex> rtl_lock(rtlsim_mutex);
@@ -506,7 +507,7 @@ void simif_emul_t::capture_driver_boundary(simulation_t &sim, bool done) {
 
 void simif_emul_t::require_settled_checkpoint_capture() const {
   if (std::this_thread::get_id() == thread.get_id() || driver_context_active ||
-      !settled_pending || !driver_capture_active || !driver_diagnostic.lowclock() ||
+      !settled_pending || !driver_capture_active || !checkpoint_lowclock() ||
       cpu_managed_stream_io || fpga_managed_stream_io || !qsfp.empty() || slave.size() > 4)
     throw std::runtime_error("live capture outside parked low-clock driver boundary");
 }
@@ -522,7 +523,7 @@ bool simif_emul_t::checkpoint_settled(uint32_t bits, const uint32_t *banks) {
   if (std::this_thread::get_id() == thread.get_id() || driver_context_active ||
       !settled_pending || !driver_capture_active)
     throw std::runtime_error("settled capture outside parked driver boundary");
-  harness_observation_t::require_clock_phase(bits, banks, driver_diagnostic.lowclock());
+  harness_observation_t::require_clock_phase(bits, banks, checkpoint_lowclock());
   if (public_capture_required && !public_capture_published)
     throw std::runtime_error("public checkpoint callback did not complete publication");
   {
@@ -539,7 +540,9 @@ bool simif_emul_t::checkpoint_settled(uint32_t bits, const uint32_t *banks) {
   }
   {
     std::unique_lock<std::mutex> lock(rtlsim_mutex);
-    rtlsim_cond.wait(lock, [&] { return rtlsim_flag || finished; });
+    // A resumed operation can finish entirely in software and immediately
+    // park again, without another MMIO yield or target edge.
+    rtlsim_cond.wait(lock, [&] { return rtlsim_flag || finished || settled_pending; });
   }
   driver_context_active = false;
   return finished;
