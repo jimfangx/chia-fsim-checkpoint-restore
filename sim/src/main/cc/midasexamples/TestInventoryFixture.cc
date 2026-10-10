@@ -1,9 +1,25 @@
 // See LICENSE for license details.
 #include "TestHarness.h"
+#include <charconv>
+#include <stdexcept>
 
 class TestInventoryFixture final : public TestHarness {
 public:
-  using TestHarness::TestHarness;
+  TestInventoryFixture(widget_registry_t &registry,
+                       const std::vector<std::string> &args,
+                       std::string_view name) : TestHarness(registry, args, name) {
+    bool seen = false;
+    for (const auto &arg : args) {
+      const std::string_view prefix = "+inventory-shadow-rounds=";
+      if (arg.compare(0, prefix.size(), prefix) != 0) continue;
+      const auto value = std::string_view(arg).substr(prefix.size());
+      const auto result = std::from_chars(value.data(), value.data() + value.size(), shadow_rounds);
+      if (seen || value.empty() || value.front() == '0' || result.ec != std::errc{} ||
+          result.ptr != value.data() + value.size() || shadow_rounds == 0 || shadow_rounds > 1000000)
+        throw std::invalid_argument("invalid +inventory-shadow-rounds");
+      seen = true;
+    }
+  }
 
   void run_test() override {
     poke("io_data", 0);
@@ -74,7 +90,33 @@ public:
     step(1);
     expect(std::string_view{"io_respValid"}, 0);
     step(3);
+
+    // Optional sustained live-shadow workload. Keep the complete original
+    // directed test above, then alternate a held response and active traffic.
+    // Request address stays stable throughout each valid interval.
+    if (shadow_rounds) log = false;
+    for (uint32_t round = 0; round < shadow_rounds; ++round) {
+      poke("io_reqValid", 0);
+      poke("io_addr", round % 8);
+      poke("io_data", round % 512);
+      poke("io_wen", 1);
+      step(1);
+      poke("io_wen", 0);
+      poke("io_respReady", 0);
+      poke("io_reqValid", 1);
+      step(32);
+      expect("io_respValid", 1);
+      expect("io_queued", 1);
+      poke("io_respReady", 1);
+      step(64);
+      poke("io_reqValid", 0);
+      step(8);
+      expect(std::string_view{"io_respValid"}, 0);
+    }
   }
+
+private:
+  uint32_t shadow_rounds = 0;
 };
 
 TEST_MAIN(TestInventoryFixture)
