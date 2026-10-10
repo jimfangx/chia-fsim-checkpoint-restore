@@ -23,10 +23,11 @@ struct checkpoint_request_t {
   uint64_t operation = 0; // Completed host driver operations, never target cycles.
   std::string directory;
   uint64_t interval = 0, retention = 0;
+  uint64_t target_timeout_cycles = 0;
   uint64_t host_timeout_ms = 0, cycle_timeout_ms = 0, capture_timeout_ms = 0;
 
   bool periodic() const { return !directory.empty(); }
-  bool watchdog() const { return host_timeout_ms || cycle_timeout_ms; }
+  bool watchdog() const { return host_timeout_ms || cycle_timeout_ms || target_timeout_cycles; }
 
   bool durable() const {
     return watchdog() || periodic() || kind == kind_t::capture || kind == kind_t::restore;
@@ -36,6 +37,7 @@ struct checkpoint_request_t {
     checkpoint_request_t request;
     bool have_operation = false;
     bool have_directory = false, have_interval = false, have_retention = false, have_level = false;
+    bool have_target_timeout = false;
     bool have_host_timeout = false, have_cycle_timeout = false, have_capture_timeout = false;
     for (const auto &arg : args) {
       auto positive = [&](const std::string &prefix, bool &seen, uint64_t &number) {
@@ -52,6 +54,9 @@ struct checkpoint_request_t {
         if(number>uint64_t(std::numeric_limits<int64_t>::max())/1000000)
           throw std::runtime_error("checkpoint watchdog timeout exceeds steady-clock range");
       };
+      if(arg.rfind("+fs-checkpoint-target-timeout",0)==0) {
+        positive("+fs-checkpoint-target-timeout-cycles=",have_target_timeout,request.target_timeout_cycles); continue;
+      }
       if(arg.rfind("+fs-checkpoint-host-timeout",0)==0) {
         timeout("+fs-checkpoint-host-timeout-ms=",have_host_timeout,request.host_timeout_ms); continue;
       }
@@ -115,7 +120,7 @@ struct checkpoint_request_t {
           (request.kind != kind_t::none && request.kind != kind_t::restore))
         throw std::runtime_error("periodic checkpoint requires directory, target interval, retention and level=1; no single capture/preflight");
     }
-    if(have_host_timeout || have_cycle_timeout || have_capture_timeout) {
+    if(have_target_timeout || have_host_timeout || have_cycle_timeout || have_capture_timeout) {
       if(!request.watchdog() || !have_capture_timeout ||
          (!request.periodic() && request.kind!=kind_t::restore))
         throw std::runtime_error("checkpoint watchdog requires progress and bounded capture timeouts with periodic history or restore");
