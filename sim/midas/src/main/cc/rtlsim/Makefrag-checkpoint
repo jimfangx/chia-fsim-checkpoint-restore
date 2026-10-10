@@ -14,6 +14,15 @@ checkpoint_cc := $(addprefix $(CHECKPOINT_TOOLS_DIR)/,durable_restore_entry.cc a
 override CXXFLAGS += -DFS_CHECKPOINT_ENTRY -I$(checkpoint_dir) -I$(CHECKPOINT_TOOLS_DIR)
 override LDFLAGS += -lcrypto -ldl
 emul_cc += $(checkpoint_cc)
+ifneq ($(strip $(FS_CHECKPOINT_SHADOW)),)
+ifneq ($(FS_CHECKPOINT_SHADOW),1)
+$(error Unsupported FS_CHECKPOINT_SHADOW)
+endif
+# Host-only transport, disabled during capture and opened only after public
+# fresh restore. Preserve the production driver and native owner inventory.
+emul_cc += $(CHECKPOINT_TOOLS_DIR)/live_shadow_transport.cc
+override CXXFLAGS += -DFS_CHECKPOINT_SHADOW
+endif
 checkpoint_v := $(checkpoint_dir)/checkpoint-coordinator.sv
 vcs_checkpoint_flags := -debug_access+all +vpi +define+FS_CHECKPOINT_DURABLE
 

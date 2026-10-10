@@ -17,7 +17,7 @@ $(vcs) $(vcs_post_synth) $(vcs_debug) $(vcs_post_synth_debug): export CXXFLAGS :
 # Conservatively set --no-as-needed in case --as-needed is defined in LDFLAGS.
 $(vcs) $(vcs_post_synth) $(vcs_debug) $(vcs_post_synth_debug): export LDFLAGS := $(LDFLAGS) -Wl,--no-as-needed $(common_ld_flags) -Wl,-rpath='$$$$ORIGIN'
 
-vcs_driver_deps := $(header) $(DRIVER_CC) $(DRIVER_H) $(midas_cc) $(midas_h) $(VCS_EXTRA_V)
+vcs_driver_deps := $(header) $(DRIVER_CC) $(DRIVER_H) $(midas_cc) $(midas_h) $(VCS_EXTRA_V) $(if $(FS_CHECKPOINT_SHADOW),$(CHECKPOINT_TOOLS_DIR)/live_shadow_transport.cc,)
 
 define make_vcs
 	$(MAKE) -C $(simif_dir) $(1) \
@@ -28,7 +28,7 @@ define make_vcs
 		$(if $(FS_CHECKPOINT_PROFILE),OUT_DIR=$(GENERATED_DIR)/checkpoint-vcs,) \
 		DRIVER="$(DRIVER_CC)" \
 		DESIGN_V=$(2) \
-		FS_CHECKPOINT_PROFILE=$(FS_CHECKPOINT_PROFILE) CHECKPOINT_TOOLS_DIR=$(CHECKPOINT_TOOLS_DIR)
+		FS_CHECKPOINT_PROFILE=$(FS_CHECKPOINT_PROFILE) FS_CHECKPOINT_SHADOW=$(FS_CHECKPOINT_SHADOW) CHECKPOINT_TOOLS_DIR=$(CHECKPOINT_TOOLS_DIR)
 endef
 
 ifneq ($(strip $(FS_CHECKPOINT_PROFILE)),)
