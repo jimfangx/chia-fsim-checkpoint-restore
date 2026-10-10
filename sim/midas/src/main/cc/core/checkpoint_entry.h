@@ -3,6 +3,8 @@
 #define __CHECKPOINT_ENTRY_H
 
 #include <memory>
+#include <charconv>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -17,6 +19,7 @@ struct checkpoint_request_t {
   enum class kind_t { none, preflight, capture, restore };
   kind_t kind = kind_t::none;
   std::string path;
+  uint64_t operation = 0; // Completed host driver operations, never target cycles.
 
   bool durable() const {
     return kind == kind_t::capture || kind == kind_t::restore;
@@ -24,7 +27,19 @@ struct checkpoint_request_t {
 
   static checkpoint_request_t parse(const std::vector<std::string> &args) {
     checkpoint_request_t request;
+    bool have_operation = false;
     for (const auto &arg : args) {
+      if (arg.rfind("+fs-checkpoint-operation", 0) == 0) {
+        const std::string prefix = "+fs-checkpoint-operation=";
+        if (have_operation || arg.rfind(prefix, 0) != 0)
+          throw std::runtime_error("malformed/duplicate checkpoint operation schedule");
+        have_operation = true;
+        const auto value = arg.substr(prefix.size());
+        const auto parsed = std::from_chars(value.data(), value.data()+value.size(), request.operation);
+        if (parsed.ec != std::errc{} || parsed.ptr != value.data()+value.size() || !request.operation)
+          throw std::runtime_error("invalid checkpoint operation schedule");
+        continue;
+      }
       if (arg.rfind("+fs-checkpoint", 0) != 0 &&
           arg.rfind("+fs-restore", 0) != 0)
         continue;
@@ -44,6 +59,8 @@ struct checkpoint_request_t {
       if (request.durable() && request.path.empty())
         throw std::runtime_error("empty Level-1 checkpoint path");
     }
+    if (have_operation && request.kind != kind_t::capture)
+      throw std::runtime_error("checkpoint operation schedule requires capture");
     return request;
   }
 };

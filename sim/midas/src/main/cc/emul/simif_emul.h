@@ -93,6 +93,13 @@ public:
   // Read-only native/VPI collection is allowed only on VCS's main thread
   // while the completed-operation worker is parked at a low-clock cut.
   void require_settled_checkpoint_capture() const;
+  void schedule_checkpoint_operation(uint64_t operation) {
+    if (driver_started)
+      throw std::runtime_error("checkpoint schedule after worker startup");
+    driver_diagnostic.arm_checkpoint_operation(operation);
+    public_capture_required = true;
+  }
+  void acknowledge_checkpoint_publication();
   bool checkpoint_settled(uint32_t bits, const uint32_t *banks);
 
   /**
@@ -208,6 +215,8 @@ private:
   simulation_t *loading_driver = nullptr;
   bool restore_consumed = false;
   bool driver_started = false;
+  bool public_capture_required = false;
+  bool public_capture_published = false;
   void require_restored_destination(simulation_t &sim);
   bool start_driver_impl(simulation_t &sim, bool restored);
   driver_boundary_diagnostic_t driver_diagnostic;

@@ -511,11 +511,20 @@ void simif_emul_t::require_settled_checkpoint_capture() const {
     throw std::runtime_error("live capture outside parked low-clock driver boundary");
 }
 
+void simif_emul_t::acknowledge_checkpoint_publication() {
+  require_settled_checkpoint_capture();
+  if (!public_capture_required || public_capture_published)
+    throw std::runtime_error("unexpected/duplicate public checkpoint publication");
+  public_capture_published = true;
+}
+
 bool simif_emul_t::checkpoint_settled(uint32_t bits, const uint32_t *banks) {
   if (std::this_thread::get_id() == thread.get_id() || driver_context_active ||
       !settled_pending || !driver_capture_active)
     throw std::runtime_error("settled capture outside parked driver boundary");
   harness_observation_t::require_clock_phase(bits, banks, driver_diagnostic.lowclock());
+  if (public_capture_required && !public_capture_published)
+    throw std::runtime_error("public checkpoint callback did not complete publication");
   {
     std::unique_lock<std::mutex> lock(settled_mutex);
     harness_observation_t observation(bits, banks);

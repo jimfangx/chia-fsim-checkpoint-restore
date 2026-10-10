@@ -12,7 +12,8 @@ class driver_boundary_diagnostic_t {
 public:
   using owners_t = std::vector<std::pair<std::string, checkpoint_owner_t *>>;
   explicit driver_boundary_diagnostic_t(const std::vector<std::string> &args);
-  bool requested() const { return !path.empty(); }
+  bool requested() const { return !path.empty() || public_capture; }
+  void arm_checkpoint_operation(uint64_t operation);
   bool settled() const { return settled_capture; }
   bool lowclock() const { return lowclock_capture; }
   bool due() const { return requested() && completed + 1 == cut; }
@@ -25,5 +26,6 @@ private:
   bool captured = false, active = false, failed = false;
   bool settled_capture = false;
   bool lowclock_capture = false;
+  bool public_capture = false;
 };
 #endif

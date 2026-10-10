@@ -66,12 +66,27 @@ driver_boundary_diagnostic_t::driver_boundary_diagnostic_t(
           "lowclock modifier requires a settled diagnostic request");
 }
 
+void driver_boundary_diagnostic_t::arm_checkpoint_operation(uint64_t operation) {
+  require(operation && !completed && !public_capture && !active && !failed,
+          "invalid public checkpoint schedule lifecycle");
+  require(!requested() || (cut == operation && settled_capture && lowclock_capture),
+          "diagnostic cut conflicts with public checkpoint schedule");
+  cut = operation;
+  public_capture = settled_capture = lowclock_capture = true;
+}
+
 void driver_boundary_diagnostic_t::observe(const owners_t &owners) {
   require(!active && !failed, "reentrant or failed diagnostic");
   require(completed < std::numeric_limits<uint64_t>::max(),
           "operation counter overflow");
   if (++completed != cut || !requested())
     return;
+  if (public_capture && path.empty()) {
+    // Complete collection/publication occurred in the context DPI callback
+    // before the worker is released. No diagnostic file is needed.
+    captured = true;
+    return;
+  }
   active = true;
   const auto temporary = path + ".tmp";
   bool created = false;
