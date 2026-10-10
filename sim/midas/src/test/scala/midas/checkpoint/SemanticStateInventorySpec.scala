@@ -23,6 +23,57 @@ class SemanticStateInventorySpec extends AnyFlatSpec {
 
   behavior.of("Pre-FAME semantic inventory")
 
+  it should "defer an explicit bridge-extracted root and consume it only at the pre-FAME boundary" in {
+    val state = lower(source).copy(annotations = Seq(SemanticBridgeCheckpointRootAnnotation("Harness.dut")))
+    val deferred = SemanticStateInventory(state)
+    assert(deferred == state)
+    val result = new BridgeSemanticStateInventory().execute(deferred)
+    assert(result.circuit == state.circuit)
+    val files = result.annotations.collect { case a: GoldenGateOutputFileAnnotation => a.fileSuffix -> a.body }.toMap
+    assert(files(".semantic-state.json") == manifest())
+    assert(files(".semantic-clean.sv").contains("module InventoryDUT("))
+    assert(!result.annotations.exists {
+      case _: SemanticCheckpointRootAnnotation | _: SemanticBridgeCheckpointRootAnnotation => true
+      case _ => false
+    })
+    assert(new BridgeSemanticStateInventory().execute(result) == result)
+    val ordinary = lower(source)
+    assert(new BridgeSemanticStateInventory().execute(ordinary) == ordinary)
+  }
+
+  it should "reject mixed inventory phases and duplicate deferred selections before emission" in {
+    val root = SemanticBridgeCheckpointRootAnnotation("Harness.dut")
+    val early = SemanticCheckpointRootAnnotation("Harness.dut")
+    for (annotations <- Seq(Seq(root, early), Seq(root, root))) {
+      val state = lower(source).copy(annotations = annotations)
+      intercept[IllegalArgumentException](SemanticStateInventory(state))
+      intercept[IllegalArgumentException](new BridgeSemanticStateInventory().execute(state))
+    }
+    val state = lower(source).copy(annotations = Seq(root, SemanticBankedAccessAnnotation("Harness.dut", Seq.empty)))
+    intercept[IllegalArgumentException](SemanticStateInventory(state))
+    intercept[IllegalArgumentException](new BridgeSemanticStateInventory().execute(state))
+  }
+
+  it should "describe extracted clock aliases separately and reject generated or undriven clocks" in {
+    val alias = source.replace("    output count : UInt<9>",
+      "    output bridgeClock : Clock\n    output count : UInt<9>")
+      .replace("    reg counter : UInt<9>", "    bridgeClock <= clock\n    reg counter : UInt<9>")
+    val state = lower(alias).copy(annotations = Seq(SemanticBridgeCheckpointRootAnnotation("Harness.dut")))
+    intercept[IllegalArgumentException](SemanticStateInventory.discover(state, "Harness.dut"))
+    val result = new BridgeSemanticStateInventory().execute(state)
+    val files = result.annotations.collect { case a: GoldenGateOutputFileAnnotation => a.fileSuffix -> a.body }.toMap
+    assert(entries(files(".semantic-state.json")) == entries(manifest()))
+    val boundary = parse(files(".semantic-boundary.json"))
+    assert((boundary \ "boundary_version") == JInt(2))
+    assert((boundary \ "clock_aliases") == JArray(List(JObject(List(
+      "direction" -> JString("output"), "name" -> JString("bridgeClock"), "source" -> JString("clock"))))))
+    assert(!(boundary \ "ports").asInstanceOf[JArray].arr.exists(p => (p \ "name") == JString("bridgeClock")))
+    assert(files(".semantic-clean.sv").contains("bridgeClock"))
+    val generated = lower(alias.replace("bridgeClock <= clock", "bridgeClock <= asClock(bits(data, 0, 0))"))
+      .copy(annotations = state.annotations)
+    intercept[IllegalArgumentException](new BridgeSemanticStateInventory().execute(generated))
+  }
+
   it should "inventory every register, FSM bit vector, array word and SRAM in two same-module instances" in {
     val state = lower(source)
     val result = SemanticStateInventory(state.copy(annotations = Seq(SemanticCheckpointRootAnnotation("Harness.dut"))))

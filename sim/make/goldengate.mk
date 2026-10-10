@@ -13,7 +13,12 @@ simulator_xdc := $(GENERATED_DIR)/$(BASE_FILE_NAME).synthesis.xdc
 
 # Request the inventory outputs as well, so enabling discovery also rebuilds
 # an existing simulator generated without discovery.
-semantic_outputs := $(if $(SEMANTIC_CHECKPOINT_ROOT),$(addprefix $(GENERATED_DIR)/$(BASE_FILE_NAME),.semantic-state.json .semantic-reference.fir .semantic-clean.sv .semantic-boundary.json),)
+ifneq ($(strip $(SEMANTIC_CHECKPOINT_ROOT)),)
+ifneq ($(strip $(SEMANTIC_BRIDGE_CHECKPOINT_ROOT)),)
+$(error Semantic checkpoint inventory requires exactly one root phase)
+endif
+endif
+semantic_outputs := $(if $(strip $(SEMANTIC_CHECKPOINT_ROOT) $(SEMANTIC_BRIDGE_CHECKPOINT_ROOT)),$(addprefix $(GENERATED_DIR)/$(BASE_FILE_NAME),.semantic-state.json .semantic-reference.fir .semantic-clean.sv .semantic-boundary.json),)
 simulator_inventory_outputs := $(if $(SIMULATOR_CHECKPOINT_INVENTORY),$(addprefix $(GENERATED_DIR)/$(BASE_FILE_NAME),.simulator-state.json .simulator-reference.fir),)
 
 # Pre-simulation-mapping annotations which includes all Bridge Annotations
@@ -37,6 +42,7 @@ $(simulator_verilog) $(simulator_xdc) $(header) $(fame_annos) $(semantic_outputs
 		--output-filename-base $(BASE_FILE_NAME) \
 		--allow-unrecognized-annotations \
 		$(if $(SEMANTIC_CHECKPOINT_ROOT),--semantic-checkpoint-root $(SEMANTIC_CHECKPOINT_ROOT),) \
+		$(if $(SEMANTIC_BRIDGE_CHECKPOINT_ROOT),--semantic-bridge-checkpoint-root $(SEMANTIC_BRIDGE_CHECKPOINT_ROOT),) \
 		$(if $(SIMULATOR_CHECKPOINT_INVENTORY),--simulator-checkpoint-inventory $(SIMULATOR_CHECKPOINT_INVENTORY),) \
 		--no-dedup)
 	grep -sh ^ $(GENERATED_DIR)/firrtl_black_box_resource_files.f | \

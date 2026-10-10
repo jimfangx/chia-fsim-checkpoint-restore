@@ -27,6 +27,47 @@ object SemanticCheckpointRootAnnotation extends HasShellOptions {
   ))
 }
 
+/** Select a target whose environment bridges must first become boundary ports.
+  * This remains a pre-FAME inventory; bridge implementation and token state are
+  * outside the selected hierarchy. It is explicitly separate from the earlier
+  * resolved-target inventory, whose reference and StateIDs remain unchanged.
+  */
+case class SemanticBridgeCheckpointRootAnnotation(path: String) extends NoTargetAnnotation with Unserializable
+object SemanticBridgeCheckpointRootAnnotation extends HasShellOptions {
+  val options = Seq(new ShellOption[String](
+    longOption = "semantic-bridge-checkpoint-root",
+    toAnnotationSeq = (path: String) => Seq(SemanticBridgeCheckpointRootAnnotation(path)),
+    helpText = "Inventory this pre-FAME instance after extracting environment bridges to boundary ports.",
+    helpValueName = Some("<Top.dut>"),
+  ))
+}
+
+/** Run at the resolved bridge-extraction boundary, before target instrumentation
+  * and every FAME transform. No circuit changes or mapping guesses are made.
+  */
+class BridgeSemanticStateInventory extends firrtl.Transform {
+  def inputForm = firrtl.LowForm
+  def outputForm = firrtl.LowForm
+  def execute(state: CircuitState): CircuitState = {
+    val roots = state.annotations.collect { case SemanticBridgeCheckpointRootAnnotation(path) => path }
+    if (roots.isEmpty) state
+    else {
+      require(roots.size == 1, "Semantic checkpoint unsupported: exactly one bridge-extracted root is required")
+      require(!state.annotations.exists {
+        case _: SemanticCheckpointRootAnnotation | _: SemanticBankedAccessAnnotation => true
+        case _ => false
+      }, "Semantic checkpoint unsupported: bridge-extracted inventory cannot mix root phases or banked bindings")
+      val selected = state.copy(form = firrtl.LowForm, annotations =
+        state.annotations.filterNot(_.isInstanceOf[SemanticBridgeCheckpointRootAnnotation]) :+
+          SemanticCheckpointRootAnnotation(roots.head))
+      val inventoried = SemanticStateInventory(selected, allowOutputClockAliases = true)
+      // The selection is consumed. Do not run this inventory again at a later
+      // compiler boundary, or leave a synthetic early-root annotation behind.
+      inventoried.copy(annotations = inventoried.annotations.filterNot(_.isInstanceOf[SemanticCheckpointRootAnnotation]))
+    }
+  }
+}
+
 /** Read-only discovery at the resolved LowForm boundary, before MidasTransforms.
   * No ports or instrumentation are added. Unsupported state aborts compilation.
   * IDs describe the lowered target hierarchy, never the transformed simulator's names.
@@ -59,7 +100,7 @@ object SemanticStateInventory {
     result.toSeq
   }
 
-  def discover(state: CircuitState, root: String): String = {
+  def discover(state: CircuitState, root: String, allowOutputClockAliases: Boolean = false): String = {
     if (state.form != firrtl.LowForm) fail("discovery requires resolved LowForm")
     val circuit = state.circuit
     val modules = circuit.modules.map(m => m.name -> m).toMap
@@ -110,6 +151,14 @@ object SemanticStateInventory {
             case _ => fail(s"derived, gated, or undriven clock at $hierarchy.$name")
           }
         }
+      }
+      // Extracted bridges forward their clock to the environment. Accept only
+      // a resolved alias of the sole incoming clock, never a generated clock.
+      // Ordinary inventories retain their original rejection of output clocks.
+      m.ports.filter(p => p.tpe == ClockType && p.direction == Output).foreach { p =>
+        if (!allowOutputClockAliases) fail(s"output clock at $hierarchy.${p.name}")
+        val source = drivers.getOrElse(p.name, fail(s"undriven output clock at $hierarchy.${p.name}"))
+        if (clock(source) != s"$root.clock") fail(s"non-target output clock at $hierarchy.${p.name}")
       }
       def enableIdentity(e: Expression, seen: Set[String] = Set.empty): String = {
         val name = e.serialize
@@ -180,8 +229,9 @@ object SemanticStateInventory {
           add(mem.name, "memory", mem.dataType, mem.depth, portClocks.head, "none")
         case i: WDefInstance =>
           val child = concrete(i.module)
-          val childClocks = child.ports.filter(_.tpe == ClockType).map { p =>
-            if (p.direction != Input) fail(s"output clock at $hierarchy.${i.name}.${p.name}")
+          if (!allowOutputClockAliases && child.ports.exists(p => p.tpe == ClockType && p.direction == Output))
+            fail(s"output clock at $hierarchy.${i.name}")
+          val childClocks = child.ports.filter(p => p.tpe == ClockType && p.direction == Input).map { p =>
             val source = drivers.getOrElse(s"${i.name}.${p.name}", fail(s"missing child clock at $hierarchy.${i.name}.${p.name}"))
             p.name -> clock(source)
           }.toMap
@@ -190,8 +240,9 @@ object SemanticStateInventory {
         case _ =>
       }
     }
-    val clocks = selected.ports.filter(_.tpe == ClockType).map { p =>
-      if (p.direction != Input) fail(s"output clock at $root.${p.name}")
+    if (!allowOutputClockAliases && selected.ports.exists(p => p.tpe == ClockType && p.direction == Output))
+      fail(s"output clock at $root")
+    val clocks = selected.ports.filter(p => p.tpe == ClockType && p.direction == Input).map { p =>
       p.name -> s"$root.${p.name}"
     }.toMap
     walk(selected, root, clocks, Set.empty)
@@ -207,16 +258,21 @@ object SemanticStateInventory {
     )))
   }
 
-  def apply(state: CircuitState): CircuitState = {
+  def apply(state: CircuitState, allowOutputClockAliases: Boolean = false): CircuitState = {
     val roots = state.annotations.collect { case SemanticCheckpointRootAnnotation(path) => path }
+    val bridgeRoots = state.annotations.collect { case SemanticBridgeCheckpointRootAnnotation(path) => path }
     val access = state.annotations.collect { case a: SemanticBankedAccessAnnotation => a }
+    if (bridgeRoots.nonEmpty) {
+      if (bridgeRoots.size != 1 || roots.nonEmpty || access.nonEmpty)
+        fail("bridge-extracted inventory cannot mix root phases, duplicate roots, or banked bindings")
+    }
     if (roots.isEmpty) {
       if (access.nonEmpty) fail("banked access requires an explicit semantic inventory root")
       state
     }
     else {
       if (roots.size != 1) fail("exactly one explicit DUT root is required")
-      val manifest = discover(state, roots.head)
+      val manifest = discover(state, roots.head, allowOutputClockAliases)
       val accessFiles = if (access.isEmpty) Seq.empty else {
         if (access.size != 1 || access.head.root != roots.head) fail("banked binding root/count mismatch")
         val binding = access.head.entries
@@ -262,11 +318,17 @@ object SemanticStateInventory {
       val clean = new Compiler(Seq(Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm).execute(
         CircuitState(cleanCircuit, firrtl.LowForm, Seq(firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter])))
       ).getEmittedCircuit.value
+      val outputClocks = selected.ports.filter(p => p.tpe == ClockType && p.direction == Output)
+      val clockFields = if (outputClocks.isEmpty) List.empty else List(
+        "clock_aliases" -> JArray(outputClocks.map(p => JObject(List(
+          "name" -> JString(p.name), "source" -> JString("clock"), "direction" -> JString("output"),
+        ))).toList),
+      )
       val boundary = canonical(JObject(List(
-        "boundary_version" -> JInt(1), "dut_module" -> JString(selected.name),
+        "boundary_version" -> JInt(if (outputClocks.isEmpty) 1 else 2), "dut_module" -> JString(selected.name),
         "dut_root" -> JString(roots.head), "clock" -> JString("clock"),
         "sample_phase" -> JString("before_rising_edge"),
-        "ports" -> JArray(selected.ports.map { port =>
+        "ports" -> JArray(selected.ports.filterNot(outputClocks.contains).map { port =>
           val width = port.tpe match {
             case ClockType if port.name == "clock" && port.direction == Input => BigInt(1)
             case UIntType(IntWidth(w)) => w
@@ -276,7 +338,7 @@ object SemanticStateInventory {
           JObject(List("name" -> JString(port.name), "width" -> JInt(width),
             "direction" -> JString(if (port.direction == Input) "input" else "output")))
         }.toList),
-      )))
+      ) ++ clockFields))
       state.copy(annotations = state.annotations ++ accessFiles ++ Seq(
         GoldenGateOutputFileAnnotation(manifest, ".semantic-state.json"),
         GoldenGateOutputFileAnnotation(state.circuit.serialize, ".semantic-reference.fir"),

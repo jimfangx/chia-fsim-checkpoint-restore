@@ -155,6 +155,7 @@ private[midas] class MidasTransforms extends Transform {
         new fame.EmitFAMEAnnotations("post-bridge-extraction.json"),
         new HighFirrtlToMiddleFirrtl,
         new MiddleFirrtlToLowFirrtl,
+        new midas.checkpoint.BridgeSemanticStateInventory,
         new AutoCounterTransform,
         new EmitFirrtl("post-autocounter.fir"),
         new fame.EmitFAMEAnnotations("post-autocounter.json"),
