@@ -8,6 +8,8 @@ import firrtl.{CircuitState, ChirrtlForm, LowForm, Parser, EmitCircuitAnnotation
 import firrtl.options.Dependency
 import firrtl.stage.Forms
 import firrtl.stage.transforms.Compiler
+import firrtl.annotations.ReferenceTarget
+import firrtl.transforms.DontTouchAnnotation
 import midas.stage.GoldenGateOutputFileAnnotation
 import org.json4s._
 import org.json4s.native.JsonMethods.parse
@@ -52,6 +54,27 @@ class SemanticStateInventorySpec extends AnyFlatSpec {
     val state = lower(source).copy(annotations = Seq(root, SemanticBankedAccessAnnotation("Harness.dut", Seq.empty)))
     intercept[IllegalArgumentException](SemanticStateInventory(state))
     intercept[IllegalArgumentException](new BridgeSemanticStateInventory().execute(state))
+  }
+
+  it should "preserve extracted data inputs through optimization without changing the semantic reference" in {
+    val src = source.replace("    output count : UInt<9>",
+      "    input responseStatus : UInt<2>\n    input responseUser : UInt<1>\n    output count : UInt<9>")
+      .replace("    dut.clock <= clock", "    dut.responseStatus <= UInt<2>(0)\n    dut.responseUser <= UInt<1>(0)\n    dut.clock <= clock")
+    val state = lower(src).copy(annotations = Seq(SemanticBridgeCheckpointRootAnnotation("Harness.dut")))
+    val result = new BridgeSemanticStateInventory().execute(state)
+    assert(result.circuit == state.circuit)
+    val selected = state.circuit.modules.find(_.name == "InventoryDUT").get
+    val expected = selected.ports.filter(p => p.direction == firrtl.ir.Input && p.tpe != firrtl.ir.ClockType)
+      .map(p => ReferenceTarget(state.circuit.main, selected.name, Nil, p.name, Nil)).toSet
+    assert(result.annotations.collect { case DontTouchAnnotation(t) => t }.toSet == expected)
+    val optimized = new Compiler(Seq(Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm).execute(
+      result.copy(annotations = result.annotations :+ EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter])))
+      .getEmittedCircuit.value
+    assert(optimized.contains("responseStatus") && optimized.contains("responseUser"))
+    val ordinary = SemanticStateInventory(state.copy(annotations = Seq(SemanticCheckpointRootAnnotation("Harness.dut"))))
+    assert(!ordinary.annotations.exists(_.isInstanceOf[DontTouchAnnotation]))
+    val files = result.annotations.collect { case a: GoldenGateOutputFileAnnotation => a.fileSuffix -> a.body }.toMap
+    assert(files(".semantic-reference.fir") == state.circuit.serialize)
   }
 
   it should "describe extracted clock aliases separately and reject generated or undriven clocks" in {

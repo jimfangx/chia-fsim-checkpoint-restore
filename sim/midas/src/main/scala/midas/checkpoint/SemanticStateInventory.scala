@@ -7,7 +7,8 @@ import scala.collection.mutable
 
 import firrtl.{CircuitState, WDefInstance, CDefMemory, CDefMPort}
 import firrtl.ir._
-import firrtl.annotations.NoTargetAnnotation
+import firrtl.annotations.{NoTargetAnnotation, ReferenceTarget}
+import firrtl.transforms.DontTouchAnnotation
 import firrtl.options.{HasShellOptions, ShellOption, Unserializable}
 import midas.stage.GoldenGateOutputFileAnnotation
 import org.json4s._
@@ -339,7 +340,15 @@ object SemanticStateInventory {
             "direction" -> JString(if (port.direction == Input) "input" else "output")))
         }.toList),
       ) ++ clockFields))
-      state.copy(annotations = state.annotations ++ accessFiles ++ Seq(
+      // The live observer must read the authoritative values, including AXI
+      // response status/user fields which later optimization can otherwise
+      // erase at this boundary. Keep only data inputs on the opt-in extracted
+      // bridge path; ordinary inventories and target logic are unchanged.
+      val boundaryInputs = if (!allowOutputClockAliases) Seq.empty else
+        selected.ports.filter(p => p.direction == Input && p.tpe != ClockType).map { p =>
+          DontTouchAnnotation(ReferenceTarget(state.circuit.main, selected.name, Nil, p.name, Nil))
+        }
+      state.copy(annotations = state.annotations ++ accessFiles ++ boundaryInputs ++ Seq(
         GoldenGateOutputFileAnnotation(manifest, ".semantic-state.json"),
         GoldenGateOutputFileAnnotation(state.circuit.serialize, ".semantic-reference.fir"),
         GoldenGateOutputFileAnnotation(clean, ".semantic-clean.sv"),
