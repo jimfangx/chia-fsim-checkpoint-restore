@@ -6,7 +6,7 @@
 
 VCS_CXXOPTS ?= -O2
 
-vcs = $(GENERATED_DIR)/$(DESIGN)
+vcs = $(GENERATED_DIR)/$(if $(FS_CHECKPOINT_PROFILE),checkpoint-vcs/,)$(DESIGN)$(if $(FS_CHECKPOINT_PROFILE),-checkpoint,)
 vcs_debug = $(GENERATED_DIR)/$(DESIGN)-debug
 vcs_post_synth = $(GENERATED_DIR)/$(DESIGN)-post-synth
 vcs_post_synth_debug = $(GENERATED_DIR)/$(DESIGN)-post-synth-debug
@@ -22,12 +22,19 @@ vcs_driver_deps := $(header) $(DRIVER_CC) $(DRIVER_H) $(midas_cc) $(midas_h) $(V
 define make_vcs
 	$(MAKE) -C $(simif_dir) $(1) \
 		PLATFORM=$(PLATFORM) \
-		DRIVER_NAME=$(DESIGN) \
+		DRIVER_NAME=$(DESIGN)$(if $(FS_CHECKPOINT_PROFILE),-checkpoint,) \
 		GEN_FILE_BASENAME=$(BASE_FILE_NAME) \
 		GEN_DIR=$(GENERATED_DIR) \
+		$(if $(FS_CHECKPOINT_PROFILE),OUT_DIR=$(GENERATED_DIR)/checkpoint-vcs,) \
 		DRIVER="$(DRIVER_CC)" \
-		DESIGN_V=$(2)
+		DESIGN_V=$(2) \
+		FS_CHECKPOINT_PROFILE=$(FS_CHECKPOINT_PROFILE) CHECKPOINT_TOOLS_DIR=$(CHECKPOINT_TOOLS_DIR)
 endef
+
+ifneq ($(strip $(FS_CHECKPOINT_PROFILE)),)
+.PHONY: checkpoint-vcs-recheck
+$(vcs): checkpoint-vcs-recheck $(simulator_inventory_outputs)
+endif
 
 $(vcs): $(vcs_driver_deps) $(simulator_verilog)
 	$(call make_vcs, vcs,$(simulator_verilog))

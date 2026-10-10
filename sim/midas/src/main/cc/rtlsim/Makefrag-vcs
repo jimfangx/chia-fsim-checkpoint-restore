@@ -10,11 +10,14 @@
 # header which then proceeds the #define _GNU_SOURCE present in the
 # aforementioned sources. This should removed once we remove the global
 # -include of the generated header.
+include rtlsim/Makefrag-checkpoint
+
 VCS ?= vcs -full64
 vcs_flags := \
 	$(VCS_FLAGS) \
+	$(vcs_checkpoint_flags) \
 	-quiet -timescale=$(SIM_TIMESCALE) +v2k +rad +vcs+initreg+random +vcs+lic+wait \
-	-notice -line -quiet +no_notifier -cc $(CC) -cpp $(CXX) \
+	-notice -line -quiet $(if $(FS_CHECKPOINT_PROFILE),,+no_notifier) -cc $(CC) -cpp $(CXX) \
 	-top $(TB) \
 	-Mdir=$(GEN_DIR)/$(DRIVER_NAME)-debug.csrc \
 	+vc+list \
@@ -25,7 +28,7 @@ vcs_flags := \
 	$(SIM_PREPROC_DEFINES) \
 	$(vcs_flags)
 
-vcs_v := $(emul_v) $(sim_wrapper_v) $(VCS_EXTRA_V)
+vcs_v := $(emul_v) $(sim_wrapper_v) $(checkpoint_v) $(VCS_EXTRA_V)
 vcs_cc := $(emul_cc) $(sim_harness)
 
 ################################################################################

@@ -1,0 +1,33 @@
+# Included only by VCS. The complete inventory is checked before compilation.
+ifneq ($(strip $(FS_CHECKPOINT_PROFILE)),)
+ifneq ($(FS_CHECKPOINT_PROFILE),fcfs-fased-v1)
+$(error Unsupported FS_CHECKPOINT_PROFILE)
+endif
+ifneq ($(filter vcs-debug vcs-post-synth%,$(MAKECMDGOALS)),)
+$(error Checkpoint builds require non-debug RTL VCS metasim)
+endif
+ifneq ($(CLOCK_PERIOD),1.0)
+$(error Checkpoint builds require CLOCK_PERIOD=1.0)
+endif
+checkpoint_dir := $(GEN_DIR)/checkpoint-native
+checkpoint_cc := $(addprefix $(CHECKPOINT_TOOLS_DIR)/,durable_restore_entry.cc aggregate_restore.cc runtime_identity.cc generated_restore.cc harness_restore.cc durable_restore.cc durable_publish.cc durable_capture.cc)
+override CXXFLAGS += -DFS_CHECKPOINT_ENTRY -I$(checkpoint_dir) -I$(CHECKPOINT_TOOLS_DIR)
+override LDFLAGS += -lcrypto -ldl
+emul_cc += $(checkpoint_cc)
+checkpoint_v := $(checkpoint_dir)/checkpoint-coordinator.sv
+vcs_checkpoint_flags := -debug_access+all +vpi +define+FS_CHECKPOINT_DURABLE
+
+.PHONY: checkpoint-build-inventory
+checkpoint-build-inventory:
+	cd $(CHECKPOINT_TOOLS_DIR)/../.. && python -m tools.checkpoint_formats.metasim_build \
+		--profile $(FS_CHECKPOINT_PROFILE) --generated $(GEN_DIR) --out $(checkpoint_dir) \
+		--driver-name $(DRIVER_NAME) \
+		--driver $(DRIVER) --sources $(emul_cc) $(sim_harness) --extra-verilog $(VCS_EXTRA_V) \
+		--cflags="$(CXXFLAGS) -D_GNU_SOURCE -DVCS -I$(VCS_HOME)/include" \
+		--ldflags="$(LDFLAGS)" --vcs-flags="$(VCS_FLAGS)"
+
+# Always recheck flags, sources, emitted RTL and constructor coverage, including
+# reused directories. Parent Make also forces this opt-in recursive invocation.
+$(OUT_DIR)/$(DRIVER_NAME): checkpoint-build-inventory
+$(checkpoint_v): checkpoint-build-inventory ;
+endif

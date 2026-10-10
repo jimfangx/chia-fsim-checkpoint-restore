@@ -50,6 +50,7 @@ include make/utils.mk
 
 include $(TARGET_PROJECT_MAKEFRAG)/config.mk
 include make/config.mk
+include make/checkpoint.mk
 include make/scala-build.mk
 
 include $(TARGET_PROJECT_MAKEFRAG)/build.mk
