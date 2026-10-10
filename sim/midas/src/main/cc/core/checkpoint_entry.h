@@ -5,6 +5,7 @@
 #include <memory>
 #include <charconv>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -22,17 +23,20 @@ struct checkpoint_request_t {
   uint64_t operation = 0; // Completed host driver operations, never target cycles.
   std::string directory;
   uint64_t interval = 0, retention = 0;
+  uint64_t host_timeout_ms = 0, cycle_timeout_ms = 0, capture_timeout_ms = 0;
 
   bool periodic() const { return !directory.empty(); }
+  bool watchdog() const { return host_timeout_ms || cycle_timeout_ms; }
 
   bool durable() const {
-    return periodic() || kind == kind_t::capture || kind == kind_t::restore;
+    return watchdog() || periodic() || kind == kind_t::capture || kind == kind_t::restore;
   }
 
   static checkpoint_request_t parse(const std::vector<std::string> &args) {
     checkpoint_request_t request;
     bool have_operation = false;
     bool have_directory = false, have_interval = false, have_retention = false, have_level = false;
+    bool have_host_timeout = false, have_cycle_timeout = false, have_capture_timeout = false;
     for (const auto &arg : args) {
       auto positive = [&](const std::string &prefix, bool &seen, uint64_t &number) {
         if (seen || arg.rfind(prefix, 0) != 0)
@@ -43,6 +47,20 @@ struct checkpoint_request_t {
         if (parsed.ec != std::errc{} || parsed.ptr != value.data()+value.size() || !number)
           throw std::runtime_error("invalid periodic checkpoint value");
       };
+      auto timeout = [&](const std::string &prefix, bool &seen, uint64_t &number) {
+        positive(prefix,seen,number);
+        if(number>uint64_t(std::numeric_limits<int64_t>::max())/1000000)
+          throw std::runtime_error("checkpoint watchdog timeout exceeds steady-clock range");
+      };
+      if(arg.rfind("+fs-checkpoint-host-timeout",0)==0) {
+        timeout("+fs-checkpoint-host-timeout-ms=",have_host_timeout,request.host_timeout_ms); continue;
+      }
+      if(arg.rfind("+fs-checkpoint-cycle-timeout",0)==0) {
+        timeout("+fs-checkpoint-cycle-timeout-ms=",have_cycle_timeout,request.cycle_timeout_ms); continue;
+      }
+      if(arg.rfind("+fs-checkpoint-capture-timeout",0)==0) {
+        timeout("+fs-checkpoint-capture-timeout-ms=",have_capture_timeout,request.capture_timeout_ms); continue;
+      }
       if (arg.rfind("+fs-checkpoint-interval", 0) == 0) {
         positive("+fs-checkpoint-interval=", have_interval, request.interval); continue;
       }
@@ -96,6 +114,11 @@ struct checkpoint_request_t {
       if (!have_directory || !have_interval || !have_retention || !have_level ||
           (request.kind != kind_t::none && request.kind != kind_t::restore))
         throw std::runtime_error("periodic checkpoint requires directory, target interval, retention and level=1; no single capture/preflight");
+    }
+    if(have_host_timeout || have_cycle_timeout || have_capture_timeout) {
+      if(!request.watchdog() || !have_capture_timeout ||
+         (!request.periodic() && request.kind!=kind_t::restore))
+        throw std::runtime_error("checkpoint watchdog requires progress and bounded capture timeouts with periodic history or restore");
     }
     return request;
   }

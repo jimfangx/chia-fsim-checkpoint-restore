@@ -10,7 +10,7 @@ ifneq ($(CLOCK_PERIOD),1.0)
 $(error Checkpoint builds require CLOCK_PERIOD=1.0)
 endif
 checkpoint_dir := $(GEN_DIR)/checkpoint-native
-checkpoint_cc := $(addprefix $(CHECKPOINT_TOOLS_DIR)/,durable_restore_entry.cc aggregate_restore.cc runtime_identity.cc generated_restore.cc harness_restore.cc durable_restore.cc durable_publish.cc durable_capture.cc durable_history.cc)
+checkpoint_cc := $(addprefix $(CHECKPOINT_TOOLS_DIR)/,durable_restore_entry.cc aggregate_restore.cc runtime_identity.cc generated_restore.cc harness_restore.cc durable_restore.cc durable_publish.cc durable_capture.cc durable_history.cc progress_watchdog.cc)
 override CXXFLAGS += -DFS_CHECKPOINT_ENTRY -I$(checkpoint_dir) -I$(CHECKPOINT_TOOLS_DIR)
 override LDFLAGS += -lcrypto -ldl
 emul_cc += $(checkpoint_cc)
