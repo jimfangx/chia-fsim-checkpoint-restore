@@ -19,6 +19,11 @@ env:
   # temporary directories should be located in /scratch (since it's larger)
   REMOTE_WORK_DIR: /scratch/buildbot/fs-shared/fs-${{ github.sha }}-${{ github.workflow }}
 
+  # Give each workflow its own conda package cache. Both workflows' setup jobs run
+  # at the same time on the same host, and concurrent downloads/extractions into a
+  # shared cache corrupt it.
+  CONDA_PKGS_DIRS: /scratch/buildbot/conda-pkgs/${{ github.workflow }}
+
   # misc
   TERM: xterm-256-color
 
@@ -123,7 +128,7 @@ jobs:
           cache-dependency-path: docs/requirements.txt
       - name: Install documentation dependencies
         run: python -m pip install -r docs/requirements.txt
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version-file: docs/.nvmrc
           cache: npm
