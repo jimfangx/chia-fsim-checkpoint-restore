@@ -6,12 +6,14 @@ import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 
 /** Semantic replay fixture: arrays/SRAM and a pipelined memory response under backpressure. */
-class InventoryFixtureLeaf(checkpointAccess: Boolean = false) extends Module {
+class InventoryFixtureLeaf(checkpointAccess: Boolean = false, forwardedClock: Boolean = false) extends Module {
   val io = IO(new Bundle {
+    val forwarded = if (forwardedClock) Some(Output(Clock())) else None
     val freeze = if (checkpointAccess) Some(Input(Bool())) else None
     val data = Input(UInt(9.W))
     val value = Output(UInt(9.W))
   })
+  io.forwarded.foreach(_ := clock)
   val frozen = io.freeze.getOrElse(false.B)
   withReset(reset.asBool && !frozen) {
     val saved = RegInit(0.U(9.W))
@@ -20,7 +22,32 @@ class InventoryFixtureLeaf(checkpointAccess: Boolean = false) extends Module {
   }
 }
 
-class InventoryFixtureDUT(checkpointAccess: Boolean = false) extends Module {
+/** Stateless clock forwarding tests must resolve through concrete definitions,
+  * including nested and sibling outputs, rather than inventing a root clock.
+  */
+class InventoryClockForwarder extends RawModule {
+  val clock = IO(Input(Clock()))
+  val forwarded = IO(Output(Clock()))
+  forwarded := clock
+}
+
+class InventoryClockIOCell extends RawModule {
+  val pad = IO(Input(UInt(1.W)))
+  val value = IO(Output(UInt(1.W)))
+  value := pad
+}
+
+class InventoryClockRelay extends RawModule {
+  val clock = IO(Input(Clock()))
+  val forwarded = IO(Output(Clock()))
+  val leaf = Module(new InventoryClockForwarder)
+  val pin = Module(new InventoryClockIOCell)
+  leaf.clock := clock
+  pin.pad := leaf.forwarded.asUInt
+  forwarded := pin.value.asBool.asClock
+}
+
+class InventoryFixtureDUT(checkpointAccess: Boolean = false, forwardedClocks: Boolean = false) extends Module {
   val io = IO(new Bundle {
     val checkpoint = if (checkpointAccess) Some(new Bundle {
       val freeze = Input(Bool())
@@ -53,7 +80,13 @@ class InventoryFixtureDUT(checkpointAccess: Boolean = false) extends Module {
     val bank = Reg(Vec(3, UInt(9.W)))
     val sram = Mem(8, UInt(9.W))
     val a = Module(new InventoryFixtureLeaf(checkpointAccess))
-    val b = Module(new InventoryFixtureLeaf(checkpointAccess))
+    val b = Module(new InventoryFixtureLeaf(checkpointAccess, forwardedClock = forwardedClocks))
+    if (forwardedClocks) {
+      val relay = Module(new InventoryClockRelay)
+      relay.clock := clock
+      b.clock := relay.forwarded
+      a.clock := b.io.forwarded.get
+    }
 
     // One request queue, a two-cycle memory operation, and a held response.
     // These are ordinary target registers, never drained for a checkpoint.
@@ -146,3 +179,6 @@ class InventoryFixtureDUT(checkpointAccess: Boolean = false) extends Module {
 
 class InventoryFixture(implicit p: Parameters)
     extends firesim.lib.testutils.PeekPokeHarness(() => new InventoryFixtureDUT)
+
+class ForwardedClockInventoryFixture(implicit p: Parameters)
+    extends firesim.lib.testutils.PeekPokeHarness(() => new InventoryFixtureDUT(forwardedClocks = true))

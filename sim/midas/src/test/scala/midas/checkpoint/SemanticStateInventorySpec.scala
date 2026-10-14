@@ -18,8 +18,12 @@ import org.scalatest.flatspec.AnyFlatSpec
 class SemanticStateInventorySpec extends AnyFlatSpec {
   private val resource = Source.fromResource("checkpoint/InventoryDUT.firrtl")
   private val source = try resource.mkString finally resource.close()
-  private def lower(src: String): CircuitState =
-    new Compiler(Forms.LowForm).execute(CircuitState(Parser.parse(src), ChirrtlForm)).copy(form = LowForm)
+  private def lower(src: String, injectClockLoop: Boolean = false): CircuitState = {
+    // Only adversarial unit cases bypass the earlier FIRRTL loop checker to
+    // exercise our own cycle rejection on an already resolved LowForm graph.
+    val annotations = if (injectClockLoop) Seq(firrtl.transforms.DontCheckCombLoopsAnnotation) else Seq.empty
+    new Compiler(Forms.LowForm).execute(CircuitState(Parser.parse(src), ChirrtlForm, annotations)).copy(form = LowForm)
+  }
   private def manifest(src: String = source): String = SemanticStateInventory.discover(lower(src), "Harness.dut")
   private def entries(text: String): List[JValue] = (parse(text) \ "state").asInstanceOf[JArray].arr
 
@@ -95,6 +99,97 @@ class SemanticStateInventorySpec extends AnyFlatSpec {
     val generated = lower(alias.replace("bridgeClock <= clock", "bridgeClock <= asClock(bits(data, 0, 0))"))
       .copy(annotations = state.annotations)
     intercept[IllegalArgumentException](new BridgeSemanticStateInventory().execute(generated))
+  }
+
+  private def forwardedSource: String = source
+    .replace("    output value : UInt<9>", "    output forwarded : Clock\n    output value : UInt<9>")
+    .replace("    value <= saved", "    forwarded <= clock\n    value <= saved")
+    .replace("    a.clock <= clock", "    a.clock <= b.forwarded")
+
+  it should "resolve hierarchical and sibling clock forwarding without changing state membership or domains" in {
+    val state = lower(forwardedSource).copy(annotations = Seq(SemanticBridgeCheckpointRootAnnotation("Harness.dut")))
+    val result = new BridgeSemanticStateInventory().execute(state)
+    val files = result.annotations.collect { case a: GoldenGateOutputFileAnnotation => a.fileSuffix -> a.body }.toMap
+    assert(entries(files(".semantic-state.json")) == entries(manifest()))
+    assert((parse(files(".semantic-boundary.json")) \ "boundary_version") == JInt(1))
+    assert(files(".semantic-clean.sv").contains("assign a_clock = b_forwarded;"))
+    assert("\\.clock\\s*\\(a_clock\\)".r.findFirstIn(files(".semantic-clean.sv")).nonEmpty)
+    val reordered = forwardedSource.replace("inst a of Leaf\n    inst b of Leaf", "inst b of Leaf\n    inst a of Leaf")
+    assert(entries(SemanticStateInventory.discover(lower(reordered), "Harness.dut", true)) == entries(manifest()))
+    // Clock has the same local name in each scope; it is not an alias cycle.
+    val nested = forwardedSource.replace("  module InventoryDUT :", """  module Relay :
+    input clock : Clock
+    output forwarded : Clock
+    inst leaf of Leaf
+    leaf.clock <= clock
+    leaf.reset <= UInt<1>(0)
+    leaf.data <= UInt<9>(0)
+    forwarded <= leaf.forwarded
+
+  module InventoryDUT :""")
+      .replace("    inst a of Leaf", "    inst relay of Relay\n    relay.clock <= clock\n    inst a of Leaf")
+      .replace("    b.clock <= clock", "    b.clock <= relay.forwarded")
+    val es = entries(SemanticStateInventory.discover(lower(nested), "Harness.dut", true))
+    assert(es.size == 9 && es.forall(e => (e \ "clock_domain") == JString("Harness.dut.clock")))
+    assert(es.exists(e => (e \ "hierarchy") == JString("Harness.dut.relay.leaf.saved")))
+    // The ordinary opt-in retains its output-clock rejection contract.
+    intercept[IllegalArgumentException](SemanticStateInventory.discover(lower(forwardedSource), "Harness.dut"))
+  }
+
+  private def clockPinSource: String = forwardedSource
+    .replace("  module Leaf :", """  module ClockPin :
+    input pad : UInt<1>
+    output value : UInt<1>
+    value <= pad
+
+  module Leaf :""")
+    .replace("    forwarded <= clock", "    inst pin of ClockPin\n    pin.pad <= asUInt(clock)\n    forwarded <= asClock(pin.value)")
+
+  it should "prove transparent clock bitcasts and concrete one-bit IO cells without treating data as a clock" in {
+    for (src <- Seq(clockPinSource,
+                    forwardedSource.replace("forwarded <= clock", "forwarded <= asClock(asUInt(clock))"),
+                    clockPinSource.replace("asUInt(clock)", "bits(asUInt(clock), 0, 0)"))) {
+      assert(entries(SemanticStateInventory.discover(lower(src), "Harness.dut", true)) == entries(manifest()))
+    }
+    val negatives = Seq(
+      clockPinSource.replace("value <= pad", "value <= not(pad)"),
+      clockPinSource.replace("value <= pad", "value <= and(pad, gate)")
+        .replace("    input pad : UInt<1>", "    input pad : UInt<1>\n    input gate : UInt<1>")
+        .replace("    pin.pad <= asUInt(clock)", "    pin.gate <= bits(data, 0, 0)\n    pin.pad <= asUInt(clock)"),
+      clockPinSource.replace("    pin.pad <= asUInt(clock)", "    pin.pad <= bits(data, 0, 0)"),
+      clockPinSource.replace("    pin.pad <= asUInt(clock)", "    pin.pad <= UInt<1>(0)"),
+      clockPinSource.replace("    pin.pad <= asUInt(clock)",
+        "    reg delayed : UInt<1>, clock\n    delayed <= asUInt(clock)\n    pin.pad <= delayed"),
+    )
+    negatives.foreach { src =>
+      val error = intercept[IllegalArgumentException](SemanticStateInventory.discover(lower(src), "Harness.dut", true))
+      assert(error.getMessage.contains("clock"), error.getMessage)
+    }
+  }
+
+  it should "reject cyclic, gated, undriven and opaque hierarchical clock aliases without emitting artifacts" in {
+    val cases = Seq(
+      forwardedSource.replace("b.clock <= clock", "b.clock <= a.forwarded") -> "clock alias cycle",
+      forwardedSource.replace("forwarded <= clock", "forwarded <= asClock(bits(data, 0, 0))") -> "clock",
+      forwardedSource.replace("forwarded <= clock", "forwarded is invalid") -> "clock",
+      forwardedSource.replace("    b.clock <= clock", "    b.clock <= b.forwarded") -> "clock alias cycle",
+      forwardedSource.replace("  module Leaf :", "  extmodule Leaf :")
+        .replace("    reg saved : UInt<9>, clock with :\n      reset => (reset, UInt<9>(0))\n    saved <= data\n    forwarded <= clock\n    value <= saved", "    defname = OpaqueClockLeaf") -> "opaque external module",
+      forwardedSource.replace("    input wen : UInt<1>", "    input wen : UInt<1>\n    input otherClock : Clock")
+        .replace("b.clock <= clock", "b.clock <= otherClock")
+        .replace("dut.wen <= wen", "dut.wen <= wen\n    dut.otherClock <= otherClock") -> "multiple target clock domains",
+      forwardedSource.replace("    input wen : UInt<1>", "    input wen : UInt<1>\n    input otherClock : Clock")
+        .replace("    output count : UInt<9>", "    output bridgeClock : Clock\n    output count : UInt<9>")
+        .replace("    count <= counter", "    bridgeClock <= otherClock\n    count <= counter")
+        .replace("dut.wen <= wen", "dut.wen <= wen\n    dut.otherClock <= otherClock") -> "outside the state clock domain",
+    )
+    cases.foreach { case (src, message) =>
+      val state = lower(src, injectClockLoop = message == "clock alias cycle")
+        .copy(annotations = Seq(SemanticBridgeCheckpointRootAnnotation("Harness.dut")))
+      val error = intercept[IllegalArgumentException](new BridgeSemanticStateInventory().execute(state))
+      assert(error.getMessage.contains(message), error.getMessage)
+      assert(!state.annotations.exists(_.isInstanceOf[GoldenGateOutputFileAnnotation]))
+    }
   }
 
   it should "inventory every register, FSM bit vector, array word and SRAM in two same-module instances" in {

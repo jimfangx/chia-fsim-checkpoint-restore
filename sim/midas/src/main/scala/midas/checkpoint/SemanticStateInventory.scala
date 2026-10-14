@@ -122,12 +122,19 @@ object SemanticStateInventory {
 
     val entries = mutable.ArrayBuffer.empty[JObject]
     val domains = mutable.Set.empty[String]
+    val forwardedDomains = mutable.Set.empty[String]
     def shape(t: Type, at: String): (BigInt, Boolean) = t match {
       case UIntType(IntWidth(w)) if w > 0 => (w, false)
       case SIntType(IntWidth(w)) if w > 0 => (w, true)
       case _ => fail(s"unresolved, aggregate, or non-bit state type ${t.serialize} at $at")
     }
-    def walk(m: Module, hierarchy: String, clocks: Map[String, String], ancestors: Set[String]): Unit = {
+    // Resolve forwarded clocks in their defining instance, not in the consumer's
+    // module. An output may depend on a sibling's forwarded clock; resolving all
+    // child inputs eagerly would then recurse even for an acyclic net. Carry a
+    // hierarchy-qualified dependency stack and resolve only the required input.
+    // Never follow a register's next-state driver as a combinational alias.
+    class ClockScope(val m: Module, val hierarchy: String,
+                     incoming: (String, Set[String]) => String, ancestors: Set[String]) {
       if (ancestors(m.name)) fail(s"recursive hierarchy at $hierarchy")
       val body = statements(m.body)
       val drivers = mutable.Map.empty[String, Expression]
@@ -142,24 +149,72 @@ object SemanticStateInventory {
         case DefNode(_, name, expr) => drivers(name) = expr
         case _ =>
       }
+      // Clock IO cells may carry an unchanged clock as a one-bit UInt between
+      // asUInt/asClock casts. Track provenance through exact bit identities,
+      // never through data expressions, logic gates or sequential storage.
+      private def clockCarrier(t: Type): Boolean = t == ClockType || t == UIntType(IntWidth(1))
+      private val inputs = m.ports.filter(p => clockCarrier(p.tpe) && p.direction == Input).map(_.name).toSet
+      private val outputs = m.ports.filter(p => clockCarrier(p.tpe) && p.direction == Output).map(p => p.name -> p.tpe).toMap
+      private val instances = body.collect { case i: WDefInstance => i.name -> i }.toMap
+      private val children = mutable.Map.empty[String, ClockScope]
+      def child(i: WDefInstance): ClockScope = children.getOrElseUpdate(i.name,
+        new ClockScope(concrete(i.module), s"$hierarchy.${i.name}", (port, seen) => {
+          val source = drivers.getOrElse(s"${i.name}.$port", fail(s"missing child clock at $hierarchy.${i.name}.$port"))
+          clock(source, seen)
+        }, ancestors + m.name))
       def clock(e: Expression, seen: Set[String] = Set.empty): String = {
         val name = e.serialize
-        if (seen(name)) fail(s"clock alias cycle at $hierarchy.$name")
-        clocks.get(name) match {
-          case Some(domain) => domain
-          case None => drivers.get(name) match {
-            case Some(alias) if alias.tpe == ClockType => clock(alias, seen + name)
-            case _ => fail(s"derived, gated, or undriven clock at $hierarchy.$name")
+        // A parent instance pin and the child's port have the same dotted
+        // path but are separate dependency steps, not a cycle by themselves.
+        val key = s"$hierarchy::$name"
+        if (seen(key)) fail(s"clock alias cycle at $hierarchy.$name")
+        val next = seen + key
+        if (!clockCarrier(e.tpe)) fail(s"non-clock alias at $hierarchy.$name")
+        if (inputs(name)) incoming(name, next)
+        else e match {
+          case DoPrim(firrtl.PrimOps.AsClock, Seq(value), Nil, ClockType)
+              if allowOutputClockAliases && value.tpe == UIntType(IntWidth(1)) => clock(value, next)
+          case DoPrim(firrtl.PrimOps.AsUInt, Seq(value), Nil, UIntType(IntWidth(width)))
+              if allowOutputClockAliases && width == 1 && value.tpe == ClockType => clock(value, next)
+          case DoPrim(firrtl.PrimOps.Bits, Seq(value), Seq(zeroHigh, zeroLow), UIntType(IntWidth(width)))
+              if allowOutputClockAliases && width == 1 && zeroHigh == 0 && zeroLow == 0 && value.tpe == UIntType(IntWidth(1)) =>
+            clock(value, next)
+          case _ => name.split("\\.", -1).toSeq match {
+            case Seq(instance, port) if instances.contains(instance) =>
+              if (!allowOutputClockAliases) fail(s"output clock at $hierarchy.$name")
+              val scope = child(instances(instance))
+              val tpe = scope.outputs.getOrElse(port, fail(s"non-output child clock at $hierarchy.$name"))
+              if (tpe != e.tpe) fail(s"reshaped child clock at $hierarchy.$name")
+              scope.clock(Reference(port, tpe), next)
+            case _ => drivers.get(name) match {
+              case Some(alias) if alias.tpe == e.tpe && (combinationalAliases(name) || outputs.contains(name)) =>
+                clock(alias, next)
+              case _ => fail(s"derived, gated, or undriven clock at $hierarchy.$name")
+            }
           }
         }
       }
+    }
+    val rootDomains = selected.ports.filter(p => p.tpe == ClockType && p.direction == Input).map { p =>
+      p.name -> s"$root.${p.name}"
+    }.toMap
+    def walk(scope: ClockScope): Unit = {
+      val m = scope.m
+      val hierarchy = scope.hierarchy
+      val body = scope.body
+      val drivers = scope.drivers
+      val combinationalAliases = scope.combinationalAliases
+      def clock(e: Expression): String = scope.clock(e)
       // Extracted bridges forward their clock to the environment. Accept only
-      // a resolved alias of the sole incoming clock, never a generated clock.
+      // a resolved alias of a selected incoming clock, never a generated clock.
+      // Distinct state clock domains still reject at the inventory boundary.
       // Ordinary inventories retain their original rejection of output clocks.
       m.ports.filter(p => p.tpe == ClockType && p.direction == Output).foreach { p =>
         if (!allowOutputClockAliases) fail(s"output clock at $hierarchy.${p.name}")
         val source = drivers.getOrElse(p.name, fail(s"undriven output clock at $hierarchy.${p.name}"))
-        if (clock(source) != s"$root.clock") fail(s"non-target output clock at $hierarchy.${p.name}")
+        val domain = clock(source)
+        if (!rootDomains.values.toSet(domain)) fail(s"non-target output clock at $hierarchy.${p.name}")
+        forwardedDomains += domain
       }
       def enableIdentity(e: Expression, seen: Set[String] = Set.empty): String = {
         val name = e.serialize
@@ -183,7 +238,7 @@ object SemanticStateInventory {
           // Boolean identity permits stripping the clock validity guard.
           case ValidIf(cond, value, ClockType) if enableIdentity(cond) == enableIdentity(enable) => clock(value)
           case _ => drivers.get(name) match {
-            case Some(alias) if alias.tpe == ClockType && !clocks.contains(name) =>
+            case Some(alias) if alias.tpe == ClockType && combinationalAliases(name) =>
               memoryClock(alias, enable, seen + name)
             case _ => clock(e)
           }
@@ -232,23 +287,22 @@ object SemanticStateInventory {
           val child = concrete(i.module)
           if (!allowOutputClockAliases && child.ports.exists(p => p.tpe == ClockType && p.direction == Output))
             fail(s"output clock at $hierarchy.${i.name}")
-          val childClocks = child.ports.filter(p => p.tpe == ClockType && p.direction == Input).map { p =>
-            val source = drivers.getOrElse(s"${i.name}.${p.name}", fail(s"missing child clock at $hierarchy.${i.name}.${p.name}"))
-            p.name -> clock(source)
-          }.toMap
-          walk(child, s"$hierarchy.${i.name}", childClocks, ancestors + m.name)
+          val childScope = scope.child(i)
+          child.ports.filter(p => p.tpe == ClockType && p.direction == Input).foreach { p =>
+            childScope.clock(Reference(p.name, ClockType))
+          }
+          walk(childScope)
         case _: Conditionally | _: CDefMemory | _: CDefMPort => fail(s"non-lowered state at $hierarchy")
         case _ =>
       }
     }
     if (!allowOutputClockAliases && selected.ports.exists(p => p.tpe == ClockType && p.direction == Output))
       fail(s"output clock at $root")
-    val clocks = selected.ports.filter(p => p.tpe == ClockType && p.direction == Input).map { p =>
-      p.name -> s"$root.${p.name}"
-    }.toMap
-    walk(selected, root, clocks, Set.empty)
+    walk(new ClockScope(selected, root, (port, _) => rootDomains.getOrElse(port,
+      fail(s"clock provenance reaches data input at $root.$port")), Set.empty))
     if (entries.isEmpty) fail(s"no state under $root")
     if (domains.size != 1) fail(s"multiple target clock domains: ${domains.toSeq.sorted.mkString(", ")}")
+    if (forwardedDomains.exists(_ != domains.head)) fail("forwarded output clock outside the state clock domain")
     val sorted = entries.sortBy(e => (e \ "state_id").values.toString).toList
     if (sorted.map(e => (e \ "state_id").values).distinct.size != sorted.size) fail("duplicate StateID")
     canonical(JObject(List(
