@@ -169,4 +169,63 @@ class SimulatorStateInventorySpec extends AnyFlatSpec {
     intercept[IllegalArgumentException](SimulatorStateInventory.discover(
       lower(source.replace("input reset : UInt<1>", "input reset : AsyncReset"))))
   }
+
+  it should "bind every exact metasim plusarg specialization and reject incomplete or altered owners" in {
+    val resource = Source.fromResource("vsrc/plusarg_reader.v")
+    val model = try resource.mkString finally resource.close()
+    val src = """circuit Top :
+  module Top :
+    output first : UInt<32>
+    output second : UInt<1>
+    inst a of Reader32
+    inst b of Reader1
+    first <= a.out
+    second <= b.out
+  extmodule Reader32 :
+    output out : UInt<32>
+    defname = plusarg_reader
+    parameter WIDTH = 32
+    parameter DEFAULT = 7
+    parameter FORMAT = "max_core_cycles=%d"
+  extmodule Reader1 :
+    output out : UInt<1>
+    defname = plusarg_reader
+    parameter WIDTH = 1
+    parameter DEFAULT = 0
+    parameter FORMAT = "custom_boot_pin=%d"
+"""
+    def annotated(text: String = src, inline: String = model): CircuitState = {
+      val s = lower(text)
+      s.copy(annotations = s.annotations ++ Seq("Reader32", "Reader1").map { name =>
+        BlackBoxInlineAnno(ModuleName(name, CircuitName("Top")), "plusarg_reader.v", inline)
+      })
+    }
+    val doc = parse(SimulatorStateInventory.discover(annotated()))
+    val es = (doc \ "state").asInstanceOf[JArray].arr
+    assert(es.size == 2)
+    assert(es.forall(e => (e \ "adapter") == JString("metasim-plusarg-v1")))
+    assert(es.find(e => (e \ "hierarchy") == JString("Top.a.myplus")).get \ "width" == JInt(32))
+    val owners = (doc \ "instances").asInstanceOf[JArray].arr
+    val owner = owners.find(e => (e \ "hierarchy") == JString("Top.a")).get
+    assert((owner \ "external_adapter" \ "default") == JInt(7))
+    assert((owner \ "implementation_sha256") == JString(SemanticStateInventory.sha256(
+      SemanticStateInventory.canonical(owner \ "external_adapter"))))
+    val changed = parse(SimulatorStateInventory.discover(annotated(src.replace("DEFAULT = 7", "DEFAULT = 8"))))
+    assert((changed \ "instances") != (doc \ "instances"))
+    intercept[IllegalArgumentException](SimulatorStateInventory.discover(lower(src)))
+    for (bad <- Seq(src.replace("WIDTH = 32", "WIDTH = 31"), src.replace("DEFAULT = 7", "DEFAULT = -1"),
+                    src.replace("DEFAULT = 0", "DEFAULT = 2"), src.replace("FORMAT =", "UNKNOWN ="),
+                    src.replace("max_core_cycles=%d", "max_core_cycles=%s"))) {
+      intercept[IllegalArgumentException](SimulatorStateInventory.discover(annotated(bad)))
+    }
+    intercept[IllegalArgumentException](SimulatorStateInventory.discover(annotated(inline = model + "\n")))
+    val duplicate = annotated().copy(annotations = annotated().annotations ++ annotated().annotations)
+    intercept[IllegalArgumentException](SimulatorStateInventory.discover(duplicate))
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { dir =>
+      java.nio.file.Files.write(java.nio.file.Paths.get(dir, "plusarg-inventory.json"),
+        SimulatorStateInventory.discover(annotated()).getBytes(java.nio.charset.StandardCharsets.UTF_8))
+      java.nio.file.Files.write(java.nio.file.Paths.get(dir, "plusarg-reference.fir"),
+        annotated().circuit.serialize.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+    }
+  }
 }

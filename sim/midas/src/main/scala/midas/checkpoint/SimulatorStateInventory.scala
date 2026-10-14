@@ -28,6 +28,7 @@ object SimulatorCheckpointInventoryAnnotation extends HasShellOptions {
 object SimulatorStateInventory {
   // Backend must verify the actual supplied metasim model against this hash.
   val bufgceModelSHA256 = "061be30e475233b0ac347aafb88d470279f16c4ebb1908f399edd4446c811e28"
+  val plusargModelSHA256 = "482a63c1f24a7ac920909620bd0df108e6954eabf9520de6e72334a2b5450efb"
   private def fail(message: String): Nothing =
     throw new IllegalArgumentException(s"Simulator checkpoint unsupported: $message")
 
@@ -68,16 +69,41 @@ object SimulatorStateInventory {
       if (!identifier(name) || !path.split("\\.").forall(identifier)) fail(s"unsupported hierarchy $path")
       if (ancestors(name)) fail(s"recursive hierarchy at $path")
       val module = modules.getOrElse(name, fail(s"missing module $name at $path"))
+      var externalAdapter = List.empty[(String, JValue)]
       val sourceHash = module match {
         case m: ExtModule =>
           // An explicit adapter for this exact inline clock-gate implementation.
           // Name/signature alone cannot establish that an opaque module has one bit of state.
           val expected = DefineAbstractClockGate.blackbox
           val sources = state.annotations.collect { case a: BlackBoxInlineAnno if a.target.name == name => a.text }
-          if (m.params.nonEmpty ||
-              m.ports.map(p => (p.name, p.direction, p.tpe)) != expected.ports.map(p => (p.name, p.direction, p.tpe)))
+          if (m.defname == "plusarg_reader") {
+            val width = m.params.collect { case IntParam("WIDTH", w) => w }
+            val default = m.params.collect { case IntParam("DEFAULT", v) => v }
+            val format = m.params.collect { case StringParam("FORMAT", s) => s.string }
+            if (sources.size != 1 || SemanticStateInventory.sha256(sources.head) != plusargModelSHA256 ||
+                m.params.size != 3 || width.size != 1 || default.size != 1 || format.size != 1 ||
+                width.head <= 0 || width.head > Int.MaxValue || default.head < 0 ||
+                default.head.bitLength > width.head || !format.head.matches("[A-Za-z_][A-Za-z0-9_]*=%[dbh]") ||
+                m.ports.map(p => (p.name, p.direction, p.tpe)) !=
+                  Seq(("out", Output, UIntType(IntWidth(width.head)))))
+              fail(s"opaque external module $name at $path; no exact plusarg state adapter")
+            // Metasim's non-SYNTHESIS model has one init-only register. It is
+            // real runtime state, not a constant inferred from DEFAULT. Bind
+            // every specialization so alternate process plusargs cannot silently
+            // change an image's state owner. FPGA synthesis has no such register.
+            val adapter = JObject(List(
+              "adapter" -> JString("metasim-plusarg-v1"), "defname" -> JString(m.defname),
+              "source_sha256" -> JString(plusargModelSHA256), "width" -> JInt(width.head),
+              "default" -> JInt(default.head), "format" -> JString(format.head),
+            ))
+            externalAdapter = List("external_adapter" -> adapter)
+            add(s"$path.myplus", name, "register", UIntType(IntWidth(width.head)), 1,
+              "initial", "none", "metasim-plusarg-v1")
+            SemanticStateInventory.sha256(SemanticStateInventory.canonical(adapter))
+          } else if (m.params.nonEmpty ||
+              m.ports.map(p => (p.name, p.direction, p.tpe)) != expected.ports.map(p => (p.name, p.direction, p.tpe))) {
             fail(s"opaque external module $name at $path; no exact state adapter")
-          if (m.defname == expected.defname && sources.size == 1 && sources.head == DefineAbstractClockGate.impl) {
+          } else if (m.defname == expected.defname && sources.size == 1 && sources.head == DefineAbstractClockGate.impl) {
             add(s"$path.enable", name, "register", UIntType(IntWidth(1)), 1, "I", "none", "abstract-clock-gate-v1")
             SemanticStateInventory.sha256(sources.head)
           } else if (m.defname == "BUFGCE" && sources.isEmpty) {
@@ -131,7 +157,7 @@ object SimulatorStateInventory {
         case _ => fail(s"unsupported module wrapper at $path")
       }
       instances += JObject(List("hierarchy" -> JString(path), "module" -> JString(name),
-        "implementation_sha256" -> JString(sourceHash)))
+        "implementation_sha256" -> JString(sourceHash)) ++ externalAdapter)
     }
     val root = if (rootModule.isEmpty) circuit.main else rootModule
     walk(root, root, Set.empty)
