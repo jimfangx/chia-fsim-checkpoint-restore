@@ -1,0 +1,76 @@
+circuit MultiClockInventory :
+  module Relay :
+    input clock : Clock
+    output forwarded : Clock
+    forwarded <= clock
+  module MultiClockInventory :
+    input clock0 : Clock
+    input clock1 : Clock
+    input clock2 : Clock
+    input clock3 : Clock
+    input clock4 : Clock
+    input clock5 : Clock
+    input clock6 : Clock
+    input reset : UInt<1>
+    input data : UInt<16>
+    input address : UInt<2>
+    input wen : UInt<1>
+    output out0 : UInt<16>
+    output out1 : UInt<16>
+    output out2 : UInt<16>
+    output out3 : UInt<16>
+    output out4 : UInt<16>
+    output out5 : UInt<16>
+    output out6 : UInt<16>
+    output readData : UInt<16>
+    output crossing : UInt<16>
+    output forwarded : Clock
+    inst relay of Relay
+    relay.clock <= clock6
+    forwarded <= relay.forwarded
+    reg s0 : UInt<16>, clock0 with :
+      reset => (reset, UInt<16>(0))
+    reg s1 : UInt<16>, clock1 with :
+      reset => (reset, UInt<16>(0))
+    reg s2 : UInt<16>, clock2 with :
+      reset => (reset, UInt<16>(0))
+    reg s3 : UInt<16>, clock3 with :
+      reset => (reset, UInt<16>(0))
+    reg s4 : UInt<16>, clock4 with :
+      reset => (reset, UInt<16>(0))
+    reg s5 : UInt<16>, clock5 with :
+      reset => (reset, UInt<16>(0))
+    reg s6 : UInt<16>, relay.clock with :
+      reset => (reset, UInt<16>(0))
+    s0 <= add(s0, data)
+    s1 <= add(s1, s0)
+    s2 <= add(s2, data)
+    s3 <= add(s3, s2)
+    s4 <= add(s4, data)
+    s5 <= add(s5, s4)
+    s6 <= add(s6, s5)
+    out0 <= s0
+    out1 <= s1
+    out2 <= s2
+    out3 <= s3
+    out4 <= s4
+    out5 <= s5
+    out6 <= s6
+    crossing <= xor(s0, s6)
+    mem ram :
+      data-type => UInt<16>
+      depth => 4
+      read-latency => 1
+      write-latency => 1
+      reader => r
+      writer => w
+      read-under-write => old
+    ram.r.clk <= clock0
+    ram.r.addr <= address
+    ram.r.en <= UInt<1>(1)
+    ram.w.clk <= clock0
+    ram.w.addr <= address
+    ram.w.en <= wen
+    ram.w.mask <= UInt<1>(1)
+    ram.w.data <= data
+    readData <= ram.r.data

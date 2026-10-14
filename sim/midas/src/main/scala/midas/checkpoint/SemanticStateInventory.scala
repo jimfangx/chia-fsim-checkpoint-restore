@@ -7,7 +7,7 @@ import scala.collection.mutable
 
 import firrtl.{CircuitState, WDefInstance, CDefMemory, CDefMPort}
 import firrtl.ir._
-import firrtl.annotations.{NoTargetAnnotation, ReferenceTarget}
+import firrtl.annotations.{NoTargetAnnotation, ReferenceTarget, InstanceTarget, SingleTargetAnnotation}
 import firrtl.transforms.{DontTouchAnnotation, BlackBoxInlineAnno}
 import firrtl.options.{HasShellOptions, ShellOption, Unserializable}
 import midas.stage.GoldenGateOutputFileAnnotation
@@ -43,6 +43,42 @@ object SemanticBridgeCheckpointRootAnnotation extends HasShellOptions {
   ))
 }
 
+/** Discovery only: event phases and a coherent multi-clock cut must be bound
+  * by a separate capture backend before this inventory can authorize restore.
+  */
+case object SemanticMultiClockInventoryAnnotation extends NoTargetAnnotation with Unserializable with HasShellOptions {
+  val options = Seq(new ShellOption[Unit](
+    longOption = "semantic-multiclock-inventory",
+    toAnnotationSeq = (_: Unit) => Seq(SemanticMultiClockInventoryAnnotation),
+    helpText = "Emit explicit pre-FAME clock ownership; does not enable multi-clock capture or restore.",
+  ))
+}
+
+/** Compiler-maintained clean-RTL location, separate from original StateID. */
+case class SemanticCleanStorageAnnotation(stateID: String, target: ReferenceTarget, suffix: String = "",
+                                          instanceKeys: Seq[String] = Nil)
+    extends SingleTargetAnnotation[ReferenceTarget] {
+  def duplicate(n: ReferenceTarget): SemanticCleanStorageAnnotation = copy(target = n)
+}
+
+case class SemanticCleanInstanceAnnotation(key: String, target: InstanceTarget)
+    extends SingleTargetAnnotation[InstanceTarget] {
+  def duplicate(n: InstanceTarget): SemanticCleanInstanceAnnotation = copy(target = n)
+}
+
+/** FIRRTL's emitter runs VerilogPrep/VerilogRename internally but returns the
+  * input CircuitState. Observe that exact internal state, never reconstruct a
+  * keyword rename from the emitted spelling or from the earlier result state.
+  */
+class SemanticCleanEmitter extends firrtl.SystemVerilogEmitter {
+  var preparedState: Option[CircuitState] = None
+  override protected def runTransforms(state: CircuitState): CircuitState = {
+    val prepared = super.runTransforms(state)
+    preparedState = Some(prepared)
+    prepared
+  }
+}
+
 /** Run at the resolved bridge-extraction boundary, before target instrumentation
   * and every FAME transform. No circuit changes or mapping guesses are made.
   */
@@ -64,7 +100,10 @@ class BridgeSemanticStateInventory extends firrtl.Transform {
       val inventoried = SemanticStateInventory(selected, allowOutputClockAliases = true)
       // The selection is consumed. Do not run this inventory again at a later
       // compiler boundary, or leave a synthetic early-root annotation behind.
-      inventoried.copy(annotations = inventoried.annotations.filterNot(_.isInstanceOf[SemanticCheckpointRootAnnotation]))
+      inventoried.copy(annotations = inventoried.annotations.filterNot {
+        case _: SemanticCheckpointRootAnnotation | SemanticMultiClockInventoryAnnotation => true
+        case _ => false
+      })
     }
   }
 }
@@ -101,7 +140,8 @@ object SemanticStateInventory {
     result.toSeq
   }
 
-  def discover(state: CircuitState, root: String, allowOutputClockAliases: Boolean = false): String = {
+  def discover(state: CircuitState, root: String, allowOutputClockAliases: Boolean = false,
+               allowMultipleClocks: Boolean = false): String = {
     if (state.form != firrtl.LowForm) fail("discovery requires resolved LowForm")
     val circuit = state.circuit
     val modules = circuit.modules.map(m => m.name -> m).toMap
@@ -124,6 +164,7 @@ object SemanticStateInventory {
     val externalModels = mutable.ArrayBuffer.empty[JObject]
     val domains = mutable.Set.empty[String]
     val forwardedDomains = mutable.Set.empty[String]
+    val rootClockAliases = mutable.Map.empty[String, String]
     def shape(t: Type, at: String): (BigInt, Boolean) = t match {
       case UIntType(IntWidth(w)) if w > 0 => (w, false)
       case SIntType(IntWidth(w)) if w > 0 => (w, true)
@@ -224,6 +265,7 @@ object SemanticStateInventory {
         val domain = clock(source)
         if (!rootDomains.values.toSet(domain)) fail(s"non-target output clock at $hierarchy.${p.name}")
         forwardedDomains += domain
+        if (hierarchy == root) rootClockAliases(p.name) = domain.stripPrefix(root + ".")
       }
       def enableIdentity(e: Expression, seen: Set[String] = Set.empty): String = {
         val name = e.serialize
@@ -360,17 +402,26 @@ object SemanticStateInventory {
     walk(new ClockScope(selected, root, (port, _) => rootDomains.getOrElse(port,
       fail(s"clock provenance reaches data input at $root.$port")), Set.empty))
     if (entries.isEmpty) fail(s"no state under $root")
-    if (domains.size != 1) fail(s"multiple target clock domains: ${domains.toSeq.sorted.mkString(", ")}")
-    if (forwardedDomains.exists(_ != domains.head)) fail("forwarded output clock outside the state clock domain")
+    if (domains.isEmpty || (!allowMultipleClocks && domains.size != 1))
+      fail(s"multiple target clock domains: ${domains.toSeq.sorted.mkString(", ")}")
+    if (!allowMultipleClocks && forwardedDomains.exists(_ != domains.head))
+      fail("forwarded output clock outside the state clock domain")
     val sorted = entries.sortBy(e => (e \ "state_id").values.toString).toList
     if (sorted.map(e => (e \ "state_id").values).distinct.size != sorted.size) fail("duplicate StateID")
     if (sorted.map(e => (e \ "hierarchy").values).distinct.size != sorted.size) fail("duplicate semantic state path")
     canonical(JObject(List(
-      "manifest_version" -> JInt(if (externalModels.isEmpty) 1 else 2), "manifest_type" -> JString("rtlckpt"),
+      "manifest_version" -> JInt(if (allowMultipleClocks) 3 else if (externalModels.isEmpty) 1 else 2),
+      "manifest_type" -> JString("rtlckpt"),
       "identity_scheme" -> JString("pre-fame-state-v1"), "circuit" -> JString(circuit.main),
-      "dut_root" -> JString(root), "clock_domain" -> JString(domains.head),
+      "dut_root" -> JString(root),
       "reference_sha256" -> JString(sha256(circuit.serialize)), "state" -> JArray(sorted),
-    ) ++ (if (externalModels.isEmpty) Nil else List(
+    ) ++ (if (!allowMultipleClocks) List("clock_domain" -> JString(domains.head)) else List(
+      "clock_domains" -> JArray(domains.toSeq.sorted.map(JString(_)).toList),
+      "clock_inputs" -> JArray(rootDomains.values.toSeq.sorted.map(JString(_)).toList),
+      "clock_aliases" -> JArray(rootClockAliases.toSeq.sortBy(_._1).map { case (name, source) =>
+        JObject(List("name" -> JString(name), "source" -> JString(source), "direction" -> JString("output")))
+      }.toList),
+    )) ++ (if (externalModels.isEmpty && !allowMultipleClocks) Nil else List(
       "external_models" -> JArray(externalModels.sortBy(e => (e \ "hierarchy").values.toString).toList),
     ))))
   }
@@ -379,6 +430,10 @@ object SemanticStateInventory {
     val roots = state.annotations.collect { case SemanticCheckpointRootAnnotation(path) => path }
     val bridgeRoots = state.annotations.collect { case SemanticBridgeCheckpointRootAnnotation(path) => path }
     val access = state.annotations.collect { case a: SemanticBankedAccessAnnotation => a }
+    val multiclock = state.annotations.count(_ == SemanticMultiClockInventoryAnnotation)
+    if (multiclock > 1 || (multiclock != 0 && (roots.isEmpty && bridgeRoots.isEmpty)))
+      fail("multi-clock inventory requires exactly one explicit root and one opt-in")
+    if (multiclock != 0 && access.nonEmpty) fail("multi-clock banked cut protocol is not implemented")
     if (bridgeRoots.nonEmpty) {
       if (bridgeRoots.size != 1 || roots.nonEmpty || access.nonEmpty)
         fail("bridge-extracted inventory cannot mix root phases, duplicate roots, or banked bindings")
@@ -389,7 +444,7 @@ object SemanticStateInventory {
     }
     else {
       if (roots.size != 1) fail("exactly one explicit DUT root is required")
-      val manifest = discover(state, roots.head, allowOutputClockAliases)
+      val manifest = discover(state, roots.head, allowOutputClockAliases, multiclock != 0)
       val accessFiles = if (access.isEmpty) Seq.empty else {
         if (access.size != 1 || access.head.root != roots.head) fail("banked binding root/count mismatch")
         val binding = access.head.entries
@@ -435,30 +490,110 @@ object SemanticStateInventory {
       }
       include(selected.name)
       val cleanCircuit = state.circuit.copy(main = selected.name, modules = state.circuit.modules.filter(m => reachable(m.name)))
-      val cleanRTL = new Compiler(Seq(Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm).execute(
+      val preserveStorage = if (multiclock == 0) Seq.empty else cleanCircuit.modules.flatMap {
+        case m: Module =>
+          statements(m.body).collect {
+            case r: DefRegister => DontTouchAnnotation(ReferenceTarget(cleanCircuit.main, m.name, Nil, r.name, Nil))
+            case m0: DefMemory => DontTouchAnnotation(ReferenceTarget(cleanCircuit.main, m.name, Nil, m0.name, Nil))
+          }
+        case _ => Seq.empty
+      }
+      val storageLocations = if (multiclock == 0) Seq.empty else {
+        (parse(manifest) \ "state").asInstanceOf[JArray].arr.map { entry =>
+          val relative = (entry \ "hierarchy").values.toString.stripPrefix(roots.head + ".").split("\\.").toSeq
+          var scope = selected
+          val instanceKeys = mutable.ArrayBuffer.empty[String]
+          // InstanceTarget and ModuleTarget share IsModule, but keep the path
+          // explicit so each repeated module instance remains independently owned.
+          val path = relative.dropRight(1).map { name =>
+            val instance = instances(scope.body).find(_.name == name).getOrElse(
+              fail(s"missing clean semantic instance $name"))
+            instanceKeys += s"${scope.name}::$name"
+            val pair = (firrtl.annotations.TargetToken.Instance(name), firrtl.annotations.TargetToken.OfModule(instance.module))
+            modules(instance.module) match { case m: Module => scope = m; case _: ExtModule => }
+            pair
+          }
+          val pipeline = statements(scope.body).collect { case mem: DefMemory => mem }.flatMap { mem =>
+            val fields = mem.readers.map(p => (p, if (mem.readUnderWrite == ReadUnderWrite.Old) "data" else "addr")) ++
+              mem.readwriters.map(p => (p, "rdata"))
+            if (mem.readLatency == 1) fields.map { case (port, field) =>
+              (firrtl.passes.LowerTypes.loweredName(firrtl.passes.MemPortUtils.memPortField(mem, port, field)),
+                mem.name, s"_${port}_${field}")
+            } else Seq.empty
+          }.filter(_._1 == relative.last)
+          if (pipeline.size > 1) fail("ambiguous clean memory pipeline owner")
+          val (reference, suffix) = pipeline.headOption.map(x => (x._2, x._3)).getOrElse((relative.last, ""))
+          SemanticCleanStorageAnnotation((entry \ "state_id").values.toString,
+            ReferenceTarget(cleanCircuit.main, selected.name, path, reference, Nil), suffix, instanceKeys.toSeq)
+        }
+      }
+      // Local instance targets preserve keyword renames in each path segment.
+      // FIRRTL's nonlocal ReferenceTarget update leaves some such segments in
+      // their original spelling, even though it updates the terminal reference.
+      val requiredInstanceKeys = storageLocations.flatMap(_.instanceKeys).toSet
+      val instanceLocations = if (multiclock == 0) Seq.empty else cleanCircuit.modules.flatMap {
+        case m: Module => instances(m.body).filter(i => requiredInstanceKeys(s"${m.name}::${i.name}")).map { i =>
+          SemanticCleanInstanceAnnotation(s"${m.name}::${i.name}",
+            InstanceTarget(cleanCircuit.main, m.name, Nil, i.name, i.module))
+        }
+        case _ => Seq.empty
+      }
+      val emitter = if (multiclock == 0) new firrtl.SystemVerilogEmitter else new SemanticCleanEmitter
+      val cleanResult = new Compiler(Seq(Dependency.fromTransform(emitter)), Forms.LowForm, Set(emitter)).execute(
         CircuitState(cleanCircuit, firrtl.LowForm, Seq(
           // Preserve the same implicit memory owners as the inventoried IR and
           // Golden Gate's emission path; lowering again creates different state.
           firrtl.passes.memlib.PassthroughSimpleSyncReadMemsAnnotation,
-          firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter]),
-        ))
-      ).getEmittedCircuit.value
+          firrtl.EmitCircuitAnnotation(emitter.getClass),
+        ) ++ preserveStorage ++ storageLocations ++ instanceLocations)
+      )
+      val prepared = emitter match {
+        case e: SemanticCleanEmitter => e.preparedState.getOrElse(fail("clean emitter did not expose its actual storage layout"))
+        case _ => cleanResult
+      }
+      val cleanRTL = cleanResult.getEmittedCircuit.value
       val externalSources = state.annotations.collect {
         case a: BlackBoxInlineAnno if reachable(a.target.name) &&
             modules(a.target.name).isInstanceOf[ExtModule] && a.target.circuit.name == state.circuit.main => a.text
       }.distinct
       val clean = cleanRTL + externalSources.map("\n" + _).mkString
+      val cleanAccessFiles = if (multiclock == 0) Seq.empty else {
+        val locations = prepared.annotations.collect { case a: SemanticCleanStorageAnnotation => a }.sortBy(_.stateID)
+        val renamedInstances = prepared.annotations.collect { case a: SemanticCleanInstanceAnnotation => a }
+        if (renamedInstances.map(_.key).sorted != instanceLocations.map(_.key).sorted)
+          fail("lost or duplicated clean instance location")
+        val instancePaths = renamedInstances.map(a => a.key -> a.target.instance).toMap
+        val originalIDs = (parse(manifest) \ "state").asInstanceOf[JArray].arr.map(e => (e \ "state_id").values.toString)
+        if (locations.map(_.stateID) != originalIDs || locations.exists(a => a.target.component.nonEmpty))
+          fail("lost, duplicated, or reshaped clean RTL storage annotation")
+        val bindings = locations.map { a =>
+          val path = (a.instanceKeys.map(key => instancePaths.getOrElse(key,
+            fail("missing clean instance path segment"))) :+ (a.target.ref + a.suffix)).mkString(".")
+          JObject(List("state_id" -> JString(a.stateID), "rtl_path" -> JString(path)))
+        }.toList
+        if (bindings.map(e => (e \ "rtl_path").values).distinct.size != bindings.size)
+          fail("aliased clean RTL storage locations")
+        Seq(GoldenGateOutputFileAnnotation(canonical(JObject(List(
+          "access_version" -> JInt(1), "scope" -> JString("clean-rtl-inventory-only"),
+          "state_manifest_sha256" -> JString(sha256(manifest)), "clean_rtl_sha256" -> JString(sha256(clean)),
+          "dut_module" -> JString(prepared.circuit.main), "state" -> JArray(bindings),
+        ))), ".semantic-clean-access.json"))
+      }
       val outputClocks = selected.ports.filter(p => p.tpe == ClockType && p.direction == Output)
-      val clockFields = if (outputClocks.isEmpty) List.empty else List(
+      val clockFields = if (multiclock != 0) List(
+        "clock_inputs" -> (parse(manifest) \ "clock_inputs"),
+        "clock_aliases" -> (parse(manifest) \ "clock_aliases"),
+      ) else if (outputClocks.isEmpty) List.empty else List(
         "clock_aliases" -> JArray(outputClocks.map(p => JObject(List(
           "name" -> JString(p.name), "source" -> JString("clock"), "direction" -> JString("output"),
         ))).toList),
       )
       val boundary = canonical(JObject(List(
-        "boundary_version" -> JInt(if (outputClocks.isEmpty) 1 else 2), "dut_module" -> JString(selected.name),
-        "dut_root" -> JString(roots.head), "clock" -> JString("clock"),
-        "sample_phase" -> JString("before_rising_edge"),
-        "ports" -> JArray(selected.ports.filterNot(outputClocks.contains).map { port =>
+        "boundary_version" -> JInt(if (multiclock != 0) 3 else if (outputClocks.isEmpty) 1 else 2),
+        "dut_module" -> JString(if (multiclock == 0) selected.name else prepared.circuit.main), "dut_root" -> JString(roots.head),
+        "sample_phase" -> JString(if (multiclock != 0) "before_clock_event" else "before_rising_edge"),
+        "ports" -> JArray(selected.ports.filterNot(p => outputClocks.contains(p) ||
+          (multiclock != 0 && p.tpe == ClockType)).map { port =>
           val width = port.tpe match {
             case ClockType if port.name == "clock" && port.direction == Input => BigInt(1)
             case UIntType(IntWidth(w)) => w
@@ -468,7 +603,7 @@ object SemanticStateInventory {
           JObject(List("name" -> JString(port.name), "width" -> JInt(width),
             "direction" -> JString(if (port.direction == Input) "input" else "output")))
         }.toList),
-      ) ++ clockFields))
+      ) ++ (if (multiclock != 0) Nil else List("clock" -> JString("clock"))) ++ clockFields))
       // The live observer must read the authoritative values, including AXI
       // response status/user fields which later optimization can otherwise
       // erase at this boundary. Keep only data inputs on the opt-in extracted
@@ -477,7 +612,7 @@ object SemanticStateInventory {
         selected.ports.filter(p => p.direction == Input && p.tpe != ClockType).map { p =>
           DontTouchAnnotation(ReferenceTarget(state.circuit.main, selected.name, Nil, p.name, Nil))
         }
-      state.copy(annotations = state.annotations ++ accessFiles ++ boundaryInputs ++ Seq(
+      state.copy(annotations = state.annotations ++ accessFiles ++ cleanAccessFiles ++ boundaryInputs ++ Seq(
         GoldenGateOutputFileAnnotation(manifest, ".semantic-state.json"),
         GoldenGateOutputFileAnnotation(state.circuit.serialize, ".semantic-reference.fir"),
         GoldenGateOutputFileAnnotation(clean, ".semantic-clean.sv"),

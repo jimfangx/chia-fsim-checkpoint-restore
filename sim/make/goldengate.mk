@@ -18,7 +18,16 @@ ifneq ($(strip $(SEMANTIC_BRIDGE_CHECKPOINT_ROOT)),)
 $(error Semantic checkpoint inventory requires exactly one root phase)
 endif
 endif
+ifneq ($(strip $(SEMANTIC_MULTICLOCK_INVENTORY)),)
+ifneq ($(SEMANTIC_MULTICLOCK_INVENTORY),1)
+$(error SEMANTIC_MULTICLOCK_INVENTORY must be 1 or empty)
+endif
+ifeq ($(strip $(SEMANTIC_CHECKPOINT_ROOT) $(SEMANTIC_BRIDGE_CHECKPOINT_ROOT)),)
+$(error SEMANTIC_MULTICLOCK_INVENTORY requires an explicit semantic root)
+endif
+endif
 semantic_outputs := $(if $(strip $(SEMANTIC_CHECKPOINT_ROOT) $(SEMANTIC_BRIDGE_CHECKPOINT_ROOT)),$(addprefix $(GENERATED_DIR)/$(BASE_FILE_NAME),.semantic-state.json .semantic-reference.fir .semantic-clean.sv .semantic-boundary.json),)
+semantic_outputs += $(if $(SEMANTIC_MULTICLOCK_INVENTORY),$(GENERATED_DIR)/$(BASE_FILE_NAME).semantic-clean-access.json,)
 simulator_inventory_outputs := $(if $(SIMULATOR_CHECKPOINT_INVENTORY),$(addprefix $(GENERATED_DIR)/$(BASE_FILE_NAME),.simulator-state.json .simulator-reference.fir),)
 
 # Pre-simulation-mapping annotations which includes all Bridge Annotations
@@ -43,6 +52,7 @@ $(simulator_verilog) $(simulator_xdc) $(header) $(fame_annos) $(semantic_outputs
 		--allow-unrecognized-annotations \
 		$(if $(SEMANTIC_CHECKPOINT_ROOT),--semantic-checkpoint-root $(SEMANTIC_CHECKPOINT_ROOT),) \
 		$(if $(SEMANTIC_BRIDGE_CHECKPOINT_ROOT),--semantic-bridge-checkpoint-root $(SEMANTIC_BRIDGE_CHECKPOINT_ROOT),) \
+		$(if $(SEMANTIC_MULTICLOCK_INVENTORY),--semantic-multiclock-inventory,) \
 		$(if $(SIMULATOR_CHECKPOINT_INVENTORY),--simulator-checkpoint-inventory $(SIMULATOR_CHECKPOINT_INVENTORY),) \
 		--no-dedup)
 	grep -sh ^ $(GENERATED_DIR)/firrtl_black_box_resource_files.f | \

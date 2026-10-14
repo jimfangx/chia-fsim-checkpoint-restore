@@ -29,6 +29,97 @@ class SemanticStateInventorySpec extends AnyFlatSpec {
 
   behavior.of("Pre-FAME semantic inventory")
 
+  it should "inventory seven explicit state clocks and resolve each forwarded boundary source only when opted in" in {
+    val resource = Source.fromResource("checkpoint/MultiClockInventory.firrtl")
+    val source = try resource.mkString finally resource.close()
+    val state = lower(source.replace("inst relay of Relay",
+      "inst unused of Relay\n    unused.clock <= clock0\n    inst relay of Relay"))
+    val legacy = intercept[IllegalArgumentException](SemanticStateInventory.discover(state,
+      "MultiClockInventory", allowOutputClockAliases = true))
+    assert(legacy.getMessage.contains("multiple target clock domains:"))
+    val selected = state.copy(annotations = state.annotations ++ Seq(
+      SemanticBridgeCheckpointRootAnnotation("MultiClockInventory"), SemanticMultiClockInventoryAnnotation))
+    val result = new BridgeSemanticStateInventory().execute(SemanticStateInventory(selected))
+    assert(result.circuit == state.circuit)
+    val files = result.annotations.collect { case a: GoldenGateOutputFileAnnotation => a.fileSuffix -> a.body }.toMap
+    val doc = parse(files(".semantic-state.json"))
+    val clocks = JArray((0 until 7).map(i => JString(s"MultiClockInventory.clock$i")).toList)
+    assert((doc \ "manifest_version") == JInt(3))
+    assert((doc \ "clock_domains") == clocks && (doc \ "clock_inputs") == clocks)
+    assert((doc \ "clock_domain") == JNothing)
+    val alias = JArray(List(JObject(List("direction" -> JString("output"),
+      "name" -> JString("forwarded"), "source" -> JString("clock6")))))
+    assert((doc \ "clock_aliases") == alias)
+    val es = entries(files(".semantic-state.json"))
+    assert(es.size == 9 && es.map(e => (e \ "depth").asInstanceOf[JInt].num).sum == 12)
+    assert(es.find(e => (e \ "hierarchy") == JString("MultiClockInventory.s6")).get \ "clock_domain" ==
+      JString("MultiClockInventory.clock6"))
+    val boundary = parse(files(".semantic-boundary.json"))
+    assert((boundary \ "boundary_version") == JInt(3))
+    assert((boundary \ "clock_inputs") == clocks && (boundary \ "clock_aliases") == alias)
+    assert((boundary \ "clock") == JNothing && (boundary \ "sample_phase") == JString("before_clock_event"))
+    assert((boundary \ "ports").asInstanceOf[JArray].arr.size == 13)
+    assert(!result.annotations.contains(SemanticMultiClockInventoryAnnotation))
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { dir =>
+      val output = Paths.get(dir); Files.createDirectories(output)
+      files.foreach { case (suffix, body) => Files.write(output.resolve("semantic-multiclock" + suffix), body.getBytes(UTF_8)) }
+    }
+    // Memory ports that actually use different clocks still need a distinct
+    // storage adapter. Opt-in never turns a dual-clock RAM into one owner.
+    val mixed = lower(source.replace("ram.w.clk <= clock0", "ram.w.clk <= clock1"))
+    assert(intercept[IllegalArgumentException](SemanticStateInventory.discover(mixed, "MultiClockInventory",
+      allowOutputClockAliases = true, allowMultipleClocks = true)).getMessage.contains("multiple memory clocks"))
+    val gated = lower(source.replace("reg s2 : UInt<16>, clock2", "reg s2 : UInt<16>, asClock(and(asUInt(clock2), wen))"))
+    intercept[IllegalArgumentException](SemanticStateInventory.discover(gated, "MultiClockInventory",
+      allowOutputClockAliases = true, allowMultipleClocks = true))
+  }
+
+  it should "require a unique multi-clock opt-in root and reject unimplemented multi-clock banked cuts" in {
+    val state = lower(source)
+    val multi = SemanticMultiClockInventoryAnnotation
+    val root = SemanticCheckpointRootAnnotation("Harness.dut")
+    for (annotations <- Seq(Seq(multi), Seq(root, multi, multi),
+        Seq(root, multi, SemanticBankedAccessAnnotation("Harness.dut", Seq.empty)))) {
+      intercept[IllegalArgumentException](SemanticStateInventory(state.copy(annotations = annotations)))
+    }
+    val plusargs = SemanticStateInventory(plusargState().copy(annotations = plusargState().annotations :+ multi))
+    val files = plusargs.annotations.collect { case a: GoldenGateOutputFileAnnotation => a.fileSuffix -> a.body }.toMap
+    assert((parse(files(".semantic-state.json")) \ "manifest_version") == JInt(3))
+    assert(entries(files(".semantic-state.json")).count(e => (e \ "clock_domain") == JString("initial")) == 4)
+  }
+
+  it should "preserve constant-driven state and compiler-renamed keywords including memory pipeline owners" in {
+    val resource = Source.fromResource("checkpoint/MultiClockInventory.firrtl")
+    val original = try resource.mkString finally resource.close()
+    val source = original.replace("s0", "reg").replace("s1", "time").replace("ram", "large")
+      .replace("time <= add(time, reg)", "time <= UInt<16>(0)")
+      .replace("relay", "small").replace("forwarded <= clock\n",
+        "forwarded <= clock\n    reg time : UInt<16>, clock\n    time <= UInt<16>(0)\n")
+    val state = lower(source)
+    val selected = state.copy(annotations = state.annotations ++ Seq(
+      SemanticBridgeCheckpointRootAnnotation("MultiClockInventory"), SemanticMultiClockInventoryAnnotation))
+    val result = new BridgeSemanticStateInventory().execute(selected)
+    val files = result.annotations.collect { case a: GoldenGateOutputFileAnnotation => a.fileSuffix -> a.body }.toMap
+    val access = parse(files(".semantic-clean-access.json"))
+    assert((access \ "state_manifest_sha256") == JString(SemanticStateInventory.sha256(files(".semantic-state.json"))))
+    assert((access \ "clean_rtl_sha256") == JString(SemanticStateInventory.sha256(files(".semantic-clean.sv"))))
+    val paths = (access \ "state").asInstanceOf[JArray].arr.map(e =>
+      (e \ "state_id").values.toString -> (e \ "rtl_path").values.toString).toMap
+    for ((original, emitted) <- Seq(("reg", "reg_"), ("time", "time_"),
+        ("large", "large_"), ("large_r_data", "large__r_data"))) {
+      val kind = if (original == "large") "memory" else "register"
+      assert(paths(SemanticStateInventory.stateID(s"MultiClockInventory.$original", kind)) == emitted)
+      assert(files(".semantic-clean.sv").contains(" " + emitted + ";") ||
+        files(".semantic-clean.sv").contains(" " + emitted + " [0:3];"))
+    }
+    assert(paths(SemanticStateInventory.stateID("MultiClockInventory.small.time", "register")) == "small_.time_")
+    assert(paths.size == 10)
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { dir =>
+      val output = Paths.get(dir); Files.createDirectories(output)
+      files.foreach { case (suffix, body) => Files.write(output.resolve("semantic-multiclock-renamed" + suffix), body.getBytes(UTF_8)) }
+    }
+  }
+
   it should "defer an explicit bridge-extracted root and consume it only at the pre-FAME boundary" in {
     val state = lower(source).copy(annotations = Seq(SemanticBridgeCheckpointRootAnnotation("Harness.dut")))
     val deferred = SemanticStateInventory(state)
