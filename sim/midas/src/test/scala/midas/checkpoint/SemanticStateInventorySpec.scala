@@ -8,8 +8,8 @@ import firrtl.{CircuitState, ChirrtlForm, LowForm, Parser, EmitCircuitAnnotation
 import firrtl.options.Dependency
 import firrtl.stage.Forms
 import firrtl.stage.transforms.Compiler
-import firrtl.annotations.ReferenceTarget
-import firrtl.transforms.DontTouchAnnotation
+import firrtl.annotations.{ReferenceTarget, ModuleName, CircuitName}
+import firrtl.transforms.{DontTouchAnnotation, BlackBoxInlineAnno}
 import midas.stage.GoldenGateOutputFileAnnotation
 import org.json4s._
 import org.json4s.native.JsonMethods.parse
@@ -58,6 +58,140 @@ class SemanticStateInventorySpec extends AnyFlatSpec {
     val state = lower(source).copy(annotations = Seq(root, SemanticBankedAccessAnnotation("Harness.dut", Seq.empty)))
     intercept[IllegalArgumentException](SemanticStateInventory(state))
     intercept[IllegalArgumentException](new BridgeSemanticStateInventory().execute(state))
+  }
+
+  private val plusargSource = """circuit Top :
+  module Top :
+    input clock : Clock
+    input reset : UInt<1>
+    input data : UInt<32>
+    output result : UInt<32>
+    output repeated : UInt<32>
+    output flag : UInt<1>
+    output wide : UInt<65>
+    output count : UInt<32>
+    reg counter : UInt<32>, clock with :
+      reset => (reset, UInt<32>(0))
+    counter <= add(counter, data)
+    inst a of Reader32
+    inst b of Reader1
+    inst w of Reader65
+    inst relay of Relay
+    result <= add(counter, a.out)
+    repeated <= add(counter, relay.value)
+    flag <= b.out
+    wide <= w.out
+    count <= counter
+  module Relay :
+    output value : UInt<32>
+    inst a of Reader32
+    value <= a.out
+  extmodule Reader32 :
+    output out : UInt<32>
+    defname = plusarg_reader
+    parameter WIDTH = 32
+    parameter DEFAULT = 7
+    parameter FORMAT = "semantic_limit=%d"
+  extmodule Reader1 :
+    output out : UInt<1>
+    defname = plusarg_reader
+    parameter WIDTH = 1
+    parameter DEFAULT = 0
+    parameter FORMAT = "semantic_flag=%b"
+  extmodule Reader65 :
+    output out : UInt<65>
+    defname = plusarg_reader
+    parameter WIDTH = 65
+    parameter DEFAULT = 9
+    parameter FORMAT = "semantic_wide=%h"
+"""
+  private def plusargState(src: String = plusargSource, changeModel: Boolean = false): CircuitState = {
+    val resource = Source.fromResource("vsrc/plusarg_reader.v")
+    val model = try resource.mkString finally resource.close()
+    val state = lower(src)
+    state.copy(annotations = state.annotations ++ Seq("Reader32", "Reader1", "Reader65").map { name =>
+      BlackBoxInlineAnno(ModuleName(name, CircuitName("Top")), "plusarg_reader.v", model + (if (changeModel) "\n" else ""))
+    } :+ SemanticCheckpointRootAnnotation("Top"))
+  }
+
+  it should "own every exact initialized external value separately from target clock state and emit its original model" in {
+    val state = plusargState()
+    val result = SemanticStateInventory(state)
+    assert(result.circuit == state.circuit)
+    val files = result.annotations.collect { case a: GoldenGateOutputFileAnnotation => a.fileSuffix -> a.body }.toMap
+    val doc = parse(files(".semantic-state.json"))
+    assert((doc \ "manifest_version") == JInt(2))
+    assert((doc \ "clock_domain") == JString("Top.clock"))
+    val es = entries(files(".semantic-state.json"))
+    val initialized = es.filter(e => (e \ "clock_domain") == JString("initial"))
+    assert(es.size == 5 && initialized.size == 4)
+    assert(initialized.map(e => (e \ "hierarchy").values).toSet ==
+      Set("Top.a.myplus", "Top.b.myplus", "Top.w.myplus", "Top.relay.a.myplus"))
+    assert(initialized.forall(e => (e \ "kind") == JString("register") && (e \ "reset") == JString("none")))
+    val owners = (doc \ "external_models").asInstanceOf[JArray].arr
+    assert(owners.size == 4 && owners.forall(e => (e \ "adapter") == JString("semantic-plusarg-v1")))
+    assert(owners.find(e => (e \ "hierarchy") == JString("Top.a")).get \ "default" == JInt(7))
+    val model = state.annotations.collect { case a: BlackBoxInlineAnno => a.text }.head
+    assert(files(".semantic-clean.sv").sliding(model.length).count(_ == model) == 1)
+    assert(files(".semantic-clean.sv").contains(".WIDTH(65)"))
+    assert(files(".semantic-reference.fir") == state.circuit.serialize)
+    val changed = parse(SemanticStateInventory.discover(plusargState(plusargSource.replace("DEFAULT = 7", "DEFAULT = 8")), "Top"))
+    assert((changed \ "external_models") != (doc \ "external_models"))
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { dir =>
+      val output = Paths.get(dir)
+      Files.createDirectories(output)
+      files.foreach { case (suffix, body) => Files.write(output.resolve("semantic-plusarg" + suffix), body.getBytes(UTF_8)) }
+    }
+  }
+
+  it should "reject unbound, altered, duplicated and unsupported external models before semantic publication" in {
+    val state = plusargState()
+    val missing = state.copy(annotations = state.annotations.filterNot(_.isInstanceOf[BlackBoxInlineAnno]))
+    val duplicate = state.copy(annotations = state.annotations ++ state.annotations.collect { case a: BlackBoxInlineAnno => a })
+    val wrongCircuit = state.copy(annotations = state.annotations.map {
+      case a: BlackBoxInlineAnno => a.copy(target = ModuleName(a.target.name, CircuitName("Other")))
+      case a => a
+    })
+    val cases = Seq(missing, duplicate, wrongCircuit, plusargState(changeModel = true)) ++
+      Seq(plusargSource.replace("WIDTH = 32", "WIDTH = 31"),
+          plusargSource.replace("DEFAULT = 7", "DEFAULT = -1"),
+          plusargSource.replace("DEFAULT = 0", "DEFAULT = 2"),
+          plusargSource.replace("FORMAT =", "OTHER ="),
+          plusargSource.replace("semantic_limit=%d", "semantic_limit=%s"),
+          plusargSource.replace("defname = plusarg_reader", "defname = OtherModel"))
+        .map(src => plusargState(src))
+    cases.foreach { s =>
+      val error = intercept[IllegalArgumentException](SemanticStateInventory(s))
+      assert(error.getMessage.contains("opaque external module"), error.getMessage)
+      assert(!s.annotations.exists(_.isInstanceOf[GoldenGateOutputFileAnnotation]))
+    }
+    // An initialized value is never a clock-domain exception for ordinary registers.
+    val twoClocks = plusargSource.replace("    input reset :", "    input secondClock : Clock\n    input reset :")
+      .replace("    reg counter :", "    reg other : UInt<1>, secondClock\n    other <= UInt<1>(0)\n    reg counter :")
+    assert(intercept[IllegalArgumentException](SemanticStateInventory(plusargState(twoClocks)))
+      .getMessage.contains("multiple target clock domains"))
+  }
+
+  it should "retain exact parent clock pin fanout beside initialized external owners in ordinary RTL" in {
+    val src = plusargSource.replace("reg counter : UInt<32>, clock", "reg counter : UInt<32>, relay.clock")
+      .replace("    inst relay of Relay\n", "")
+      .replace("    reg counter :", "    inst relay of Relay\n    relay.clock <= clock\n    reg counter :")
+      .replace("  module Relay :", "  module Relay :\n    input clock : Clock")
+    val state = plusargState(src)
+    val selected = state.copy(annotations = state.annotations.filterNot(_.isInstanceOf[SemanticCheckpointRootAnnotation]) :+
+      SemanticBridgeCheckpointRootAnnotation("Top"))
+    val result = new BridgeSemanticStateInventory().execute(selected)
+    val files = result.annotations.collect { case a: GoldenGateOutputFileAnnotation => a.fileSuffix -> a.body }.toMap
+    val clean = files(".semantic-clean.sv")
+    assert(clean.contains("always @(posedge relay_clock)") && clean.contains(".clock(relay_clock)"))
+    assert(entries(files(".semantic-state.json")) == entries(SemanticStateInventory.discover(plusargState(), "Top")))
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { dir =>
+      val output = Paths.get(dir)
+      Files.createDirectories(output)
+      files.foreach { case (suffix, body) =>
+        Files.write(output.resolve("semantic-plusarg-clock-pin" + suffix), body.getBytes(UTF_8))
+      }
+    }
   }
 
   it should "preserve extracted data inputs through optimization without changing the semantic reference" in {
@@ -134,6 +268,19 @@ class SemanticStateInventorySpec extends AnyFlatSpec {
     assert(es.exists(e => (e \ "hierarchy") == JString("Harness.dut.relay.leaf.saved")))
     // The ordinary opt-in retains its output-clock rejection contract.
     intercept[IllegalArgumentException](SemanticStateInventory.discover(lower(forwardedSource), "Harness.dut"))
+  }
+
+  it should "resolve a driven child input clock pin in the parent without accepting data or cyclic pins" in {
+    val src = forwardedSource.replace("a.clock <= b.forwarded", "a.clock <= b.clock")
+    assert(entries(SemanticStateInventory.discover(lower(src), "Harness.dut", true)) == entries(manifest()))
+    for ((text, cycle) <- Seq(
+      src.replace("b.clock <= clock", "b.clock <= a.clock") -> true,
+      src.replace("b.clock <= clock", "b.clock <= asClock(bits(data, 0, 0))") -> false,
+      src.replace("b.clock <= clock", "b.clock is invalid") -> false)) {
+      val error = intercept[IllegalArgumentException](SemanticStateInventory.discover(
+        lower(text, injectClockLoop = cycle), "Harness.dut", true))
+      assert(error.getMessage.contains("clock"), error.getMessage)
+    }
   }
 
   private def clockPinSource: String = forwardedSource

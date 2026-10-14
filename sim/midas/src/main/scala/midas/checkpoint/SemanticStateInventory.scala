@@ -8,7 +8,7 @@ import scala.collection.mutable
 import firrtl.{CircuitState, WDefInstance, CDefMemory, CDefMPort}
 import firrtl.ir._
 import firrtl.annotations.{NoTargetAnnotation, ReferenceTarget}
-import firrtl.transforms.DontTouchAnnotation
+import firrtl.transforms.{DontTouchAnnotation, BlackBoxInlineAnno}
 import firrtl.options.{HasShellOptions, ShellOption, Unserializable}
 import midas.stage.GoldenGateOutputFileAnnotation
 import org.json4s._
@@ -121,6 +121,7 @@ object SemanticStateInventory {
     }
 
     val entries = mutable.ArrayBuffer.empty[JObject]
+    val externalModels = mutable.ArrayBuffer.empty[JObject]
     val domains = mutable.Set.empty[String]
     val forwardedDomains = mutable.Set.empty[String]
     def shape(t: Type, at: String): (BigInt, Boolean) = t match {
@@ -183,9 +184,17 @@ object SemanticStateInventory {
             case Seq(instance, port) if instances.contains(instance) =>
               if (!allowOutputClockAliases) fail(s"output clock at $hierarchy.$name")
               val scope = child(instances(instance))
-              val tpe = scope.outputs.getOrElse(port, fail(s"non-output child clock at $hierarchy.$name"))
+              val pin = scope.m.ports.find(p => p.name == port && clockCarrier(p.tpe))
+                .getOrElse(fail(s"non-clock child pin at $hierarchy.$name"))
+              val tpe = pin.tpe
               if (tpe != e.tpe) fail(s"reshaped child clock at $hierarchy.$name")
-              scope.clock(Reference(port, tpe), next)
+              if (pin.direction == Input) {
+                // Rocket's serial domain fans out a child's connected clock
+                // input. This is the parent net, not an output dependency.
+                val source = drivers.getOrElse(name, fail(s"undriven child clock pin at $hierarchy.$name"))
+                if (source.tpe != tpe) fail(s"reshaped child clock input at $hierarchy.$name")
+                clock(source, next)
+              } else scope.clock(Reference(port, tpe), next)
             case _ => drivers.get(name) match {
               case Some(alias) if alias.tpe == e.tpe && (combinationalAliases(name) || outputs.contains(name)) =>
                 clock(alias, next)
@@ -249,7 +258,7 @@ object SemanticStateInventory {
         val (width, signed) = shape(t, s"$hierarchy.$name")
         if (depth <= 0 || depth > Int.MaxValue || width > Int.MaxValue) fail(s"oversized/empty state at $hierarchy.$name")
         val h = s"$hierarchy.$name"
-        domains += domain
+        if (domain != "initial") domains += domain
         entries += JObject(List(
           "state_id" -> JString(stateID(h, kind)), "hierarchy" -> JString(h), "kind" -> JString(kind),
           "width" -> JInt(width), "depth" -> JInt(depth), "signed" -> JBool(signed),
@@ -296,14 +305,52 @@ object SemanticStateInventory {
             mem.readwriters.foreach(rw => pipeline(rw, "rdata"))
           }
         case i: WDefInstance =>
-          val child = concrete(i.module)
-          if (!allowOutputClockAliases && child.ports.exists(p => p.tpe == ClockType && p.direction == Output))
-            fail(s"output clock at $hierarchy.${i.name}")
-          val childScope = scope.child(i)
-          child.ports.filter(p => p.tpe == ClockType && p.direction == Input).foreach { p =>
-            childScope.clock(Reference(p.name, ClockType))
+          modules.get(i.module) match {
+            case Some(m: ExtModule) =>
+              // Runtime initialization is state even though it has no clock.
+              // Accept only the exact non-SYNTHESIS model and specialization;
+              // DEFAULT is never substituted for the captured stored value.
+              val sources = state.annotations.collect {
+                case a: BlackBoxInlineAnno if a.target.name == m.name &&
+                    a.target.circuit.name == circuit.main => a.text
+              }
+              val width = m.params.collect { case IntParam("WIDTH", w) => w }
+              val default = m.params.collect { case IntParam("DEFAULT", v) => v }
+              val format = m.params.collect { case StringParam("FORMAT", s) => s.string }
+              if (m.defname != "plusarg_reader" || sources.size != 1 ||
+                  sha256(sources.head) != SimulatorStateInventory.plusargModelSHA256 ||
+                  m.params.size != 3 || width.size != 1 || default.size != 1 || format.size != 1 ||
+                  width.head <= 0 || width.head > Int.MaxValue || default.head < 0 ||
+                  default.head.bitLength > width.head || !format.head.matches("[A-Za-z_][A-Za-z0-9_]*=%[dbh]") ||
+                  m.ports.map(p => (p.name, p.direction, p.tpe)) !=
+                    Seq(("out", Output, UIntType(IntWidth(width.head)))))
+                fail(s"opaque external module ${m.name}; no exact semantic plusarg state adapter")
+              val instancePath = s"$hierarchy.${i.name}"
+              // add() takes a local identifier; the external scope has no
+              // FIRRTL body and cannot participate in clock alias resolution.
+              val h = s"$instancePath.myplus"
+              entries += JObject(List(
+                "state_id" -> JString(stateID(h, "register")), "hierarchy" -> JString(h),
+                "kind" -> JString("register"), "width" -> JInt(width.head), "depth" -> JInt(1),
+                "signed" -> JBool(false), "clock_domain" -> JString("initial"), "reset" -> JString("none"),
+                "bit_order" -> JString("lsb0"), "address_order" -> JString("ascending_zero_based"),
+              ))
+              externalModels += JObject(List(
+                "hierarchy" -> JString(instancePath), "module" -> JString(m.name),
+                "adapter" -> JString("semantic-plusarg-v1"), "defname" -> JString(m.defname),
+                "source_sha256" -> JString(sha256(sources.head)), "width" -> JInt(width.head),
+                "default" -> JInt(default.head), "format" -> JString(format.head),
+              ))
+            case _ =>
+              val child = concrete(i.module)
+              if (!allowOutputClockAliases && child.ports.exists(p => p.tpe == ClockType && p.direction == Output))
+                fail(s"output clock at $hierarchy.${i.name}")
+              val childScope = scope.child(i)
+              child.ports.filter(p => p.tpe == ClockType && p.direction == Input).foreach { p =>
+                childScope.clock(Reference(p.name, ClockType))
+              }
+              walk(childScope)
           }
-          walk(childScope)
         case _: Conditionally | _: CDefMemory | _: CDefMPort => fail(s"non-lowered state at $hierarchy")
         case _ =>
       }
@@ -319,11 +366,13 @@ object SemanticStateInventory {
     if (sorted.map(e => (e \ "state_id").values).distinct.size != sorted.size) fail("duplicate StateID")
     if (sorted.map(e => (e \ "hierarchy").values).distinct.size != sorted.size) fail("duplicate semantic state path")
     canonical(JObject(List(
-      "manifest_version" -> JInt(1), "manifest_type" -> JString("rtlckpt"),
+      "manifest_version" -> JInt(if (externalModels.isEmpty) 1 else 2), "manifest_type" -> JString("rtlckpt"),
       "identity_scheme" -> JString("pre-fame-state-v1"), "circuit" -> JString(circuit.main),
       "dut_root" -> JString(root), "clock_domain" -> JString(domains.head),
       "reference_sha256" -> JString(sha256(circuit.serialize)), "state" -> JArray(sorted),
-    )))
+    ) ++ (if (externalModels.isEmpty) Nil else List(
+      "external_models" -> JArray(externalModels.sortBy(e => (e \ "hierarchy").values.toString).toList),
+    ))))
   }
 
   def apply(state: CircuitState, allowOutputClockAliases: Boolean = false): CircuitState = {
@@ -379,11 +428,14 @@ object SemanticStateInventory {
       }
       val reachable = mutable.Set.empty[String]
       def include(name: String): Unit = if (reachable.add(name)) {
-        instances(modules(name).asInstanceOf[Module].body).foreach(i => include(i.module))
+        modules(name) match {
+          case m: Module => instances(m.body).foreach(i => include(i.module))
+          case _: ExtModule => // Validated exact owner in discover().
+        }
       }
       include(selected.name)
       val cleanCircuit = state.circuit.copy(main = selected.name, modules = state.circuit.modules.filter(m => reachable(m.name)))
-      val clean = new Compiler(Seq(Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm).execute(
+      val cleanRTL = new Compiler(Seq(Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm).execute(
         CircuitState(cleanCircuit, firrtl.LowForm, Seq(
           // Preserve the same implicit memory owners as the inventoried IR and
           // Golden Gate's emission path; lowering again creates different state.
@@ -391,6 +443,11 @@ object SemanticStateInventory {
           firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter]),
         ))
       ).getEmittedCircuit.value
+      val externalSources = state.annotations.collect {
+        case a: BlackBoxInlineAnno if reachable(a.target.name) &&
+            modules(a.target.name).isInstanceOf[ExtModule] && a.target.circuit.name == state.circuit.main => a.text
+      }.distinct
+      val clean = cleanRTL + externalSources.map("\n" + _).mkString
       val outputClocks = selected.ports.filter(p => p.tpe == ClockType && p.direction == Output)
       val clockFields = if (outputClocks.isEmpty) List.empty else List(
         "clock_aliases" -> JArray(outputClocks.map(p => JObject(List(
