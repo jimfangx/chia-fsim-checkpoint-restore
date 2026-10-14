@@ -47,6 +47,11 @@ vcs_debug_flags := \
 	+define+FSDB \
 	+define+DEBUG
 
+ifeq ($(VCS_FORCE_REBUILD),1)
+.PHONY: vcs-native-rebuild
+$(OUT_DIR)/$(DRIVER_NAME): vcs-native-rebuild
+endif
+
 $(OUT_DIR)/$(DRIVER_NAME): $(vcs_v) $(vcs_cc) $(emul_h)
 	mkdir -p $(OUT_DIR)
 	rm -rf $(GEN_DIR)/$(DRIVER_NAME).csrc

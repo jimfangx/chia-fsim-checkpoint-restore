@@ -36,6 +36,14 @@ ifneq ($(strip $(FS_CHECKPOINT_PROFILE)),)
 $(vcs): checkpoint-vcs-recheck $(simulator_inventory_outputs)
 endif
 
+# Validation callers need a real native invocation even when RTL and driver
+# timestamps are unchanged. Propagate the command-line switch to the recursive
+# Make as well; forcing only this outer target still permits an inner no-op.
+ifeq ($(VCS_FORCE_REBUILD),1)
+.PHONY: vcs-native-rebuild
+$(vcs): vcs-native-rebuild
+endif
+
 $(vcs): $(vcs_driver_deps) $(simulator_verilog)
 	$(call make_vcs, vcs,$(simulator_verilog))
 
