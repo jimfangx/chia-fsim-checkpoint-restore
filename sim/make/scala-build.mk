@@ -56,8 +56,10 @@ endef
 # (1) - build.sbt path
 # (2) - sbt project to assemble
 # (3) - classpath file(s) to create
+# sbt-assembly can reuse its previous destination when only BUILD_DIR changes.
+# Reassemble into the requested path and refuse to touch a missing/empty jar.
 define run_sbt_assembly
-	cd $(1) && $(SBT) ";project $(2); set assembly / assemblyOutputPath := file(\"$(3)\"); assembly" && touch $(3)
+	cd $(1) && $(SBT) ";project $(2); set assembly / assemblyOutputPath := file(\"$(3)\"); set assembly / assemblyCacheOutput := false; assembly" && test -s $(3) && touch $(3)
 endef
 
 ################################################################################
