@@ -2,6 +2,7 @@
 #define __HEARTBEAT_H
 
 #include "core/bridge_driver.h"
+#include "core/widget_checkpoint.h"
 
 #include <fstream>
 
@@ -26,13 +27,39 @@ public:
               const std::vector<std::string> &args);
 
   void tick() override;
+  void finish() override;
   bool terminate() override { return has_timed_out; };
   int exit_code() override { return (has_timed_out) ? 1 : 0; };
+
+  // Completed-call host ownership, opt-in buffered log only. The clock's
+  // generated counters/latches and MMIO transport remain separate owners.
+  std::string checkpoint_schema() const override { return "firesim.widget.heartbeat.v1"; }
+  std::vector<uint8_t> save_checkpoint() const override;
+  void validate_checkpoint(const std::vector<uint8_t> &) const override;
+  void load_checkpoint(const std::vector<uint8_t> &) override;
 
 private:
   clockmodule_t &clock;
   std::ofstream log;
   time_t start_time;
+  widget_checkpoint_state_t checkpoint_state;
+  bool buffered = false;
+  bool finished = false;
+  std::string output_path = "heartbeat.csv";
+  struct sample_t {
+    uint64_t cycle;
+    int64_t elapsed;
+  };
+  std::vector<sample_t> samples;
+  struct decoded_checkpoint_t {
+    time_t start_time;
+    bool timed_out;
+    uint64_t trip_count, last_cycle;
+    std::vector<sample_t> samples;
+  };
+  void require_checkpointable() const;
+  widget_checkpoint_config_t checkpoint_configuration() const;
+  decoded_checkpoint_t decode_checkpoint(const std::vector<uint8_t> &) const;
 
   bool has_timed_out = false;
   // Arbitrary selection; O(10) wallclock seconds for default targets during
