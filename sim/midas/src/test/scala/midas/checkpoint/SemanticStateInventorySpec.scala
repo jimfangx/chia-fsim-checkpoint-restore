@@ -292,7 +292,81 @@ class SemanticStateInventorySpec extends AnyFlatSpec {
     intercept[IllegalArgumentException](manifest(registerClock))
   }
 
-  it should "reject opaque state, async reset, derived clocks, multiple clocks, and hidden memory pipelines" in {
+  private def memorySource(port: String, policy: String): String = {
+    val rw = port == "readwriter"
+    s"""circuit Top :
+  module Top :
+    input clock : Clock
+    input enable : UInt<1>
+    input address : UInt<3>
+    input data : UInt<9>
+    input write : UInt<1>
+    output result : UInt<9>
+    mem ram :
+      data-type => UInt<9>
+      depth => 5
+      read-latency => 1
+      write-latency => 1
+      $port => p
+      ${if (rw) "" else "writer => w"}
+      read-under-write => $policy
+    ram.p.clk <= clock
+    ram.p.en <= enable
+    ram.p.addr <= address
+    ${if (rw) "ram.p.wmode <= write\n    ram.p.wmask <= UInt<1>(1)\n    ram.p.wdata <= data"
+      else "ram.w.clk <= clock\n    ram.w.en <= write\n    ram.w.addr <= address\n    ram.w.mask <= UInt<1>(1)\n    ram.w.data <= data"}
+    result <= ram.p.${if (rw) "rdata" else "data"}
+"""
+  }
+
+  it should "own passthrough read and readwrite storage in the emitted clean reference without altering the IR" in {
+    for ((port, policy, field, width) <- Seq(("reader", "old", "data", 9),
+        ("reader", "new", "addr", 3), ("reader", "undefined", "addr", 3),
+        ("readwriter", "old", "rdata", 9), ("readwriter", "undefined", "rdata", 9))) {
+      val state = lower(memorySource(port, policy)).copy(annotations = Seq(SemanticCheckpointRootAnnotation("Top")))
+      val result = SemanticStateInventory(state)
+      assert(result.circuit == state.circuit)
+      val files = result.annotations.collect { case a: GoldenGateOutputFileAnnotation => a.fileSuffix -> a.body }.toMap
+      val es = entries(files(".semantic-state.json"))
+      assert(es.size == 2 && es.map(e => (e \ "hierarchy").values).toSet == Set("Top.ram", s"Top.ram_p_$field"))
+      val saved = es.find(e => (e \ "hierarchy") == JString(s"Top.ram_p_$field")).get
+      assert((saved \ "width") == JInt(width) && (saved \ "depth") == JInt(1))
+      assert((saved \ "reset") == JString("none") && (saved \ "clock_domain") == JString("Top.clock"))
+      assert(files(".semantic-clean.sv").contains(s"reg [${width - 1}:0] ram_p_$field;"))
+      assert(files(".semantic-clean.sv").contains("reg [8:0] ram [0:4];"))
+      assert(files(".semantic-reference.fir") == state.circuit.serialize)
+      sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { dir =>
+        val output = Paths.get(dir)
+        Files.createDirectories(output)
+        files.foreach { case (suffix, body) =>
+          Files.write(output.resolve(s"semantic-$port-$policy" + suffix), body.getBytes(UTF_8))
+        }
+      }
+    }
+  }
+
+  it should "reject unsupported memory policies, latencies and port clocks before publishing state" in {
+    val src = memorySource("readwriter", "old")
+    val cases = Seq(
+      memorySource("readwriter", "new") -> "memory latency",
+      src.replace("read-latency => 1", "read-latency => 0") -> "memory latency",
+      src.replace("read-latency => 1", "read-latency => 2") -> "memory latency",
+      src.replace("write-latency => 1", "write-latency => 2") -> "memory latency",
+      src.replace("ram.p.clk <= clock", "ram.p.clk <= asClock(enable)") -> "clock",
+      src.replace("    mem ram :", "    reg ram_p_rdata : UInt<9>, clock\n    ram_p_rdata <= data\n    mem ram :") -> "duplicate StateID",
+      memorySource("reader", "old").replace("    input enable : UInt<1>",
+        "    input otherClock : Clock\n    input enable : UInt<1>")
+        .replace("ram.w.clk <= clock", "ram.w.clk <= otherClock") -> "multiple memory clocks",
+    )
+    for ((text, message) <- cases) {
+      val state = lower(text).copy(annotations = Seq(SemanticCheckpointRootAnnotation("Top")))
+      val error = intercept[IllegalArgumentException](SemanticStateInventory(state))
+      assert(error.getMessage.contains(message), error.getMessage)
+      assert(!state.annotations.exists(_.isInstanceOf[GoldenGateOutputFileAnnotation]))
+    }
+  }
+
+  it should "reject opaque state, async reset, derived clocks, multiple clocks, and unsupported memory pipelines" in {
     val opaque = source.replace("module Leaf :", "extmodule Leaf :")
       .replace("    reg saved : UInt<9>, clock with :\n      reset => (reset, UInt<9>(0))\n    saved <= data\n    value <= saved", "    defname = OpaqueLeaf")
     val negatives = Seq(
@@ -302,7 +376,7 @@ class SemanticStateInventorySpec extends AnyFlatSpec {
       source.replace("    input wen : UInt<1>", "    input wen : UInt<1>\n    input otherClock : Clock")
         .replace("b.clock <= clock", "b.clock <= otherClock")
         .replace("dut.wen <= wen", "dut.wen <= wen\n    dut.otherClock <= otherClock") -> "multiple target clock domains",
-      source.replace("read-latency => 0", "read-latency => 1") -> "memory latency",
+      source.replace("read-latency => 0", "read-latency => 2") -> "memory latency",
     )
     negatives.foreach { case (src, message) =>
       val error = intercept[IllegalArgumentException](manifest(src))

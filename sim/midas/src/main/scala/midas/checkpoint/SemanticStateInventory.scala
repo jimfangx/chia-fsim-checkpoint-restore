@@ -268,11 +268,15 @@ object SemanticStateInventory {
           }
           add(r.name, "register", r.tpe, 1, clock(r.clock), reset)
         case mem: DefMemory =>
-          // Synchronous read pipelines are additional state, not just logical RAM words.
-          // Until those are inventoried, accepting such a memory would silently lose state.
-          if (mem.readLatency != 0 || mem.writeLatency != 1 || mem.readwriters.nonEmpty)
+          // The FIRRTL passthrough emitter stores an address for new/undefined
+          // readers, data for old readers, and rdata for old/undefined readwriters.
+          // These are semantic sequential owners in addition to the logical RAM.
+          // Keep the exact port field type/name; never approximate it as RAM data.
+          if (mem.readLatency < 0 || mem.readLatency > 1 || mem.writeLatency != 1 ||
+              (mem.readwriters.nonEmpty &&
+                (mem.readLatency != 1 || mem.readUnderWrite == ReadUnderWrite.New)))
             fail(s"memory latency/readwrite pipeline at $hierarchy.${mem.name} (read=${mem.readLatency}, write=${mem.writeLatency})")
-          val ports = mem.readers ++ mem.writers
+          val ports = mem.readers ++ mem.writers ++ mem.readwriters
           if (ports.isEmpty) fail(s"portless memory at $hierarchy.${mem.name}")
           val portClocks = ports.map { port =>
             drivers.get(s"${mem.name}.$port.clk") match {
@@ -283,6 +287,14 @@ object SemanticStateInventory {
           }.distinct
           if (portClocks.size != 1) fail(s"multiple memory clocks at $hierarchy.${mem.name}")
           add(mem.name, "memory", mem.dataType, mem.depth, portClocks.head, "none")
+          def pipeline(port: String, field: String): Unit = {
+            val ref = firrtl.passes.MemPortUtils.memPortField(mem, port, field)
+            add(firrtl.passes.LowerTypes.loweredName(ref), "register", ref.tpe, 1, portClocks.head, "none")
+          }
+          if (mem.readLatency == 1) {
+            mem.readers.foreach(r => pipeline(r, if (mem.readUnderWrite == ReadUnderWrite.Old) "data" else "addr"))
+            mem.readwriters.foreach(rw => pipeline(rw, "rdata"))
+          }
         case i: WDefInstance =>
           val child = concrete(i.module)
           if (!allowOutputClockAliases && child.ports.exists(p => p.tpe == ClockType && p.direction == Output))
@@ -305,6 +317,7 @@ object SemanticStateInventory {
     if (forwardedDomains.exists(_ != domains.head)) fail("forwarded output clock outside the state clock domain")
     val sorted = entries.sortBy(e => (e \ "state_id").values.toString).toList
     if (sorted.map(e => (e \ "state_id").values).distinct.size != sorted.size) fail("duplicate StateID")
+    if (sorted.map(e => (e \ "hierarchy").values).distinct.size != sorted.size) fail("duplicate semantic state path")
     canonical(JObject(List(
       "manifest_version" -> JInt(1), "manifest_type" -> JString("rtlckpt"),
       "identity_scheme" -> JString("pre-fame-state-v1"), "circuit" -> JString(circuit.main),
@@ -371,7 +384,12 @@ object SemanticStateInventory {
       include(selected.name)
       val cleanCircuit = state.circuit.copy(main = selected.name, modules = state.circuit.modules.filter(m => reachable(m.name)))
       val clean = new Compiler(Seq(Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm).execute(
-        CircuitState(cleanCircuit, firrtl.LowForm, Seq(firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter])))
+        CircuitState(cleanCircuit, firrtl.LowForm, Seq(
+          // Preserve the same implicit memory owners as the inventoried IR and
+          // Golden Gate's emission path; lowering again creates different state.
+          firrtl.passes.memlib.PassthroughSimpleSyncReadMemsAnnotation,
+          firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter]),
+        ))
       ).getEmittedCircuit.value
       val outputClocks = selected.ports.filter(p => p.tpe == ClockType && p.direction == Output)
       val clockFields = if (outputClocks.isEmpty) List.empty else List(
