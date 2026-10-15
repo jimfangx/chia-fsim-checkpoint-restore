@@ -67,6 +67,14 @@ public:
    */
   virtual int exit_code() { return 0; }
 
+  // Optional read-only component diagnostics. These do not grant an aggregate
+  // checkpoint schema or certify RTL/host ownership outside the named scope.
+  using host_component_images_t = std::vector<std::pair<std::string, std::vector<uint8_t>>>;
+  virtual std::string host_component_scope() const { return {}; }
+  virtual host_component_images_t inspect_host_components() const {
+    throw std::runtime_error("bridge has no host component diagnostic");
+  }
+
 protected:
   void write(size_t addr, uint32_t data);
 
