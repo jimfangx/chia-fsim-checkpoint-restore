@@ -13,6 +13,15 @@
 class simif_t;
 class simulation_t;
 
+// Optional diagnostic backend exclusion. An absent weak symbol preserves
+// ordinary builds; a present symbol can only deny checkpoint admission.
+extern "C" const char *firesim_fame_capture_level1_exclusion() __attribute__((weak));
+inline void checkpoint_require_owned_observers() {
+  if (firesim_fame_capture_level1_exclusion)
+    throw std::runtime_error(std::string("Level-1 checkpoint has unowned compiled observer state: ") +
+                             firesim_fame_capture_level1_exclusion());
+}
+
 // Public Level-1 requests are parsed even in builds without a capability.
 // A path is opaque here: only the durable implementation may open it, after
 // authorizing the request and binding the runtime inventory/build identity.
@@ -27,6 +36,7 @@ struct checkpoint_request_t {
   uint64_t host_timeout_ms = 0, cycle_timeout_ms = 0, capture_timeout_ms = 0;
 
   bool periodic() const { return !directory.empty(); }
+  bool requested() const { return kind != kind_t::none || periodic(); }
   bool watchdog() const { return host_timeout_ms || cycle_timeout_ms || target_timeout_cycles; }
 
   bool durable() const {
@@ -38,8 +48,15 @@ struct checkpoint_request_t {
     bool have_operation = false;
     bool have_directory = false, have_interval = false, have_retention = false, have_level = false;
     bool have_target_timeout = false;
+    bool semantic_observer = false;
     bool have_host_timeout = false, have_cycle_timeout = false, have_capture_timeout = false;
     for (const auto &arg : args) {
+      // These diagnostic Level-2 observers own counters, saved samples and
+      // trace files outside the Level-1 inventory. Keep the levels independent,
+      // including when an observer option precedes the checkpoint request.
+      if (arg.rfind("+fame_capture=", 0) == 0 ||
+          arg.rfind("+semantic_capture=", 0) == 0)
+        semantic_observer = true;
       auto positive = [&](const std::string &prefix, bool &seen, uint64_t &number) {
         if (seen || arg.rfind(prefix, 0) != 0)
           throw std::runtime_error("malformed/duplicate periodic checkpoint option");
@@ -125,6 +142,8 @@ struct checkpoint_request_t {
          (!request.periodic() && request.kind!=kind_t::restore))
         throw std::runtime_error("checkpoint watchdog requires progress and bounded capture timeouts with periodic history or restore");
     }
+    if (request.requested() && semantic_observer)
+      throw std::runtime_error("Level-1 checkpoint has unowned semantic capture observer state");
     return request;
   }
 };
@@ -136,6 +155,10 @@ struct checkpoint_request_t {
 // rejection cannot start a worker or consume a native/target tick.
 class checkpoint_entry_t {
 public:
+  // Also covers private/diagnostic capture paths in linked capabilities, which
+  // can be configured without a public request. Reject before derived members
+  // can open files, construct owners or initialize a worker.
+  checkpoint_entry_t() { checkpoint_require_owned_observers(); }
   virtual ~checkpoint_entry_t() = default;
   enum class action_t { run, restore_reserved };
 

@@ -45,6 +45,7 @@ int entry(int argc, char **argv) {
   // must have this exist for *.const.h
   std::vector<std::string> args(argv + 1, argv + argc);
   const auto request = checkpoint_request_t::parse(args);
+  if (request.requested()) checkpoint_require_owned_observers();
 #ifdef FS_CHECKPOINT_ENTRY
   checkpoint_entry = create_checkpoint_entry(args);
   if (!checkpoint_entry)
