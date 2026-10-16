@@ -210,6 +210,7 @@ private[midas] class MidasTransforms extends Transform {
         new EmitFirrtl("post-infer-model-ports.fir"),
         new fame.EmitFAMEAnnotations("post-infer-model-ports.json"),
         new fame.FAMETransform,
+        new midas.checkpoint.PreserveSemanticFAMEStorage,
         DefineAbstractClockGate,
         fame.AddRemainingFanoutAnnotations,
         new EmitFirrtl("post-fame-transform.fir"),

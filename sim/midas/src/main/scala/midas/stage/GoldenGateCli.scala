@@ -18,6 +18,7 @@ trait GoldenGateCli { this: Shell =>
     midas.checkpoint.SemanticCheckpointRootAnnotation,
     midas.checkpoint.SemanticBridgeCheckpointRootAnnotation,
     midas.checkpoint.SemanticMultiClockInventoryAnnotation,
+    midas.checkpoint.SemanticFAMEStateMapAnnotation,
     midas.checkpoint.SimulatorCheckpointInventoryAnnotation,
     firrtl.stage.FirrtlFileAnnotation,
     firrtl.stage.FirrtlSourceAnnotation,

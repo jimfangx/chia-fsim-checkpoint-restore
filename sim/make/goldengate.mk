@@ -28,6 +28,19 @@ endif
 endif
 semantic_outputs := $(if $(strip $(SEMANTIC_CHECKPOINT_ROOT) $(SEMANTIC_BRIDGE_CHECKPOINT_ROOT)),$(addprefix $(GENERATED_DIR)/$(BASE_FILE_NAME),.semantic-state.json .semantic-reference.fir .semantic-clean.sv .semantic-boundary.json),)
 semantic_outputs += $(if $(SEMANTIC_MULTICLOCK_INVENTORY),$(GENERATED_DIR)/$(BASE_FILE_NAME).semantic-clean-access.json,)
+ifneq ($(strip $(SEMANTIC_FAME_STATE_MAP)),)
+ifneq ($(SEMANTIC_FAME_STATE_MAP),1)
+$(error SEMANTIC_FAME_STATE_MAP must be 1 or empty)
+endif
+ifeq ($(strip $(SEMANTIC_BRIDGE_CHECKPOINT_ROOT)),)
+$(error SEMANTIC_FAME_STATE_MAP requires an explicit bridge-extracted semantic root)
+endif
+ifneq ($(SEMANTIC_MULTICLOCK_INVENTORY),1)
+$(error SEMANTIC_FAME_STATE_MAP requires SEMANTIC_MULTICLOCK_INVENTORY=1)
+endif
+semantic_outputs += $(GENERATED_DIR)/$(BASE_FILE_NAME).semantic-fame-map.json
+semantic_outputs += $(GENERATED_DIR)/$(BASE_FILE_NAME).semantic-fame-emitted.sv
+endif
 simulator_inventory_outputs := $(if $(SIMULATOR_CHECKPOINT_INVENTORY),$(addprefix $(GENERATED_DIR)/$(BASE_FILE_NAME),.simulator-state.json .simulator-reference.fir),)
 
 # Pre-simulation-mapping annotations which includes all Bridge Annotations
@@ -53,6 +66,7 @@ $(simulator_verilog) $(simulator_xdc) $(header) $(fame_annos) $(semantic_outputs
 		$(if $(SEMANTIC_CHECKPOINT_ROOT),--semantic-checkpoint-root $(SEMANTIC_CHECKPOINT_ROOT),) \
 		$(if $(SEMANTIC_BRIDGE_CHECKPOINT_ROOT),--semantic-bridge-checkpoint-root $(SEMANTIC_BRIDGE_CHECKPOINT_ROOT),) \
 		$(if $(SEMANTIC_MULTICLOCK_INVENTORY),--semantic-multiclock-inventory,) \
+		$(if $(SEMANTIC_FAME_STATE_MAP),--semantic-fame-state-map,) \
 		$(if $(SIMULATOR_CHECKPOINT_INVENTORY),--simulator-checkpoint-inventory $(SIMULATOR_CHECKPOINT_INVENTORY),) \
 		--no-dedup)
 	grep -sh ^ $(GENERATED_DIR)/firrtl_black_box_resource_files.f | \

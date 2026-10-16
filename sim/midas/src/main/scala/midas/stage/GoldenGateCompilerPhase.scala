@@ -90,12 +90,22 @@ class GoldenGateCompilerPhase extends Phase {
 
     // Workaround under-constrained transform dependencies by forcing the
     // emitter to run last in a separate compiler.
-    val emitter =
-      new Compiler(Seq(Dependency(midas.passes.WriteXDCFile), Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm)
+    val semanticMap = postLoweredSimulator.annotations.contains(midas.checkpoint.SemanticFAMEStateMapAnnotation)
+    val verilogEmitter = if (semanticMap) new midas.checkpoint.SemanticCleanEmitter else new firrtl.SystemVerilogEmitter
+    val emitter = new Compiler(Seq(Dependency(midas.passes.WriteXDCFile), Dependency.fromTransform(verilogEmitter)),
+      Forms.LowForm, Set(verilogEmitter))
     logger.info("Final Emission Transformation Ordering\n")
     logger.info(emitter.prettyPrint("  "))
 
-    val emitted = emitter.execute(postLoweredSimulator)
+    val emissionInput = if (semanticMap) midas.checkpoint.SemanticFAMEStateMap.prepareEmission(postLoweredSimulator) else postLoweredSimulator
+    val emitted = emitter.execute(if (semanticMap) emissionInput.copy(annotations =
+      emissionInput.annotations.filterNot(_.isInstanceOf[firrtl.EmitCircuitAnnotation]) :+
+        firrtl.EmitCircuitAnnotation(verilogEmitter.getClass)) else emissionInput)
+    val semanticMapFiles = if (!semanticMap) Seq.empty else {
+      val actual = verilogEmitter.asInstanceOf[midas.checkpoint.SemanticCleanEmitter].preparedState.get
+      Seq(midas.checkpoint.SemanticFAMEStateMap.emit(actual, emitted.getEmittedCircuit.value),
+        GoldenGateOutputFileAnnotation(emitted.getEmittedCircuit.value, ".semantic-fame-emitted.sv"))
+    }
     // The emitter returns its input circuit; reproduce its private lowering
     // on that input solely for read-only inventory, keeping emitted RTL and
     // compiler behavior unchanged. Do not rerun user HostTransforms here.
@@ -104,7 +114,7 @@ class GoldenGateCompilerPhase extends Phase {
         case (s, transform) => transform.runTransform(s)
       }
       val inventoried = midas.checkpoint.SimulatorStateInventory(emissionIR)
-      emitted.annotations ++ inventoried.annotations.drop(emissionIR.annotations.size)
-    } else emitted.annotations
+      emitted.annotations ++ inventoried.annotations.drop(emissionIR.annotations.size) ++ semanticMapFiles
+    } else emitted.annotations ++ semanticMapFiles
   }
 }

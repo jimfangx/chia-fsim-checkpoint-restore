@@ -97,7 +97,12 @@ class BridgeSemanticStateInventory extends firrtl.Transform {
       val selected = state.copy(form = firrtl.LowForm, annotations =
         state.annotations.filterNot(_.isInstanceOf[SemanticBridgeCheckpointRootAnnotation]) :+
           SemanticCheckpointRootAnnotation(roots.head))
-      val inventoried = SemanticStateInventory(selected, allowOutputClockAliases = true)
+      val discovered = SemanticStateInventory(selected, allowOutputClockAliases = true)
+      // FIRRTL's inliner renames local references. Resolve instance-qualified
+      // owners to distinct local modules before flattening, using FIRRTL's own
+      // path-resolution/duplication maps (never concatenate flattened names).
+      val inventoried = if (discovered.annotations.contains(SemanticFAMEStateMapAnnotation))
+        discovered.resolvePathsOf(classOf[SemanticFAMEStorageAnnotation]) else discovered
       // The selection is consumed. Do not run this inventory again at a later
       // compiler boundary, or leave a synthetic early-root annotation behind.
       inventoried.copy(annotations = inventoried.annotations.filterNot {
@@ -431,6 +436,9 @@ object SemanticStateInventory {
     val bridgeRoots = state.annotations.collect { case SemanticBridgeCheckpointRootAnnotation(path) => path }
     val access = state.annotations.collect { case a: SemanticBankedAccessAnnotation => a }
     val multiclock = state.annotations.count(_ == SemanticMultiClockInventoryAnnotation)
+    val fameMap = state.annotations.count(_ == SemanticFAMEStateMapAnnotation)
+    if (fameMap > 1 || (fameMap != 0 && (multiclock != 1 || bridgeRoots.size != 1) && roots.isEmpty))
+      fail("FAME state mapping requires one bridge-extracted schema-3 root")
     if (multiclock > 1 || (multiclock != 0 && (roots.isEmpty && bridgeRoots.isEmpty)))
       fail("multi-clock inventory requires exactly one explicit root and one opt-in")
     if (multiclock != 0 && access.nonEmpty) fail("multi-clock banked cut protocol is not implemented")
@@ -538,6 +546,26 @@ object SemanticStateInventory {
         }
         case _ => Seq.empty
       }
+      val fameLocations = if (fameMap == 0) Seq.empty else {
+        if (multiclock != 1 || !allowOutputClockAliases)
+          fail("FAME state mapping requires one bridge-extracted schema-3 root")
+        var parent = modules(state.circuit.main).asInstanceOf[Module]
+        val prefix = roots.head.split("\\.").tail.map { name =>
+          val i = instances(parent.body).find(_.name == name).get
+          parent = modules(i.module).asInstanceOf[Module]
+          (firrtl.annotations.TargetToken.Instance(name), firrtl.annotations.TargetToken.OfModule(i.module))
+        }.toSeq
+        storageLocations.map { a =>
+          val external = modules(a.target.path.lastOption.map(_._2.value).getOrElse(a.target.module)).isInstanceOf[ExtModule]
+          SemanticFAMEStorageAnnotation(a.stateID,
+            ReferenceTarget(state.circuit.main, state.circuit.main, prefix ++ a.target.path,
+              if (external) "out" else a.target.ref, Nil), a.suffix, external)
+        }
+      }
+      val fameAnnotations = if (fameMap == 0) Seq.empty else
+        Seq(SemanticFAMEManifestAnnotation(manifest)) ++ fameLocations ++
+          preserveStorage.map(a => a.copy(target = a.target.copy(circuit = state.circuit.main))) ++
+          fameLocations.filter(_.external).map(a => DontTouchAnnotation(a.target))
       val emitter = if (multiclock == 0) new firrtl.SystemVerilogEmitter else new SemanticCleanEmitter
       val cleanResult = new Compiler(Seq(Dependency.fromTransform(emitter)), Forms.LowForm, Set(emitter)).execute(
         CircuitState(cleanCircuit, firrtl.LowForm, Seq(
@@ -612,7 +640,7 @@ object SemanticStateInventory {
         selected.ports.filter(p => p.direction == Input && p.tpe != ClockType).map { p =>
           DontTouchAnnotation(ReferenceTarget(state.circuit.main, selected.name, Nil, p.name, Nil))
         }
-      state.copy(annotations = state.annotations ++ accessFiles ++ cleanAccessFiles ++ boundaryInputs ++ Seq(
+      state.copy(annotations = state.annotations ++ accessFiles ++ cleanAccessFiles ++ boundaryInputs ++ fameAnnotations ++ Seq(
         GoldenGateOutputFileAnnotation(manifest, ".semantic-state.json"),
         GoldenGateOutputFileAnnotation(state.circuit.serialize, ".semantic-reference.fir"),
         GoldenGateOutputFileAnnotation(clean, ".semantic-clean.sv"),
