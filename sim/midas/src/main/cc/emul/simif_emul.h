@@ -14,6 +14,7 @@
 #include "bridges/cpu_managed_stream.h"
 #include "bridges/fpga_managed_stream.h"
 #include "core/simif.h"
+#include "core/widget_checkpoint.h"
 #include "core/driver_boundary_diagnostic.h"
 #include "emul/mm.h"
 #include "emul/host_timing.h"
@@ -204,6 +205,12 @@ public:
   // separate owners. FPGA-managed host rings remain explicitly unsupported.
   std::vector<std::pair<std::string, checkpoint_owner_t *>> checkpoint_stream_io_owners();
 
+  // Returned control calls only. runtime/mmio owns the AXI queues; a suspended
+  // read/write also owns a native stack and cannot be restored from those queues.
+  std::pair<std::string, checkpoint_owner_t *> checkpoint_mmio_io_owner() {
+    return {"runtime/mmio-io", &mmio_io};
+  }
+
   // A component subset, with no thread freeze or driver continuation claim.
   // Hooks reject while advance_target is suspended, even if RTL is parked.
   std::pair<std::string, checkpoint_owner_t *> checkpoint_host_timing_owner() {
@@ -252,6 +259,28 @@ protected:
   void load_mems(const char *fname);
 
 private:
+  class MMIOIOOwner final : public checkpoint_owner_t {
+  public:
+    explicit MMIOIOOwner(const AXI4Config &config)
+        : config(25, {config.id_bits, config.addr_bits, config.data_bits}) {}
+    std::string checkpoint_schema() const override {
+      return "firesim.emul.mmio-io.returned.v1";
+    }
+    std::vector<uint8_t> save_checkpoint() const override {
+      return state.save(config);
+    }
+    void validate_checkpoint(const std::vector<uint8_t> &payload) const override {
+      state.validate(payload, config);
+    }
+    void load_checkpoint(const std::vector<uint8_t> &payload) override {
+      // No I/O or lifetime reset: an interrupted native call remains poisoned.
+      state.validate(payload, config);
+    }
+    widget_checkpoint_state_t state;
+  private:
+    const widget_checkpoint_config_t config;
+  } mmio_io;
+
   simulation_t *restored_driver = nullptr;
   simulation_t *loading_driver = nullptr;
   simulation_t *prepared_launch_driver = nullptr;

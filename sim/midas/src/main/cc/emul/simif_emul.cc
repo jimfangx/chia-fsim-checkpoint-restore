@@ -19,7 +19,7 @@
 simif_emul_t::simif_emul_t(const TargetConfig &config,
                            const std::vector<std::string> &args)
     : simif_t(config), master(std::make_unique<mmio_t>(config.ctrl)),
-      driver_diagnostic(args) {
+      mmio_io(config.ctrl), driver_diagnostic(args) {
 #ifndef VCS
   if (driver_diagnostic.settled())
     throw std::runtime_error("settled driver diagnostics require the VCS harness");
@@ -405,6 +405,7 @@ void simif_emul_t::wait_read(mmio_t &mmio, void *data) {
 
 void simif_emul_t::write(size_t addr, uint32_t data) {
   require_no_driver_capture();
+  widget_checkpoint_state_t::call_t call(mmio_io.state);
   uint64_t size = master->get_config().get_size();
   assert(size == 2 && "AXI4-lite control interface has unexpected size");
   uint64_t strb = (1 << master->get_config().strb_bits()) - 1;
@@ -414,6 +415,7 @@ void simif_emul_t::write(size_t addr, uint32_t data) {
 
 uint32_t simif_emul_t::read(size_t addr) {
   require_no_driver_capture();
+  widget_checkpoint_state_t::call_t call(mmio_io.state);
   uint64_t size = master->get_config().get_size();
   assert(size == 2 && "AXI4-lite control interface has unexpected size");
   uint32_t data;
@@ -555,6 +557,7 @@ void simif_emul_t::capture_driver_boundary(simulation_t &sim, bool done) {
     driver_boundary_diagnostic_t::owners_t owners;
     if (driver_diagnostic.due()) {
       owners = checkpoint_axi_owners();
+      owners.push_back(checkpoint_mmio_io_owner());
       owners.push_back(checkpoint_host_timing_owner());
       const auto widgets = sim.checkpoint_widget_owners();
       owners.insert(owners.end(), widgets.begin(), widgets.end());
