@@ -221,6 +221,20 @@ void mmio_t::load_checkpoint(const std::vector<uint8_t> &bytes) {
   write_inflight = state.write_inflight;
 }
 
+void mmio_t::swap_checkpoint_state(mmio_t &other) noexcept {
+  static_assert(noexcept(ar.swap(other.ar)) && noexcept(aw.swap(other.aw)) &&
+                noexcept(w.swap(other.w)) && noexcept(r.swap(other.r)) &&
+                noexcept(b.swap(other.b)) && noexcept(dummy_data.swap(other.dummy_data)));
+  ar.swap(other.ar);
+  aw.swap(other.aw);
+  w.swap(other.w);
+  r.swap(other.r);
+  b.swap(other.b);
+  dummy_data.swap(other.dummy_data);
+  std::swap(read_inflight, other.read_inflight);
+  std::swap(write_inflight, other.write_inflight);
+}
+
 void mmio_t::read_req(uint64_t addr, size_t size, size_t len) {
   check_request(conf, addr, size, len);
   mmio_req_addr_t ar(0, addr, size, len);

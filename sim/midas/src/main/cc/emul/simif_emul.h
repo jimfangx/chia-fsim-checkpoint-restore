@@ -211,6 +211,40 @@ public:
     return {"runtime/mmio-io", &mmio_io};
   }
 
+  struct io_checkpoint_t {
+    struct entry_t {
+      std::string name, schema;
+      std::vector<uint8_t> payload;
+      bool operator==(const entry_t &other) const {
+        return name == other.name && schema == other.schema && payload == other.payload;
+      }
+    };
+    std::vector<entry_t> owners;
+    bool operator==(const io_checkpoint_t &other) const { return owners == other.owners; }
+  };
+  class io_restore_t {
+  public:
+    ~io_restore_t();
+    io_restore_t(const io_restore_t &) = delete;
+    io_restore_t &operator=(const io_restore_t &) = delete;
+  private:
+    friend class simif_emul_t;
+    struct impl_t;
+    explicit io_restore_t(std::unique_ptr<impl_t>);
+    std::unique_ptr<impl_t> impl;
+  };
+  // Joint returned-call/AXI/host-timing component transaction. The caller must
+  // hold both simulator contexts and exclude all other users throughout these
+  // calls. This does not freeze the process or admit complete CPU restoration.
+  // All membership, parsing and allocation precede publication. Publication
+  // rechecks the destination and both returned-call owners, then uses only
+  // nonthrowing swaps. Candidates are bound to one destination/native thread
+  // and can publish once. Functional memory, RTL/harness and bridge state are
+  // separate; the outer coordinator must bind the executable/library build.
+  io_checkpoint_t save_checkpoint_io();
+  std::unique_ptr<io_restore_t> prepare_checkpoint_io(const io_checkpoint_t &);
+  void publish_checkpoint_io(io_restore_t &);
+
   // A component subset, with no thread freeze or driver continuation claim.
   // Hooks reject while advance_target is suspended, even if RTL is parked.
   std::pair<std::string, checkpoint_owner_t *> checkpoint_host_timing_owner() {
@@ -377,6 +411,11 @@ private:
   };
 
   std::unique_ptr<FPGAManagedStreamIOImpl> fpga_managed_stream_io;
+
+  // A retained token prevents an old candidate from accepting a new simulator
+  // constructed at a recycled address.
+  const std::shared_ptr<const uint8_t> io_checkpoint_identity = std::make_shared<const uint8_t>(0);
+  std::vector<std::pair<std::string, checkpoint_owner_t *>> checkpoint_io_owners();
 
 private:
   /**

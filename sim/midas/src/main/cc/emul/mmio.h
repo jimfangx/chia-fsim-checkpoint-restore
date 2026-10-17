@@ -106,6 +106,9 @@ public:
   const AXI4Config &get_config() const { return conf; }
 
 private:
+  friend class simif_emul_t;
+  // Only a same-configuration prepared runtime candidate may use this.
+  void swap_checkpoint_state(mmio_t &other) noexcept;
   const AXI4Config conf;
 
   std::queue<mmio_req_addr_t> ar;

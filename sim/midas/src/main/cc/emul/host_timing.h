@@ -26,6 +26,13 @@ public:
   void load_checkpoint(const std::vector<uint8_t> &) override;
 
 private:
+  friend class simif_emul_t;
+  void swap_checkpoint_state(host_timing_t &other) noexcept {
+    static_assert(std::is_nothrow_swappable_v<std::mt19937_64>);
+    std::swap(engine, other.engine);
+    std::swap(total, other.total);
+    std::swap(remaining, other.remaining);
+  }
   struct state_t {
     uint64_t total, remaining;
     std::mt19937_64 engine;

@@ -183,6 +183,85 @@ simif_emul_t::checkpoint_stream_io_owners() {
   return owners;
 }
 
+struct simif_emul_t::io_restore_t::impl_t {
+  simif_emul_t *destination;
+  std::shared_ptr<const uint8_t> identity;
+  std::thread::id creator = std::this_thread::get_id();
+  io_checkpoint_t expected;
+  std::unique_ptr<mmio_t> mmio, dma;
+  host_timing_t timing;
+  bool published = false;
+  explicit impl_t(simif_emul_t &destination)
+      : destination(&destination), identity(destination.io_checkpoint_identity),
+        timing(destination.host_timing) {}
+};
+
+simif_emul_t::io_restore_t::io_restore_t(std::unique_ptr<impl_t> impl)
+    : impl(std::move(impl)) {}
+simif_emul_t::io_restore_t::~io_restore_t() = default;
+
+std::vector<std::pair<std::string, checkpoint_owner_t *>>
+simif_emul_t::checkpoint_io_owners() {
+  if (fpga_managed_stream_io || !qsfp.empty())
+    throw std::runtime_error("unsupported runtime I/O checkpoint transport");
+  std::vector<std::pair<std::string, checkpoint_owner_t *>> owners{
+      checkpoint_mmio_io_owner(), {"runtime/mmio", master.get()}};
+  if (cpu_managed_stream_io) {
+    owners.emplace_back("runtime/cpu-managed-stream-io", cpu_managed_stream_io.get());
+    owners.emplace_back("runtime/cpu-managed-axi4", &cpu_managed_stream_io->cpu_managed_axi4);
+  }
+  owners.push_back(checkpoint_host_timing_owner());
+  return owners;
+}
+
+simif_emul_t::io_checkpoint_t simif_emul_t::save_checkpoint_io() {
+  io_checkpoint_t image;
+  for (const auto &[name, owner] : checkpoint_io_owners())
+    image.owners.push_back({name, owner->checkpoint_schema(), owner->save_checkpoint()});
+  return image;
+}
+
+std::unique_ptr<simif_emul_t::io_restore_t>
+simif_emul_t::prepare_checkpoint_io(const io_checkpoint_t &image) {
+  const auto owners = checkpoint_io_owners();
+  if (image.owners.size() != owners.size())
+    throw std::runtime_error("runtime I/O checkpoint owner count mismatch");
+  for (size_t i = 0; i < owners.size(); ++i) {
+    const auto &[name, owner] = owners[i];
+    const auto &entry = image.owners[i];
+    if (entry.name != name || entry.schema != owner->checkpoint_schema())
+      throw std::runtime_error("runtime I/O checkpoint owner/schema mismatch");
+    owner->validate_checkpoint(entry.payload);
+  }
+  auto candidate = std::make_unique<io_restore_t::impl_t>(*this);
+  candidate->expected = save_checkpoint_io();
+  candidate->mmio = std::make_unique<mmio_t>(master->get_config());
+  candidate->mmio->load_checkpoint(image.owners[1].payload);
+  if (cpu_managed_stream_io) {
+    candidate->dma = std::make_unique<mmio_t>(cpu_managed_stream_io->cpu_managed_axi4.get_config());
+    candidate->dma->load_checkpoint(image.owners[3].payload);
+  }
+  candidate->timing.load_checkpoint(image.owners.back().payload);
+  return std::unique_ptr<io_restore_t>(new io_restore_t(std::move(candidate)));
+}
+
+void simif_emul_t::publish_checkpoint_io(io_restore_t &restore) {
+  auto &candidate = *restore.impl;
+  if (candidate.destination != this || candidate.identity != io_checkpoint_identity ||
+      candidate.creator != std::this_thread::get_id() ||
+      candidate.published)
+    throw std::runtime_error("runtime I/O checkpoint foreign/consumed candidate");
+  // This may allocate or reject a suspended/poisoned caller. It must finish
+  // before the first swap. The caller retains exclusion through publication.
+  if (!(save_checkpoint_io() == candidate.expected))
+    throw std::runtime_error("runtime I/O checkpoint destination changed after preparation");
+  master->swap_checkpoint_state(*candidate.mmio);
+  if (candidate.dma)
+    cpu_managed_stream_io->cpu_managed_axi4.swap_checkpoint_state(*candidate.dma);
+  host_timing.swap_checkpoint_state(candidate.timing);
+  candidate.published = true;
+}
+
 void simif_emul_t::start_driver(simulation_t &sim) {
   thread.require_controller_if_started();
   if (loading_driver)
