@@ -17,6 +17,7 @@
 #include "core/driver_boundary_diagnostic.h"
 #include "emul/mm.h"
 #include "emul/host_timing.h"
+#include "emul/driver_thread.h"
 #include "emul/mmio.h"
 #include "emul/qsfp.h"
 
@@ -75,6 +76,13 @@ public:
   // handles/clocks settle after entry returns; the coordinator can then
   // prevalidate everything, load/read back, and arm this same driver.
   void begin_restored_load(simulation_t &sim);
+  // Optional creator reservation under that hold. Callbacks run synchronously
+  // on the eventual driver worker; they must return owned observations only.
+  // No MMIO, RTL ticks or simulation flow is allowed during preparation. This
+  // does not admit unsupported CPU owners or supply process-wide exclusion.
+  void reserve_restored_creator(simulation_t &sim);
+  void prepare_on_restored_creator(simulation_t &sim,
+                                   emul_driver_thread_t::task_t prepare);
   bool restored_driver_pending() const { return restored_driver != nullptr || loading_driver != nullptr; }
   bool resume_restored_driver(uint32_t bits, const uint32_t *banks);
 
@@ -309,7 +317,7 @@ private:
    *
    * The main thread is the target thread.
    */
-  std::thread thread;
+  emul_driver_thread_t thread;
 
   // Synchronisation primitives blocking the driver.  The driver thread
   // waits on the condition variable until the simulator allows it to proceed.

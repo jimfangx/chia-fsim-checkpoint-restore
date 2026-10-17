@@ -158,7 +158,7 @@ simif_emul_t::simif_emul_t(const TargetConfig &config,
   std::cout << "simif_emul_t: done" << std::endl;
 }
 
-simif_emul_t::~simif_emul_t() {}
+simif_emul_t::~simif_emul_t() { thread.cancel_reserved(); }
 
 std::vector<std::pair<std::string, checkpoint_owner_t *>>
 simif_emul_t::checkpoint_axi_owners() {
@@ -174,6 +174,7 @@ simif_emul_t::checkpoint_axi_owners() {
 }
 
 void simif_emul_t::start_driver(simulation_t &sim) {
+  thread.require_controller_if_started();
   if (loading_driver)
     throw std::runtime_error("reserved restore destination cannot start ordinarily");
   if (restored_driver || restore_consumed)
@@ -182,6 +183,7 @@ void simif_emul_t::start_driver(simulation_t &sim) {
 }
 
 void simif_emul_t::require_restored_destination(simulation_t &sim) {
+  thread.require_controller_if_started();
   if (driver_started || driver_diagnostic.requested() ||
       cpu_managed_stream_io || fpga_managed_stream_io || !qsfp.empty() || slave.size() > 4)
     throw std::runtime_error("unsupported/nonfresh restored dispatcher destination");
@@ -190,6 +192,7 @@ void simif_emul_t::require_restored_destination(simulation_t &sim) {
 }
 
 void simif_emul_t::arm_restored_driver(simulation_t &sim) {
+  thread.require_controller_if_started();
   if (restored_driver || restore_consumed)
     throw std::runtime_error("restored dispatcher already armed/consumed");
   if (loading_driver && loading_driver != &sim)
@@ -200,6 +203,7 @@ void simif_emul_t::arm_restored_driver(simulation_t &sim) {
 }
 
 void simif_emul_t::begin_restored_load(simulation_t &sim) {
+  thread.require_controller_if_started();
   if (loading_driver || restored_driver || restore_consumed || driver_started ||
       driver_diagnostic.requested() || cpu_managed_stream_io || fpga_managed_stream_io ||
       !qsfp.empty() || slave.size()>4)
@@ -214,7 +218,22 @@ void simif_emul_t::begin_restored_load(simulation_t &sim) {
   loading_driver = &sim;
 }
 
+void simif_emul_t::reserve_restored_creator(simulation_t &sim) {
+  if (loading_driver != &sim || restored_driver || restore_consumed || driver_started)
+    throw std::runtime_error("creator reservation requires fresh restore loading hold");
+  sim.require_fresh_dispatcher();
+  thread.reserve();
+}
+
+void simif_emul_t::prepare_on_restored_creator(
+    simulation_t &sim, emul_driver_thread_t::task_t prepare) {
+  if (loading_driver != &sim || restored_driver || restore_consumed || driver_started)
+    throw std::runtime_error("creator preparation requires restore loading hold");
+  thread.invoke(std::move(prepare));
+}
+
 bool simif_emul_t::resume_restored_driver(uint32_t bits, const uint32_t *banks) {
+  thread.require_controller_if_started();
   if (!restored_driver || restore_consumed)
     throw std::runtime_error("missing/consumed restored dispatcher");
   auto &sim = *restored_driver;
@@ -261,7 +280,7 @@ bool simif_emul_t::start_driver_impl(simulation_t &sim, bool restored) {
     rtlsim_flag = false;
 
     // Spawn the target thread.
-    thread = std::thread([&, restored] {
+    thread.launch([&, restored] {
       if (!restored)
         do_tick();
 
@@ -552,6 +571,8 @@ bool simif_emul_t::checkpoint_settled(uint32_t bits, const uint32_t *banks) {
 }
 
 void simif_emul_t::require_no_driver_capture() const {
+  if (!driver_started && (loading_driver || restored_driver || restore_consumed))
+    throw std::runtime_error("MMIO/RTL advancement during restore loading hold");
   if (driver_capture_active)
     throw std::runtime_error(
         "MMIO/RTL advancement during driver boundary capture");
