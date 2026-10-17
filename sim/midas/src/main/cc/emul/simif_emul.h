@@ -87,6 +87,11 @@ public:
   // hold, before publishing owners. Requires a reserved creator and a fresh
   // driver. Arming/bootstrap still validate the restored state independently.
   void prepare_restored_launch(simulation_t &sim);
+  // Optional final creator validation. Retain its guard through controller
+  // publication/readback, rejecting later preparation until launch/cancel.
+  // The coordinator must supply the actual process/owner exclusion policy.
+  void seal_restored_launch(simulation_t &sim,
+                            emul_driver_thread_t::publication_factory_t prepare);
   // Called only inside preparation. The bundle lives until continuation exit
   // or cancellation and is destroyed on its creator. One bundle per worker.
   void retain_on_restored_creator(simulation_t &sim,
