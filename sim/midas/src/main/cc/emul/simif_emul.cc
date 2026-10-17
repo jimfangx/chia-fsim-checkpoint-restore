@@ -173,6 +173,16 @@ simif_emul_t::checkpoint_axi_owners() {
   return owners;
 }
 
+std::vector<std::pair<std::string, checkpoint_owner_t *>>
+simif_emul_t::checkpoint_stream_io_owners() {
+  std::vector<std::pair<std::string, checkpoint_owner_t *>> owners;
+  if (cpu_managed_stream_io)
+    owners.emplace_back("runtime/cpu-managed-stream-io", cpu_managed_stream_io.get());
+  if (fpga_managed_stream_io)
+    owners.emplace_back("runtime/fpga-managed-stream-io", nullptr);
+  return owners;
+}
+
 void simif_emul_t::start_driver(simulation_t &sim) {
   thread.require_controller_if_started();
   if (loading_driver)
@@ -417,7 +427,11 @@ uint32_t simif_emul_t::read(size_t addr) {
 size_t simif_emul_t::CPUManagedStreamIOImpl::cpu_managed_axi4_read(
     size_t addr, char *data, size_t size) {
   simif.require_no_driver_capture();
+  widget_checkpoint_state_t::call_t call(checkpoint_state);
   const uint64_t beat_bytes = cpu_managed_axi4.get_config().beat_bytes();
+  if (!size) return 0;
+  if (size % beat_bytes || size > size_t(SSIZE_MAX))
+    throw std::runtime_error("unsupported CPU-managed DMA read size");
   ssize_t len = (size - 1) / beat_bytes;
 
   while (len >= 0) {
@@ -436,7 +450,11 @@ size_t simif_emul_t::CPUManagedStreamIOImpl::cpu_managed_axi4_read(
 size_t simif_emul_t::CPUManagedStreamIOImpl::cpu_managed_axi4_write(
     size_t addr, const char *data, size_t size) {
   simif.require_no_driver_capture();
+  widget_checkpoint_state_t::call_t call(checkpoint_state);
   const uint64_t beat_bytes = cpu_managed_axi4.get_config().beat_bytes();
+  if (!size) return 0;
+  if (size % beat_bytes || size > size_t(SSIZE_MAX))
+    throw std::runtime_error("unsupported CPU-managed DMA write size");
   ssize_t len = (size - 1) / beat_bytes;
   const size_t remaining = size - len * beat_bytes;
   size_t strb[len + 1];
@@ -548,10 +566,8 @@ void simif_emul_t::capture_driver_boundary(simulation_t &sim, bool done) {
       owners.emplace_back("generated/rtl", nullptr);
       owners.emplace_back("runtime/harness", nullptr);
       owners.emplace_back("runtime/execution-context", nullptr);
-      if (cpu_managed_stream_io)
-        owners.emplace_back("runtime/cpu-managed-stream-io", nullptr);
-      if (fpga_managed_stream_io)
-        owners.emplace_back("runtime/fpga-managed-stream-io", nullptr);
+      const auto streams = checkpoint_stream_io_owners();
+      owners.insert(owners.end(), streams.begin(), streams.end());
       for (size_t i = 0; i < qsfp.size(); ++i)
         owners.emplace_back("runtime/qsfp/" + std::to_string(i), nullptr);
     }

@@ -199,6 +199,11 @@ public:
   // scheduler/stream-engine/QSFP owners and a coherent freeze remain required.
   std::vector<std::pair<std::string, checkpoint_owner_t *>> checkpoint_axi_owners();
 
+  // Host-side stream calls own buffers/cursors while suspended. These owners
+  // certify returned calls only; AXI queues and generated stream hardware are
+  // separate owners. FPGA-managed host rings remain explicitly unsupported.
+  std::vector<std::pair<std::string, checkpoint_owner_t *>> checkpoint_stream_io_owners();
+
   // A component subset, with no thread freeze or driver continuation claim.
   // Hooks reject while advance_target is suspended, even if RTL is parked.
   std::pair<std::string, checkpoint_owner_t *> checkpoint_host_timing_owner() {
@@ -270,12 +275,33 @@ private:
   void require_no_driver_capture() const;
   void capture_driver_boundary(simulation_t &sim, bool done);
 
-  class CPUManagedStreamIOImpl final : public CPUManagedStreamIO {
+  class CPUManagedStreamIOImpl final : public CPUManagedStreamIO,
+                                      public checkpoint_owner_t {
   public:
     CPUManagedStreamIOImpl(simif_emul_t &simif, const AXI4Config &config)
-        : simif(simif), cpu_managed_axi4(config) {}
+        : simif(simif), cpu_managed_axi4(config),
+          checkpoint_config(24, {config.id_bits, config.addr_bits, config.data_bits}) {}
 
-    uint32_t mmio_read(size_t addr) override { return simif.read(addr); }
+    uint32_t mmio_read(size_t addr) override {
+      simif.require_no_driver_capture();
+      widget_checkpoint_state_t::call_t call(checkpoint_state);
+      return simif.read(addr);
+    }
+
+    std::string checkpoint_schema() const override {
+      return "firesim.emul.cpu-managed-stream-io.returned.v1";
+    }
+    std::vector<uint8_t> save_checkpoint() const override {
+      return checkpoint_state.save(checkpoint_config);
+    }
+    void validate_checkpoint(const std::vector<uint8_t> &payload) const override {
+      checkpoint_state.validate(payload, checkpoint_config);
+    }
+    void load_checkpoint(const std::vector<uint8_t> &payload) override {
+      // There is no persistent host queue/cursor after a returned call.
+      // Never clear a suspended/poisoned lifetime or replay MMIO/DMA here.
+      checkpoint_state.validate(payload, checkpoint_config);
+    }
 
     size_t
     cpu_managed_axi4_write(size_t addr, const char *data, size_t size) override;
@@ -288,6 +314,9 @@ private:
 
     simif_emul_t &simif;
     mmio_t cpu_managed_axi4;
+  private:
+    const widget_checkpoint_config_t checkpoint_config;
+    widget_checkpoint_state_t checkpoint_state;
   };
 
   std::unique_ptr<CPUManagedStreamIOImpl> cpu_managed_stream_io;
