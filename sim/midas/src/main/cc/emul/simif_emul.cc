@@ -239,6 +239,16 @@ void simif_emul_t::retain_on_restored_creator(
   thread.retain(std::move(resource));
 }
 
+void simif_emul_t::prepare_restored_launch(simulation_t &sim) {
+  thread.require_controller_if_started();
+  if (loading_driver != &sim || restored_driver || restore_consumed || driver_started ||
+      prepared_launch_driver || !thread.reserved())
+    throw std::runtime_error("launch preparation requires idle restore loading creator");
+  sim.require_fresh_dispatcher();
+  thread.prepare_launch(make_driver_task(sim, true));
+  prepared_launch_driver = &sim;
+}
+
 bool simif_emul_t::resume_restored_driver(uint32_t bits, const uint32_t *banks) {
   thread.require_controller_if_started();
   if (!restored_driver || restore_consumed)
@@ -277,6 +287,11 @@ bool simif_emul_t::start_driver_impl(simulation_t &sim, bool restored) {
     fprintf(stderr, "FS_DRIVER_BOUNDARY_ERROR: unsupported incremental simulation driver\n");
     std::exit(EXIT_FAILURE);
   }
+  if (prepared_launch_driver && (!restored || prepared_launch_driver != &sim))
+    throw std::runtime_error("prepared driver continuation destination mismatch");
+  // Build every std::function capture before changing dispatcher state. The
+  // optional restore coordinator has already staged these before publication.
+  auto task = prepared_launch_driver ? emul_driver_thread_t::task_t{} : make_driver_task(sim, restored);
   // Set up the simulation thread.
   driver_started = true;
   finished = false;
@@ -286,8 +301,25 @@ bool simif_emul_t::start_driver_impl(simulation_t &sim, bool restored) {
     driver_flag = false;
     rtlsim_flag = false;
 
-    // Spawn the target thread.
-    thread.launch([&, restored] {
+    if (prepared_launch_driver) {
+      thread.launch_prepared();
+      prepared_launch_driver = nullptr;
+    } else {
+      thread.launch(std::move(task));
+    }
+
+    // Wait for the target thread to yield and enter the RTL simulator.
+    // A restored terminal cut can finish without yielding.
+    rtlsim_cond.wait(lock, [&] { return rtlsim_flag || finished || settled_pending; });
+  }
+  return finished;
+}
+
+emul_driver_thread_t::task_t simif_emul_t::make_driver_task(simulation_t &sim, bool restored) {
+  simulation_t::run_boundary_t boundary;
+  if (driver_diagnostic.requested() || checkpoint_polling)
+    boundary = [this](simulation_t &driver, bool done) { capture_driver_boundary(driver, done); };
+  return [this, &sim, restored, boundary = std::move(boundary)] {
       if (!restored)
         do_tick();
 
@@ -302,9 +334,6 @@ bool simif_emul_t::start_driver_impl(simulation_t &sim, bool restored) {
 
       // Run the simulation flow.
       try {
-        simulation_t::run_boundary_t boundary;
-        if (driver_diagnostic.requested() || checkpoint_polling)
-          boundary = [this](simulation_t &driver, bool done) { capture_driver_boundary(driver, done); };
         exit_code = sim.execute_simulation_flow(boundary);
         driver_diagnostic.finish();
       } catch (const std::exception &error) {
@@ -322,16 +351,7 @@ bool simif_emul_t::start_driver_impl(simulation_t &sim, bool restored) {
         finished = true;
         rtlsim_cond.notify_one();
       }
-    });
-
-    // Wait for the target thread to yield and enter the RTL simulator.
-    // The target thread is waken up when the DPI tick function is
-    // ready to transfer data to it.
-    // A restored terminal cut can finish without yielding. Waiting only for
-    // rtlsim_flag would deadlock that valid zero-edge continuation.
-    rtlsim_cond.wait(lock, [&] { return rtlsim_flag || finished || settled_pending; });
-  }
-  return finished;
+    };
 }
 
 void simif_emul_t::wait_write(mmio_t &mmio) {

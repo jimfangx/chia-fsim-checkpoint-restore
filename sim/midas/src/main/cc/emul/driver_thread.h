@@ -65,11 +65,37 @@ public:
       return;
     }
     require_controller();
-    if (state != state_t::reserved)
+    if (state != state_t::reserved || continuation)
       throw std::runtime_error("driver creator cannot launch twice/during preparation");
     pending = std::move(task);
     state = state_t::launched;
     changed.notify_one();
+  }
+
+  // Allocate/copy the continuation before any restore publication. This does
+  // not wake the worker; invoke remains available for final owner validation.
+  void prepare_launch(task_t task) {
+    std::lock_guard<std::mutex> lock(mutex);
+    require_controller();
+    if (state != state_t::reserved || !task || continuation)
+      throw std::runtime_error("driver continuation requires idle unprepared creator");
+    continuation = std::move(task);
+  }
+
+  // Publication has already happened. A broken coordinator contract is fatal,
+  // never a retryable exception that could release a partially restored DUT.
+  void launch_prepared() noexcept {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (controller != std::this_thread::get_id() || state != state_t::reserved || !continuation)
+      std::terminate();
+    pending = std::move(continuation);
+    state = state_t::launched;
+    changed.notify_one();
+  }
+
+  bool launch_prepared_pending() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    return bool(continuation);
   }
 
   void retain(std::unique_ptr<resource_t> resource) {
@@ -115,6 +141,7 @@ private:
   std::thread::id controller;
   state_t state = state_t::fresh;
   task_t pending;
+  task_t continuation;
   std::unique_ptr<resource_t> resident;
   std::exception_ptr error;
 
@@ -130,7 +157,10 @@ private:
                state == state_t::cancelled;
       });
       if (state == state_t::cancelled) {
+        auto abandoned = std::move(continuation);
         lock.unlock();
+        // A staged continuation can hold references to creator-owned owners.
+        abandoned = nullptr;
         resident.reset();
         return;
       }

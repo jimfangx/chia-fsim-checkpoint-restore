@@ -83,6 +83,10 @@ public:
   void reserve_restored_creator(simulation_t &sim);
   void prepare_on_restored_creator(simulation_t &sim,
                                    emul_driver_thread_t::task_t prepare);
+  // Stage the complete dispatcher continuation while still under the loading
+  // hold, before publishing owners. Requires a reserved creator and a fresh
+  // driver. Arming/bootstrap still validate the restored state independently.
+  void prepare_restored_launch(simulation_t &sim);
   // Called only inside preparation. The bundle lives until continuation exit
   // or cancellation and is destroyed on its creator. One bundle per worker.
   void retain_on_restored_creator(simulation_t &sim,
@@ -106,8 +110,8 @@ public:
   // while the completed-operation worker is parked at a low-clock cut.
   void require_settled_checkpoint_capture() const;
   void schedule_checkpoint_operation(uint64_t operation) {
-    if (driver_started || checkpoint_polling)
-      throw std::runtime_error("checkpoint schedule after worker startup");
+    if (driver_started || prepared_launch_driver || checkpoint_polling)
+      throw std::runtime_error("checkpoint schedule after worker startup/launch preparation");
     driver_diagnostic.arm_checkpoint_operation(operation);
     public_capture_required = true;
   }
@@ -115,7 +119,7 @@ public:
   // caller must acknowledge each settled callback, including a not-due cut.
   // This scheduling state is host policy and is freshly configured on restore.
   void schedule_checkpoint_polling() {
-    if (driver_started || checkpoint_polling || driver_diagnostic.requested())
+    if (driver_started || prepared_launch_driver || checkpoint_polling || driver_diagnostic.requested())
       throw std::runtime_error("invalid repeated checkpoint polling lifecycle");
     checkpoint_polling = public_capture_required = true;
   }
@@ -233,6 +237,7 @@ protected:
 private:
   simulation_t *restored_driver = nullptr;
   simulation_t *loading_driver = nullptr;
+  simulation_t *prepared_launch_driver = nullptr;
   bool restore_consumed = false;
   bool driver_started = false;
   bool public_capture_required = false;
@@ -240,6 +245,7 @@ private:
   bool checkpoint_polling = false;
   void require_restored_destination(simulation_t &sim);
   bool start_driver_impl(simulation_t &sim, bool restored);
+  emul_driver_thread_t::task_t make_driver_task(simulation_t &sim, bool restored);
   driver_boundary_diagnostic_t driver_diagnostic;
   // Published only while to_sim has parked VCS in DPI. This does not mean
   // RTL/NBA settlement: it certifies software ownership access on the driver.
