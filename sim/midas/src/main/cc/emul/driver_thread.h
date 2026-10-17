@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -18,6 +19,11 @@
 class emul_driver_thread_t {
 public:
   using task_t = std::function<void()>;
+  // A coordinator may keep one prepared owner bundle on its creator across
+  // launch. Its destructor must not throw. No live owner crosses to VCS.
+  struct resource_t {
+    virtual ~resource_t() = default;
+  };
   emul_driver_thread_t() = default;
   emul_driver_thread_t(const emul_driver_thread_t &) = delete;
   emul_driver_thread_t &operator=(const emul_driver_thread_t &) = delete;
@@ -66,6 +72,14 @@ public:
     changed.notify_one();
   }
 
+  void retain(std::unique_ptr<resource_t> resource) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (state != state_t::preparing || worker.get_id() != std::this_thread::get_id() ||
+        !resource || resident)
+      throw std::runtime_error("driver resource requires empty preparing creator");
+    resident = std::move(resource);
+  }
+
   bool reserved() const {
     std::lock_guard<std::mutex> lock(mutex);
     return state == state_t::reserved;
@@ -101,6 +115,7 @@ private:
   std::thread::id controller;
   state_t state = state_t::fresh;
   task_t pending;
+  std::unique_ptr<resource_t> resident;
   std::exception_ptr error;
 
   void require_controller() const {
@@ -114,13 +129,20 @@ private:
         return state == state_t::preparing || state == state_t::launched ||
                state == state_t::cancelled;
       });
-      if (state == state_t::cancelled)
+      if (state == state_t::cancelled) {
+        lock.unlock();
+        resident.reset();
         return;
+      }
       const bool launching = state == state_t::launched;
       auto task = std::move(pending);
       lock.unlock();
       if (launching) {
         task();
+        // Continuation captures may refer to the resident bundle. Release
+        // them first, then destroy the bundle on its original creator.
+        task = nullptr;
+        resident.reset();
         return;
       }
       std::exception_ptr failure;

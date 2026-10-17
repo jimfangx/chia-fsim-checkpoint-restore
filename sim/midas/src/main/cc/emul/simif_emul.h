@@ -83,6 +83,10 @@ public:
   void reserve_restored_creator(simulation_t &sim);
   void prepare_on_restored_creator(simulation_t &sim,
                                    emul_driver_thread_t::task_t prepare);
+  // Called only inside preparation. The bundle lives until continuation exit
+  // or cancellation and is destroyed on its creator. One bundle per worker.
+  void retain_on_restored_creator(simulation_t &sim,
+                                  std::unique_ptr<emul_driver_thread_t::resource_t> resource);
   bool restored_driver_pending() const { return restored_driver != nullptr || loading_driver != nullptr; }
   bool resume_restored_driver(uint32_t bits, const uint32_t *banks);
 

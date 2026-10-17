@@ -232,6 +232,13 @@ void simif_emul_t::prepare_on_restored_creator(
   thread.invoke(std::move(prepare));
 }
 
+void simif_emul_t::retain_on_restored_creator(
+    simulation_t &sim, std::unique_ptr<emul_driver_thread_t::resource_t> resource) {
+  if (loading_driver != &sim || restored_driver || restore_consumed || driver_started)
+    throw std::runtime_error("creator lifetime requires restore loading hold");
+  thread.retain(std::move(resource));
+}
+
 bool simif_emul_t::resume_restored_driver(uint32_t bits, const uint32_t *banks) {
   thread.require_controller_if_started();
   if (!restored_driver || restore_consumed)
