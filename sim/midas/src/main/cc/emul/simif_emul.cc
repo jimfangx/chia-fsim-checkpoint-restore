@@ -481,18 +481,21 @@ void simif_emul_t::capture_driver_boundary(simulation_t &sim, bool done) {
         owners.emplace_back("runtime/qsfp/" + std::to_string(i), nullptr);
     }
     if (checkpoint_polling || (driver_diagnostic.settled() && driver_diagnostic.due())) {
-      // Publish the complete inventory before releasing VCS. The worker stays
-      // in this callback, with no suspended MMIO or host-delay operation.
+      // Freeze on the driver creator, while VCS is still parked in DPI. The
+      // settled callback must never invoke mutable or creator-bound owners.
+      // Empty polling inventories have no diagnostic owner work to transfer.
+      auto snapshot = owners.empty() ? driver_boundary_diagnostic_t::snapshot_t{}
+                                    : driver_boundary_diagnostic_t::freeze(owners);
       std::unique_lock<std::mutex> lock(settled_mutex);
       public_capture_published = false;
-      settled_owners = std::move(owners);
+      settled_owners = std::move(snapshot);
       {
         std::unique_lock<std::mutex> rtl_lock(rtlsim_mutex);
         settled_pending = true;
         rtlsim_cond.notify_one();
       }
       settled_cond.wait(lock, [&] { return !settled_pending; });
-      settled_owners.clear();
+      settled_owners = driver_boundary_diagnostic_t::snapshot_t{};
     } else {
       driver_diagnostic.observe(owners);
     }
@@ -529,7 +532,7 @@ bool simif_emul_t::checkpoint_settled(uint32_t bits, const uint32_t *banks) {
   {
     std::unique_lock<std::mutex> lock(settled_mutex);
     harness_observation_t observation(bits, banks);
-    auto owners = settled_owners;
+    auto owners = settled_owners.owners();
     owners.emplace_back("diagnostic/harness-banks", &observation);
     driver_diagnostic.observe(owners);
     // Resume the existing operation dispatcher until its next normal yield.

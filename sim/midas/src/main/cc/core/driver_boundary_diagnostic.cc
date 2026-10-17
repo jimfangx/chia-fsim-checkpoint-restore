@@ -25,7 +25,69 @@ struct record_t {
   checkpoint_owner_t *owner;
   std::vector<uint8_t> payload;
 };
+std::vector<record_t> collect(const driver_boundary_diagnostic_t::owners_t &owners) {
+  require(!owners.empty(), "empty owner inventory");
+  std::unordered_set<std::string> ids;
+  std::unordered_set<checkpoint_owner_t *> pointers;
+  std::vector<record_t> records;
+  for (const auto &[id, owner] : owners) {
+    require(!id.empty() && ids.insert(id).second, "empty/duplicate owner identity");
+    require(!owner || pointers.insert(owner).second, "aliased owner");
+    record_t record{id, owner ? owner->checkpoint_schema() : "", owner, {}};
+    if (!record.schema.empty()) {
+      record.payload = owner->save_checkpoint();
+      owner->validate_checkpoint(record.payload);
+    }
+    records.push_back(std::move(record));
+  }
+  // Check after every save/validation, including cross-owner mutations.
+  for (const auto &record : records) {
+    require(!record.owner || record.owner->checkpoint_schema() == record.schema,
+            "owner schema changed during capture");
+    if (!record.schema.empty())
+      require(record.owner->save_checkpoint() == record.payload,
+              "owner changed during parked capture");
+  }
+  return records;
+}
+class frozen_owner_t final : public checkpoint_owner_t {
+public:
+  frozen_owner_t(std::string schema, std::vector<uint8_t> payload)
+      : schema(std::move(schema)), payload(std::move(payload)) {}
+  std::string checkpoint_schema() const override { return schema; }
+  std::vector<uint8_t> save_checkpoint() const override {
+    require(!schema.empty(), "unsupported frozen owner");
+    return payload;
+  }
+  void validate_checkpoint(const std::vector<uint8_t> &image) const override {
+    require(!schema.empty() && image == payload, "frozen owner image mismatch");
+  }
+  void load_checkpoint(const std::vector<uint8_t> &) override {
+    throw std::runtime_error("driver boundary diagnostic: cannot restore an observation");
+  }
+private:
+  const std::string schema;
+  const std::vector<uint8_t> payload;
+};
 } // namespace
+
+driver_boundary_diagnostic_t::snapshot_t
+driver_boundary_diagnostic_t::freeze(const owners_t &owners) {
+  auto captured = collect(owners);
+  snapshot_t snapshot;
+  for (auto &record : captured)
+    snapshot.records.emplace_back(std::move(record.id),
+        std::make_unique<frozen_owner_t>(std::move(record.schema), std::move(record.payload)));
+  return snapshot;
+}
+
+driver_boundary_diagnostic_t::owners_t
+driver_boundary_diagnostic_t::snapshot_t::owners() const {
+  owners_t result;
+  for (const auto &[id, owner] : records)
+    result.emplace_back(id, owner.get());
+  return result;
+}
 
 driver_boundary_diagnostic_t::driver_boundary_diagnostic_t(
     const std::vector<std::string> &args) {
@@ -91,31 +153,7 @@ void driver_boundary_diagnostic_t::observe(const owners_t &owners) {
   const auto temporary = path + ".tmp";
   bool created = false;
   try {
-    require(!owners.empty(), "empty owner inventory");
-    std::unordered_set<std::string> ids;
-    std::unordered_set<checkpoint_owner_t *> pointers;
-    std::vector<record_t> records;
-    for (const auto &[id, owner] : owners) {
-      require(!id.empty() && ids.insert(id).second,
-              "empty/duplicate owner identity");
-      require(!owner || pointers.insert(owner).second, "aliased owner");
-      record_t record{id, owner ? owner->checkpoint_schema() : "", owner, {}};
-      if (!record.schema.empty()) {
-        record.payload = owner->save_checkpoint();
-        owner->validate_checkpoint(record.payload);
-      }
-      records.push_back(std::move(record));
-    }
-    // Validate all owners before opening a file; check stability again after
-    // all save hooks, including cross-owner mutation caused by a bad adapter.
-    for (const auto &record : records) {
-      require(!record.owner ||
-                  record.owner->checkpoint_schema() == record.schema,
-              "owner schema changed during capture");
-      if (!record.schema.empty())
-        require(record.owner->save_checkpoint() == record.payload,
-                "owner changed during parked capture");
-    }
+    const auto records = collect(owners);
     require(!std::filesystem::exists(path) &&
                 !std::filesystem::exists(temporary),
             "diagnostic destination already exists");

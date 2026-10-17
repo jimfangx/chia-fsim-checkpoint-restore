@@ -236,7 +236,7 @@ private:
   std::atomic<bool> settled_pending{false};
   std::mutex settled_mutex;
   std::condition_variable settled_cond;
-  driver_boundary_diagnostic_t::owners_t settled_owners;
+  driver_boundary_diagnostic_t::snapshot_t settled_owners;
   void require_no_driver_capture() const;
   void capture_driver_boundary(simulation_t &sim, bool done);
 
