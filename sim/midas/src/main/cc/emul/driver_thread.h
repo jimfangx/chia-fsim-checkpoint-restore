@@ -106,12 +106,38 @@ public:
     continuation = std::move(task);
   }
 
+  // Stage creator-affine owner publication/readback before acquiring the final
+  // guards. The callable and its captures are allocated before any mutation.
+  // It must not throw: validation belongs in preparation/seal_launch. A failure
+  // during publication cannot safely release a partially restored destination.
+  void prepare_publication(task_t task) {
+    std::lock_guard<std::mutex> lock(mutex);
+    require_controller();
+    if (state != state_t::reserved || !continuation || !task || publication)
+      throw std::runtime_error("driver publication requires prepared idle creator");
+    publication = std::move(task);
+  }
+
+  // Synchronous controller request; the creator keeps its guards while it
+  // publishes and reads back its owners, then parks under those same guards.
+  // No callable copy, thread creation or allocation occurs on this path.
+  void publish_prepared() {
+    std::unique_lock<std::mutex> lock(mutex);
+    require_controller();
+    if (state != state_t::sealed || !publication || publication_done)
+      throw std::runtime_error("driver publication requires sealed staged owners");
+    state = state_t::publishing;
+    changed.notify_one();
+    completed.wait(lock, [this] { return state != state_t::publishing; });
+  }
+
   // Publication has already happened. A broken coordinator contract is fatal,
   // never a retryable exception that could release a partially restored DUT.
   void launch_prepared() noexcept {
     std::lock_guard<std::mutex> lock(mutex);
     if (controller != std::this_thread::get_id() ||
-        (state != state_t::reserved && state != state_t::sealed) || !continuation)
+        (state != state_t::reserved && state != state_t::sealed) || !continuation ||
+        (publication && !publication_done))
       std::terminate();
     pending = std::move(continuation);
     state = state_t::launched;
@@ -125,7 +151,7 @@ public:
 
   bool publication_sealed() const {
     std::lock_guard<std::mutex> lock(mutex);
-    return state == state_t::sealed;
+    return state == state_t::sealed || state == state_t::publishing;
   }
 
   void retain(std::unique_ptr<resource_t> resource) {
@@ -164,7 +190,7 @@ public:
   }
 
 private:
-  enum class state_t { fresh, reserved, preparing, sealed, launched, cancelled };
+  enum class state_t { fresh, reserved, preparing, sealed, publishing, launched, cancelled };
   mutable std::mutex mutex;
   std::condition_variable changed, completed;
   std::thread worker;
@@ -172,6 +198,8 @@ private:
   state_t state = state_t::fresh;
   task_t pending;
   task_t continuation;
+  task_t publication;
+  bool publication_done = false;
   std::unique_ptr<resource_t> resident;
   std::unique_ptr<resource_t> publication_guard;
   bool sealing = false;
@@ -186,16 +214,30 @@ private:
     for (;;) {
       changed.wait(lock, [this] {
         return state == state_t::preparing || state == state_t::launched ||
-               state == state_t::cancelled;
+               state == state_t::publishing || state == state_t::cancelled;
       });
       if (state == state_t::cancelled) {
         auto abandoned = std::move(continuation);
         lock.unlock();
         // A staged continuation can hold references to creator-owned owners.
         abandoned = nullptr;
+        publication = nullptr;
         publication_guard.reset();
         resident.reset();
         return;
+      }
+      if (state == state_t::publishing) {
+        auto publish = std::move(publication);
+        lock.unlock();
+        try { publish(); } catch (...) { std::terminate(); }
+        // Captures may reference resident owners or need creator-affine
+        // destruction. Dispose of them before acknowledging publication.
+        publish = nullptr;
+        lock.lock();
+        publication_done = true;
+        state = state_t::sealed;
+        completed.notify_one();
+        continue;
       }
       const bool launching = state == state_t::launched;
       auto task = std::move(pending);

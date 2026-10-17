@@ -87,6 +87,13 @@ public:
   // hold, before publishing owners. Requires a reserved creator and a fresh
   // driver. Arming/bootstrap still validate the restored state independently.
   void prepare_restored_launch(simulation_t &sim);
+  // Stage creator-affine owner commit/readback before sealing. The callback
+  // must be fully prepared and must not throw or advance simulation.
+  void prepare_restored_publication(simulation_t &sim,
+                                    emul_driver_thread_t::task_t publish);
+  // Execute it on the creator while retaining the sealed publication guards.
+  // Loading hold remains active for controller-side publication/readback.
+  void publish_restored_owners(simulation_t &sim);
   // Optional final creator validation. Retain its guard through controller
   // publication/readback, rejecting later preparation until launch/cancel.
   // The coordinator must supply the actual process/owner exclusion policy.

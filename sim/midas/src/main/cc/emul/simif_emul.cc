@@ -249,6 +249,25 @@ void simif_emul_t::prepare_restored_launch(simulation_t &sim) {
   prepared_launch_driver = &sim;
 }
 
+void simif_emul_t::prepare_restored_publication(
+    simulation_t &sim, emul_driver_thread_t::task_t publish) {
+  thread.require_controller_if_started();
+  if (loading_driver != &sim || restored_driver || restore_consumed || driver_started ||
+      prepared_launch_driver != &sim)
+    throw std::runtime_error("owner publication preparation requires prepared loading creator");
+  sim.require_fresh_dispatcher();
+  thread.prepare_publication(std::move(publish));
+}
+
+void simif_emul_t::publish_restored_owners(simulation_t &sim) {
+  thread.require_controller_if_started();
+  if (loading_driver != &sim || restored_driver || restore_consumed || driver_started ||
+      prepared_launch_driver != &sim)
+    throw std::runtime_error("owner publication requires sealed loading creator");
+  sim.require_fresh_dispatcher();
+  thread.publish_prepared();
+}
+
 void simif_emul_t::seal_restored_launch(
     simulation_t &sim, emul_driver_thread_t::publication_factory_t prepare) {
   thread.require_controller_if_started();
