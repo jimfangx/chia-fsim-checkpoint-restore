@@ -7,6 +7,7 @@
 #include "core/checkpoint.h"
 
 #include <cstring>
+#include <memory>
 #include <queue>
 #include <stdint.h>
 
@@ -17,6 +18,10 @@ public:
   mm_t(const AXI4Config conf)
       : conf(conf), word_size(conf.beat_bytes()), data(nullptr), size(0),
         line_size(0) {}
+  mm_t(const mm_t &) = delete;
+  mm_t &operator=(const mm_t &) = delete;
+  mm_t(mm_t &&) = delete;
+  mm_t &operator=(mm_t &&) = delete;
 
   virtual void init(size_t sz, int lsz);
 
@@ -104,6 +109,27 @@ public:
   void validate_checkpoint(const std::vector<uint8_t> &) const override;
   void load_checkpoint(const std::vector<uint8_t> &) override;
 
+  class restore_t {
+  public:
+    ~restore_t();
+    restore_t(const restore_t &) = delete;
+    restore_t &operator=(const restore_t &) = delete;
+  private:
+    friend class mm_magic_t;
+    struct impl_t;
+    explicit restore_t(std::unique_ptr<impl_t>);
+    std::unique_ptr<impl_t> impl;
+  };
+  // Component transaction only. The coordinator must exclude both simulator
+  // contexts and every backing-memory user from preparation through readback.
+  // Seal finishes all allocating/throwing destination checks before any owner
+  // in the aggregate publishes. Abandoning a candidate publishes nothing.
+  std::unique_ptr<restore_t> prepare_checkpoint(const std::vector<uint8_t> &);
+  void seal_checkpoint(restore_t &);
+  // Preserves the mmap address, so existing backing-memory aliases stay valid.
+  // A broken lifetime/thread/seal/generation contract terminates before copy.
+  void publish_sealed_checkpoint(restore_t &) noexcept;
+
   void init(size_t sz, int lsz) override;
 
   bool ar_ready() override { return true; }
@@ -154,6 +180,10 @@ protected:
   std::queue<mm_rresp_t> rresp;
 
   uint64_t cycle;
+
+private:
+  const std::shared_ptr<const uint8_t> checkpoint_identity = std::make_shared<const uint8_t>(0);
+  uint64_t checkpoint_generation = 0;
 };
 
 #endif // __EMUL_MM_H

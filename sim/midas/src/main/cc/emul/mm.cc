@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <sys/mman.h>
+#include <thread>
 
 #include "mm.h"
 
@@ -60,6 +61,9 @@ mm_t::~mm_t() {
 }
 
 void mm_magic_t::init(size_t sz, int lsz) {
+  // Reinitializing would leak/replace a live mapping and invalidate aliases.
+  if (data)
+    throw std::runtime_error("mm_magic checkpoint: memory already initialized");
   mm_t::init(sz, lsz);
   dummy_data.resize(word_size);
 }
@@ -221,6 +225,7 @@ void mm_magic_t::validate_checkpoint(const std::vector<uint8_t> &bytes) const {
 
 void mm_magic_t::load_checkpoint(const std::vector<uint8_t> &bytes) {
   checkpoint_require(data != nullptr, "uninitialized memory");
+  checkpoint_require(checkpoint_generation != UINT64_MAX, "exhausted publication generation");
   // Parse and allocate everything first: a rejected payload changes nothing.
   auto state = parse_memory_checkpoint(*this, bytes, size, word_size, line_size);
   std::memcpy(data, bytes.data() + state.memory_offset, size);
@@ -233,6 +238,76 @@ void mm_magic_t::load_checkpoint(const std::vector<uint8_t> &bytes) {
   store_id = state.id;
   store_size = state.size;
   store_count = state.count;
+  ++checkpoint_generation;
+}
+
+struct mm_magic_t::restore_t::impl_t {
+  mm_magic_t *destination;
+  std::shared_ptr<const uint8_t> identity;
+  std::thread::id creator = std::this_thread::get_id();
+  uint64_t generation;
+  memory_checkpoint state;
+  std::vector<uint8_t> incoming, expected;
+  bool sealed = false, published = false;
+  explicit impl_t(mm_magic_t &destination)
+      : destination(&destination), identity(destination.checkpoint_identity),
+        generation(destination.checkpoint_generation) {}
+};
+
+mm_magic_t::restore_t::restore_t(std::unique_ptr<impl_t> impl)
+    : impl(std::move(impl)) {}
+mm_magic_t::restore_t::~restore_t() = default;
+
+std::unique_ptr<mm_magic_t::restore_t>
+mm_magic_t::prepare_checkpoint(const std::vector<uint8_t> &bytes) {
+  checkpoint_require(data != nullptr, "uninitialized memory");
+  checkpoint_require(checkpoint_generation != UINT64_MAX, "exhausted publication generation");
+  auto candidate = std::make_unique<restore_t::impl_t>(*this);
+  candidate->state = parse_memory_checkpoint(*this, bytes, size, word_size, line_size);
+  // Own incoming bytes: callers may free or reuse the original image after
+  // preparation. No file, caller buffer or parser is consulted at publication.
+  candidate->incoming = bytes;
+  candidate->expected = save_checkpoint();
+  return std::unique_ptr<restore_t>(new restore_t(std::move(candidate)));
+}
+
+void mm_magic_t::seal_checkpoint(restore_t &restore) {
+  auto &candidate = *restore.impl;
+  checkpoint_require(candidate.destination == this &&
+      candidate.identity == checkpoint_identity &&
+      candidate.creator == std::this_thread::get_id() &&
+      !candidate.sealed && !candidate.published &&
+      candidate.generation == checkpoint_generation,
+      "foreign/consumed/sealed/stale candidate");
+  // Includes every backing byte, dummy response byte, queue and pending cursor.
+  checkpoint_require(save_checkpoint() == candidate.expected,
+                     "destination changed after preparation");
+  candidate.sealed = true;
+}
+
+void mm_magic_t::publish_sealed_checkpoint(restore_t &restore) noexcept {
+  auto &candidate = *restore.impl;
+  if (candidate.destination != this || candidate.identity != checkpoint_identity ||
+      candidate.creator != std::this_thread::get_id() || !candidate.sealed ||
+      candidate.published || candidate.generation != checkpoint_generation ||
+      checkpoint_generation == UINT64_MAX)
+    std::terminate();
+  auto &state = candidate.state;
+  static_assert(noexcept(dummy_data.swap(state.dummy)));
+  static_assert(noexcept(bresp.swap(state.writes)));
+  static_assert(noexcept(rresp.swap(state.reads)));
+  std::memcpy(data, candidate.incoming.data() + state.memory_offset, size);
+  dummy_data.swap(state.dummy);
+  bresp.swap(state.writes);
+  rresp.swap(state.reads);
+  cycle = state.cycle;
+  store_inflight = state.inflight;
+  store_addr = state.addr;
+  store_id = state.id;
+  store_size = state.size;
+  store_count = state.count;
+  ++checkpoint_generation;
+  candidate.published = true;
 }
 
 void mm_magic_t::tick(bool reset,
