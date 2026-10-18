@@ -244,6 +244,14 @@ public:
   io_checkpoint_t save_checkpoint_io();
   std::unique_ptr<io_restore_t> prepare_checkpoint_io(const io_checkpoint_t &);
   void publish_checkpoint_io(io_restore_t &);
+  // Split publication for a joint transaction: seal rechecks every destination
+  // byte and can allocate/throw, without publishing. The coordinator must hold
+  // exclusion from before sealing through publication and complete readback.
+  // No owner may change between these calls. This API acquires no such guard.
+  // Sealed publication allocates nothing; a broken lifetime/thread/single-use
+  // contract terminates rather than unwinding a partly published aggregate.
+  void seal_checkpoint_io(io_restore_t &);
+  void publish_sealed_checkpoint_io(io_restore_t &) noexcept;
 
   // A component subset, with no thread freeze or driver continuation claim.
   // Hooks reject while advance_target is suspended, even if RTL is parked.
@@ -415,6 +423,7 @@ private:
   // A retained token prevents an old candidate from accepting a new simulator
   // constructed at a recycled address.
   const std::shared_ptr<const uint8_t> io_checkpoint_identity = std::make_shared<const uint8_t>(0);
+  uint64_t io_checkpoint_generation = 0;
   std::vector<std::pair<std::string, checkpoint_owner_t *>> checkpoint_io_owners();
 
 private:

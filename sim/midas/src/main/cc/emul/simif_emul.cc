@@ -190,10 +190,12 @@ struct simif_emul_t::io_restore_t::impl_t {
   io_checkpoint_t expected;
   std::unique_ptr<mmio_t> mmio, dma;
   host_timing_t timing;
+  uint64_t generation;
+  bool sealed = false;
   bool published = false;
   explicit impl_t(simif_emul_t &destination)
       : destination(&destination), identity(destination.io_checkpoint_identity),
-        timing(destination.host_timing) {}
+        timing(destination.host_timing), generation(destination.io_checkpoint_generation) {}
 };
 
 simif_emul_t::io_restore_t::io_restore_t(std::unique_ptr<impl_t> impl)
@@ -246,19 +248,39 @@ simif_emul_t::prepare_checkpoint_io(const io_checkpoint_t &image) {
 }
 
 void simif_emul_t::publish_checkpoint_io(io_restore_t &restore) {
+  seal_checkpoint_io(restore);
+  publish_sealed_checkpoint_io(restore);
+}
+
+void simif_emul_t::seal_checkpoint_io(io_restore_t &restore) {
   auto &candidate = *restore.impl;
   if (candidate.destination != this || candidate.identity != io_checkpoint_identity ||
       candidate.creator != std::this_thread::get_id() ||
-      candidate.published)
-    throw std::runtime_error("runtime I/O checkpoint foreign/consumed candidate");
+      candidate.published || candidate.sealed ||
+      candidate.generation != io_checkpoint_generation)
+    throw std::runtime_error("runtime I/O checkpoint foreign/consumed/sealed/stale candidate");
   // This may allocate or reject a suspended/poisoned caller. It must finish
   // before the first swap. The caller retains exclusion through publication.
   if (!(save_checkpoint_io() == candidate.expected))
     throw std::runtime_error("runtime I/O checkpoint destination changed after preparation");
+  candidate.sealed = true;
+}
+
+void simif_emul_t::publish_sealed_checkpoint_io(io_restore_t &restore) noexcept {
+  auto &candidate = *restore.impl;
+  // The coordinator still holds exclusion. All parsing, allocation and full
+  // destination rechecks finished before the first aggregate owner published.
+  // A different commit invalidates even another candidate for identical bytes.
+  if (candidate.destination != this || candidate.identity != io_checkpoint_identity ||
+      candidate.creator != std::this_thread::get_id() || !candidate.sealed ||
+      candidate.published || candidate.generation != io_checkpoint_generation ||
+      io_checkpoint_generation == UINT64_MAX)
+    std::terminate();
   master->swap_checkpoint_state(*candidate.mmio);
   if (candidate.dma)
     cpu_managed_stream_io->cpu_managed_axi4.swap_checkpoint_state(*candidate.dma);
   host_timing.swap_checkpoint_state(candidate.timing);
+  ++io_checkpoint_generation;
   candidate.published = true;
 }
 
