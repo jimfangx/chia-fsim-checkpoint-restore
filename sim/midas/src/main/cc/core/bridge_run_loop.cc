@@ -130,5 +130,32 @@ void bridge_run_loop_t::validate_checkpoint(const std::vector<uint8_t> &bytes) c
 }
 void bridge_run_loop_t::load_checkpoint(const std::vector<uint8_t> &bytes) {
   const auto replacement = parse(bytes);
+  publication.changed();
   state = replacement;
+}
+
+class bridge_run_loop_t::restore_t final : public prepared_checkpoint_t {
+  bridge_run_loop_t &owner;
+  checkpoint_publication_t::guard_t guard;
+  std::vector<uint8_t> expected;
+  state_t replacement;
+public:
+  restore_t(bridge_run_loop_t &owner, const std::vector<uint8_t> &bytes)
+      : owner(owner), guard(owner.publication), expected(owner.save_checkpoint()),
+        replacement(owner.parse(bytes)) {}
+  void seal() override {
+    guard.require_unsealed();
+    if (owner.save_checkpoint() != expected)
+      throw std::runtime_error("bridge run loop destination changed after preparation");
+    guard.seal();
+  }
+  void publish() noexcept override {
+    guard.publish();
+    owner.state = replacement;
+  }
+};
+
+std::unique_ptr<prepared_checkpoint_t>
+bridge_run_loop_t::prepare_checkpoint_publication(const std::vector<uint8_t> &bytes) {
+  return std::make_unique<restore_t>(*this, bytes);
 }

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "core/checkpoint.h"
+#include "core/checkpoint_publication.h"
 
 // Maximum step size in MIDAS's master is capped to width of the simulation bus
 constexpr uint64_t MAX_MIDAS_STEP = (1LL << sizeof(uint32_t) * 8) - 1;
@@ -50,6 +51,8 @@ public:
   std::vector<uint8_t> save_checkpoint() const override;
   void validate_checkpoint(const std::vector<uint8_t> &) const override;
   void load_checkpoint(const std::vector<uint8_t> &) override;
+  std::unique_ptr<prepared_checkpoint_t>
+  prepare_checkpoint_publication(const std::vector<uint8_t> &) override;
   // Calculates the next simulation step by taking the min of all
   // tasks.next_cycle
   uint32_t get_largest_stepsize();
@@ -61,6 +64,8 @@ public:
   bool finished_scheduled_tasks() { return current_cycle == max_cycles; };
 
 private:
+  class restore_t;
+  checkpoint_publication_t publication;
   // Unless overriden, assume the simulator will run indefinitely.
   std::optional<uint64_t> max_cycles = std::nullopt;
 

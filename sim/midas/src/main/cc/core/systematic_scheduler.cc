@@ -186,7 +186,36 @@ void systematic_scheduler_t::validate_checkpoint(const std::vector<uint8_t> &byt
 
 void systematic_scheduler_t::load_checkpoint(const std::vector<uint8_t> &bytes) {
   auto state = parse_checkpoint(bytes); // All parsing/allocation precedes mutation.
+  publication.changed();
   current_cycle = state.first;
   for (size_t i = 0; i < tasks.size(); ++i)
     tasks[i].next_cycle = state.second[i];
+}
+
+class systematic_scheduler_t::restore_t final : public prepared_checkpoint_t {
+  systematic_scheduler_t &owner;
+  checkpoint_publication_t::guard_t guard;
+  std::vector<uint8_t> expected;
+  std::pair<uint64_t, std::vector<uint64_t>> replacement;
+public:
+  restore_t(systematic_scheduler_t &owner, const std::vector<uint8_t> &bytes)
+      : owner(owner), guard(owner.publication), expected(owner.save_checkpoint()),
+        replacement(owner.parse_checkpoint(bytes)) {}
+  void seal() override {
+    guard.require_unsealed(); // Check lifetime before dereferencing owner.
+    if (owner.save_checkpoint() != expected)
+      throw std::runtime_error("scheduler destination changed after preparation");
+    guard.seal();
+  }
+  void publish() noexcept override {
+    guard.publish();
+    owner.current_cycle = replacement.first;
+    for (size_t i = 0; i < replacement.second.size(); ++i)
+      owner.tasks[i].next_cycle = replacement.second[i];
+  }
+};
+
+std::unique_ptr<prepared_checkpoint_t>
+systematic_scheduler_t::prepare_checkpoint_publication(const std::vector<uint8_t> &bytes) {
+  return std::make_unique<restore_t>(*this, bytes);
 }

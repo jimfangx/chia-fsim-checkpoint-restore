@@ -3,6 +3,7 @@
 #define __BRIDGE_RUN_LOOP_H
 
 #include "core/checkpoint.h"
+#include "core/checkpoint_publication.h"
 
 // FireSim's nonblocking PeekPoke/bridge-termination loop. Unlike the FCFS
 // loop, termination is checked immediately after EACH bridge tick and stops
@@ -32,8 +33,12 @@ public:
   std::vector<uint8_t> save_checkpoint() const override;
   void validate_checkpoint(const std::vector<uint8_t> &) const override;
   void load_checkpoint(const std::vector<uint8_t> &) override;
+  std::unique_ptr<prepared_checkpoint_t>
+  prepare_checkpoint_publication(const std::vector<uint8_t> &) override;
 
 private:
+  class restore_t;
+  checkpoint_publication_t publication;
   enum class phase_t : uint64_t {
     ready, tasks, issue, poll, tick, terminate, status, finished
   };
