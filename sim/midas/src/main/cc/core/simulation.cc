@@ -316,11 +316,79 @@ void simulation_t::base_checkpoint_t::load_checkpoint(
   }
   // No timestamp, MMIO, initialization, file output or target edge on load.
   // The historical wall-clock baseline is reporting state, never target time.
+  publication.changed();
   sim.start_time = start;
   sim.start_hcycle = hcycle;
   sim.run_done = payload[payload.size() - 24];
   sim.flow_phase = flow_phase_t::running;
   sim.base_checkpoint_loaded = true;
+}
+
+std::vector<uint8_t>
+simulation_t::base_checkpoint_t::destination_stamp() const {
+  sim.flow_call.require_idle();
+  sim.require_fresh_dispatcher();
+  // A fresh flow cannot use source save: that requires a running lifecycle.
+  // Bind every base-flow field as well as the complete effective configuration
+  // and ordered widget registry. The call-state guard separately rejects an
+  // active or poisoned synchronous operation.
+  auto stamp = sim.checkpoint_configuration();
+  stamp.word(static_cast<uint64_t>(sim.flow_phase));
+  stamp.word(sim.flow_on_stack);
+  stamp.word(sim.flow_poisoned);
+  stamp.word(sim.base_checkpoint_loaded);
+  stamp.word(sim.run_done);
+  stamp.word(sim.start_time);
+  stamp.word(sim.end_time);
+  stamp.word(sim.start_hcycle.has_value());
+  stamp.word(sim.start_hcycle.value_or(0));
+  stamp.word(sim.end_hcycle.has_value());
+  stamp.word(sim.end_hcycle.value_or(0));
+  stamp.word(sim.end_tcycle);
+  return std::move(stamp.bytes);
+}
+
+class simulation_t::base_checkpoint_t::restore_t final
+    : public prepared_checkpoint_t {
+  base_checkpoint_t &owner;
+  checkpoint_publication_t::guard_t guard;
+  const std::vector<uint8_t> expected;
+  uint64_t start = 0, hcycle = 0;
+  bool done = false;
+public:
+  restore_t(base_checkpoint_t &owner, const std::vector<uint8_t> &payload)
+      : owner(owner), guard(owner.publication),
+        expected(owner.destination_stamp()) {
+    owner.validate_checkpoint(payload);
+    const size_t offset = payload.size() - 16;
+    for (unsigned i = 0; i < 8; ++i) {
+      start |= uint64_t(payload[offset + i]) << (8 * i);
+      hcycle |= uint64_t(payload[offset + 8 + i]) << (8 * i);
+    }
+    done = payload[payload.size() - 24];
+  }
+  void seal() override {
+    guard.require_unsealed(); // Check lifetime/thread/generation before owner access.
+    if (owner.destination_stamp() != expected)
+      throw std::runtime_error("simulation lifecycle checkpoint destination changed");
+    guard.seal();
+  }
+  void publish() noexcept override {
+    guard.publish();
+    // Scalars and a trivial optional only. No init/reset, timestamp, MMIO,
+    // output, concrete-driver service or potentially allocating legacy load.
+    owner.sim.start_time = start;
+    owner.sim.start_hcycle = hcycle;
+    owner.sim.run_done = done;
+    owner.sim.flow_phase = flow_phase_t::running;
+    owner.sim.base_checkpoint_loaded = true;
+  }
+};
+
+std::unique_ptr<prepared_checkpoint_t>
+simulation_t::base_checkpoint_t::prepare_checkpoint_publication(
+    const std::vector<uint8_t> &payload) {
+  return std::make_unique<restore_t>(*this, payload);
 }
 
 void simulation_t::wait_for_init() {

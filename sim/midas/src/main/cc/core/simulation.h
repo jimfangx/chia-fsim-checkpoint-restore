@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "core/checkpoint.h"
+#include "core/checkpoint_publication.h"
 #include "core/timing.h"
 #include "core/widget_checkpoint.h"
 #include <utility>
@@ -136,9 +137,14 @@ private:
     std::vector<uint8_t> save_checkpoint() const override;
     void validate_checkpoint(const std::vector<uint8_t> &) const override;
     void load_checkpoint(const std::vector<uint8_t> &) override;
+    std::unique_ptr<prepared_checkpoint_t>
+    prepare_checkpoint_publication(const std::vector<uint8_t> &) override;
 
   private:
+    std::vector<uint8_t> destination_stamp() const;
+    class restore_t;
     simulation_t &sim;
+    checkpoint_publication_t publication;
   };
   widget_checkpoint_config_t checkpoint_configuration() const;
   void require_checkpoint_boundary() const;
