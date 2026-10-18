@@ -3,6 +3,7 @@
 
 #include "core/bridge_driver.h"
 #include "core/widget_checkpoint.h"
+#include "core/checkpoint_publication.h"
 
 #include <fstream>
 
@@ -17,7 +18,7 @@ class clockmodule_t;
 // docs/Advanced-Usage/Debugging-and-Profiling-on-FPGA/Debugging-Hanging-Simulators.rst
 // for expanded discussion.
 
-class heartbeat_t : public bridge_driver_t {
+class heartbeat_t final : public bridge_driver_t {
 public:
   /// The identifier for the bridge type used for casts.
   static char KIND;
@@ -37,8 +38,12 @@ public:
   std::vector<uint8_t> save_checkpoint() const override;
   void validate_checkpoint(const std::vector<uint8_t> &) const override;
   void load_checkpoint(const std::vector<uint8_t> &) override;
+  std::unique_ptr<prepared_checkpoint_t>
+  prepare_checkpoint_publication(const std::vector<uint8_t> &) override;
 
 private:
+  class restore_t;
+  checkpoint_publication_t publication;
   clockmodule_t &clock;
   std::ofstream log;
   time_t start_time;

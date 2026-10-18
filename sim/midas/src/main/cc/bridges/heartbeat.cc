@@ -168,9 +168,42 @@ void heartbeat_t::validate_checkpoint(const std::vector<uint8_t> &b) const {
 
 void heartbeat_t::load_checkpoint(const std::vector<uint8_t> &b) {
   auto d = decode_checkpoint(b); // Parse/allocate everything before mutation.
+  publication.changed();
   samples.swap(d.samples);
   start_time = d.start_time;
   has_timed_out = d.timed_out;
   trip_count = d.trip_count;
   last_cycle = d.last_cycle;
+}
+
+// Returned-call host ownership only. Clock hardware/transport and process
+// exclusion remain separate owners. No wall-clock sample or output on restore.
+class heartbeat_t::restore_t final : public prepared_checkpoint_t {
+  heartbeat_t &owner;
+  checkpoint_publication_t::guard_t guard;
+  const std::vector<uint8_t> expected;
+  decoded_checkpoint_t replacement;
+public:
+  restore_t(heartbeat_t &owner, const std::vector<uint8_t> &payload)
+      : owner(owner), guard(owner.publication), expected(owner.save_checkpoint()),
+        replacement(owner.decode_checkpoint(payload)) {}
+  void seal() override {
+    guard.require_unsealed(); // Lifetime/thread/generation before owner access.
+    if (owner.save_checkpoint() != expected)
+      throw std::runtime_error("heartbeat checkpoint destination changed");
+    guard.seal();
+  }
+  void publish() noexcept override {
+    guard.publish();
+    owner.samples.swap(replacement.samples);
+    owner.start_time = replacement.start_time;
+    owner.has_timed_out = replacement.timed_out;
+    owner.trip_count = replacement.trip_count;
+    owner.last_cycle = replacement.last_cycle;
+  }
+};
+
+std::unique_ptr<prepared_checkpoint_t>
+heartbeat_t::prepare_checkpoint_publication(const std::vector<uint8_t> &payload) {
+  return std::make_unique<restore_t>(*this, payload);
 }
