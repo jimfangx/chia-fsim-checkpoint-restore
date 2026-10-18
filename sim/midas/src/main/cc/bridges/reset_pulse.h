@@ -10,6 +10,7 @@ struct RESETPULSEBRIDGEMODULE_struct {
 
 #include "core/bridge_driver.h"
 #include "core/widget_checkpoint.h"
+#include "core/configuration_checkpoint.h"
 
 class reset_pulse_t final : public bridge_driver_t {
 public:
@@ -23,6 +24,11 @@ public:
   }
   void load_checkpoint(const std::vector<uint8_t> &payload) override {
     validate_checkpoint(payload);
+    checkpoint_publication.changed();
+  }
+  std::unique_ptr<prepared_checkpoint_t> prepare_checkpoint_publication(
+      const std::vector<uint8_t> &payload) override {
+    return std::make_unique<configuration_checkpoint_t>(*this, checkpoint_publication, payload);
   }
 
   /// The identifier for the bridge type used for casts.
@@ -41,6 +47,7 @@ public:
   unsigned get_max_pulse_length() const { return max_pulse_length; }
 
 private:
+  checkpoint_publication_t checkpoint_publication;
   widget_checkpoint_state_t checkpoint_state;
   widget_checkpoint_config_t checkpoint_configuration() const;
   const RESETPULSEBRIDGEMODULE_struct mmio_addrs;

@@ -12,6 +12,7 @@
 #include "core/config.h"
 #include "core/widget.h"
 #include "core/widget_checkpoint.h"
+#include "core/configuration_checkpoint.h"
 
 class simif_t;
 
@@ -39,6 +40,11 @@ public:
   }
   void load_checkpoint(const std::vector<uint8_t> &payload) override {
     validate_checkpoint(payload);
+    checkpoint_publication.changed();
+  }
+  std::unique_ptr<prepared_checkpoint_t> prepare_checkpoint_publication(
+      const std::vector<uint8_t> &payload) override {
+    return std::make_unique<configuration_checkpoint_t>(*this, checkpoint_publication, payload);
   }
 
   /// The identifier for the bridge type.
@@ -64,6 +70,7 @@ public:
   unsigned get_mem_data_chunk() const { return mem_data_chunk; }
 
 private:
+  checkpoint_publication_t checkpoint_publication;
   widget_checkpoint_state_t checkpoint_state;
   widget_checkpoint_config_t checkpoint_configuration() const;
   void write_mem_impl(size_t addr, mpz_t &value);
