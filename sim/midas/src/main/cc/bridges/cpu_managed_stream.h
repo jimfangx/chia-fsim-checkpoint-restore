@@ -7,6 +7,7 @@
 #include <string>
 
 #include "core/stream_engine.h"
+#include "core/checkpoint_publication.h"
 
 class simif_t;
 
@@ -179,8 +180,12 @@ public:
   std::vector<uint8_t> save_checkpoint() const override;
   void validate_checkpoint(const std::vector<uint8_t> &) const override;
   void load_checkpoint(const std::vector<uint8_t> &) override;
+  std::unique_ptr<prepared_checkpoint_t>
+  prepare_checkpoint_publication(const std::vector<uint8_t> &) override;
 
 private:
+  class restore_t;
+  checkpoint_publication_t publication;
   // CPU-managed drivers keep no host queue/read offset. Hardware queues and
   // the AXI transport are separate owners, never omitted by this adapter.
   const widget_checkpoint_config_t checkpoint_config;

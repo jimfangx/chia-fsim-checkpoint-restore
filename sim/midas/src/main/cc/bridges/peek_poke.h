@@ -8,6 +8,7 @@
 
 #include "core/simif.h"
 #include "core/widget_checkpoint.h"
+#include "core/checkpoint_publication.h"
 #include "core/timing.h"
 
 struct PEEKPOKEBRIDGEMODULE_struct {
@@ -37,9 +38,12 @@ public:
   }
   void load_checkpoint(const std::vector<uint8_t> &payload) override {
     const auto flags = checkpoint_state.validate(payload, checkpoint_configuration(), 3);
+    publication.changed();
     req_unstable = flags & 1;
     req_timeout = flags & 2;
   }
+  std::unique_ptr<prepared_checkpoint_t>
+  prepare_checkpoint_publication(const std::vector<uint8_t> &) override;
 
   /// The identifier for the bridge type.
   static char KIND;
@@ -87,6 +91,8 @@ public:
   void step(size_t n, bool blocking);
 
 private:
+  class restore_t;
+  checkpoint_publication_t publication;
   widget_checkpoint_state_t checkpoint_state;
   widget_checkpoint_config_t checkpoint_configuration() const;
   /// Base MMIO port mapping.

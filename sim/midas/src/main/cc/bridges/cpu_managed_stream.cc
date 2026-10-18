@@ -37,7 +37,9 @@ void CPUManagedStreamWidget::validate_checkpoint(
 
 void CPUManagedStreamWidget::load_checkpoint(const std::vector<uint8_t> &payload) {
   // Full validation precedes mutation; hooks perform no MMIO/DMA/init calls.
-  initialized = checkpoint_state.validate(payload, checkpoint_config, 1);
+  const auto flags = checkpoint_state.validate(payload, checkpoint_config, 1);
+  publication.changed();
+  initialized = flags;
 }
 
 /**
@@ -147,4 +149,32 @@ CPUManagedStreamWidget::CPUManagedStreamWidget(
         std::make_unique<CPUManagedStreams::FPGAToCPUDriver>(std::move(params),
                                                              io));
   }
+}
+
+// Returned-call host state only. Generated queues, MMIO/DMA and caller buffers
+// remain separate owners. The coordinator retains exclusion through readback.
+class CPUManagedStreamWidget::restore_t final : public prepared_checkpoint_t {
+  CPUManagedStreamWidget &owner;
+  checkpoint_publication_t::guard_t guard;
+  const std::vector<uint8_t> expected;
+  const uint64_t replacement;
+public:
+  restore_t(CPUManagedStreamWidget &owner, const std::vector<uint8_t> &payload)
+      : owner(owner), guard(owner.publication), expected(owner.save_checkpoint()),
+        replacement(owner.checkpoint_state.validate(payload, owner.checkpoint_config, 1)) {}
+  void seal() override {
+    guard.require_unsealed(); // Check lifetime/thread/generation before owner access.
+    if (owner.save_checkpoint() != expected)
+      throw std::runtime_error("cpu_managed_stream checkpoint destination changed");
+    guard.seal();
+  }
+  void publish() noexcept override {
+    guard.publish();
+    owner.initialized = replacement;
+  }
+};
+
+std::unique_ptr<prepared_checkpoint_t>
+CPUManagedStreamWidget::prepare_checkpoint_publication(const std::vector<uint8_t> &payload) {
+  return std::make_unique<restore_t>(*this, payload);
 }
