@@ -19,7 +19,7 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     throw new IllegalArgumentException(s"Generated checkpoint bank unsupported: $why")
   private def supported(a: Annotation): Boolean = a match {
     case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: firrtl.transforms.CombinationalPath => true
-    case MemorySynthInit | MemoryNoSynthInit => true
+    case MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation => true
     case _ => false
   }
   def preflight(state: CircuitState): Unit = {
@@ -31,7 +31,7 @@ private[checkpoint] object GeneratedStateBankAnnotations {
   }
   def annotationJSON(annotations: Seq[Annotation]): String = JsonProtocol.serialize(annotations.filter {
     case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation => true
-    case MemorySynthInit | MemoryNoSynthInit => true
+    case MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation => true
     case _ => false
   }.distinct.sortBy(_.serialize))
   def translatedHash(state: CircuitState): String = SemanticStateInventory.sha256(annotationJSON(state.annotations))
@@ -73,9 +73,9 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     }
     val initTargets = mutable.Set.empty[ReferenceTarget]
     val mappings = mutable.ArrayBuffer.empty[JValue]
-    val translated = state.annotations.flatMap {
+    val requested = state.annotations.flatMap {
       case _: firrtl.transforms.CombinationalPath => Nil // Invalidated path cache, recomputed by Compiler.
-      case a @ (MemorySynthInit | MemoryNoSynthInit) => Seq(a)
+      case a @ (MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation) => Seq(a)
       case a: DontTouchAnnotation =>
         val copies = targets(a.target, false).map(t => a.copy(target = t))
         mappings += JObject(List("source" -> JString(a.serialize),
@@ -91,6 +91,10 @@ private[checkpoint] object GeneratedStateBankAnnotations {
         copies
       case a => fail(s"annotation has no translation contract: ${a.getClass.getName}")
     }
+    // Instance-specialized bank wiring is authoritative. Prevent the resolver
+    // from merging even stateless repeated helpers and returning stale clone
+    // targets or an unowned DedupedResult side channel.
+    val translated = (requested :+ firrtl.transforms.NoCircuitDedupAnnotation).distinct
     val provenance = JObject(List("translation_version" -> JInt(1),
       "source_sha256" -> JString(SemanticStateInventory.sha256(annotationJSON(state.annotations))),
       "translated_sha256" -> JString(SemanticStateInventory.sha256(annotationJSON(translated))),

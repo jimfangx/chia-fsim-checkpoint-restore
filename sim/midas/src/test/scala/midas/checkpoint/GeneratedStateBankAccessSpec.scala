@@ -123,16 +123,24 @@ class GeneratedStateBankAccessSpec extends AnyFlatSpec {
     intercept[IllegalArgumentException](generate(clocks))
   }
 
-  it should "reject side effects that have no frozen-owner contract" in {
+  it should "freeze direct-clock effects and reject effects without a synchronous cut contract" in {
     for (effect <- Seq("printf(clock, wen, \"side effect %d\", data)",
                         "stop(clock, wen, 1)",
                         "assert(clock, UInt<1>(1), wen, \"side effect assertion\")")) {
       val effects = source.replace("    result <= dut.ram", s"    $effect\n    result <= dut.ram")
-      assert(intercept[IllegalArgumentException](generate(effects)).getMessage.contains("ungated side effect"))
+      val result = generate(effects)
+      assert(result.state.circuit.serialize.contains("and(wen, not(ckpt_freeze))"))
+      val derived = effects.replace(effect, effect.replace("(clock,", "(asClock(asUInt(wen)),"))
+      intercept[IllegalArgumentException](generate(derived))
     }
     val analog = source.replace("  module Harness :\n    input clock : Clock",
       "  module Harness :\n    input clock : Clock\n    input analogPin : Analog<1>")
     assert(intercept[IllegalArgumentException](generate(analog)).getMessage.contains("analog attachment"))
+  }
+
+  it should "reject independently driven child clocks including single-clock roots" in {
+    val derived = source.replace("dut.clock <= clock", "dut.clock <= asClock(asUInt(wen))")
+    intercept[IllegalArgumentException](generate(derived))
   }
 
   it should "reject reserved names and derived clocks without returning partial hardware" in {

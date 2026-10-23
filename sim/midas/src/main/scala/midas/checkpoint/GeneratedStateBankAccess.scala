@@ -179,18 +179,33 @@ object GeneratedStateBankAccess {
       }
       def logicalPath(name: String): String = s"$path.${pipelineNames.getOrElse(name, name)}"
       val all = stmts(m.body)
-      // Non-storage effects require their own cut contract. Leaving a printf,
-      // stop/assertion, or analog attachment active would repeat or externally
-      // advance effects while the original storage is frozen.
-      if (m.ports.exists(_.tpe.isInstanceOf[AnalogType]) || all.exists {
-        case _: Print | _: Stop | _: Verification | _: Attach => true
-        case _ => false
-      }) fail(s"ungated side effect/analog attachment at $path")
+      // Clocked effects share the storage cut. Analog connections have no
+      // such synchronous contract and must still reject before emission.
+      if (m.ports.exists(_.tpe.isInstanceOf[AnalogType]) || all.exists(_.isInstanceOf[Attach]))
+        fail(s"analog attachment at $path")
       if ((m.ports.map(_.name) ++ all.collect { case d: IsDeclaration => d.name }).exists(_.startsWith("ckpt_")))
         fail(s"reserved ckpt_ identifier at $path")
       val clocks = m.ports.filter(_.tpe == ClockType)
-      if (clocks.size != 1 || clocks.head.direction != Input) fail(s"one direct input clock required at $path")
-      val clock = clocks.head.name
+      val hasLocalClockedState = all.exists {
+        case _: DefRegister | _: DefMemory | _: Print | _: Stop | _: Verification => true
+        case _ => false
+      }
+      if (clocks.size > 1 || clocks.exists(_.direction != Input) ||
+          ((isRoot || hasLocalClockedState) && clocks.isEmpty))
+        fail(s"one direct input clock required at $path")
+      // Clockless helpers may route the combinational bank network. They must
+      // not hide sequential children; child clock connections are checked below.
+      val clock = clocks.headOption.map(_.name).getOrElse("")
+      all.foreach {
+        case p: Print => checkEffect(p.clk, p.en)
+        case s: Stop => checkEffect(s.clk, s.en)
+        case v: Verification => checkEffect(v.clk, v.en)
+        case _ => ()
+      }
+      def checkEffect(clk: Expression, en: Expression): Unit = {
+        if (clk.serialize != clock || en.tpe != UIntType(IntWidth(1)))
+          fail(s"derived clock or unresolved clocked effect at $path")
+      }
       val regs = all.collect { case r: DefRegister => r.name -> r }.toMap
       val mems = all.collect { case mem: DefMemory => mem.name -> mem }.toMap
       regs.values.foreach { r =>
@@ -209,6 +224,14 @@ object GeneratedStateBankAccess {
       val nextName = if (isRoot) root else fresh()
       clones += GeneratedStateBankAnnotations.Clone(moduleName, path, nextName, m)
       val childInstances = all.collect { case i: WDefInstance => i }
+      val drivers = all.collect { case c: Connect => c.loc.serialize -> c.expr }.toMap
+      childInstances.foreach { i =>
+        modules(i.module).ports.filter(_.tpe == ClockType).foreach { port =>
+          if (port.direction != Input || clock.isEmpty ||
+              !drivers.get(s"${i.name}.${port.name}").exists(_.serialize == clock))
+            fail(s"derived or independent child clock at $path.${i.name}.${port.name}")
+        }
+      }
       val children = childInstances.map(i => i.name -> build(i.module, s"$path.${i.name}",
         s"$emittedPath.${i.name}", false)).toMap
       val readers = mutable.ArrayBuffer.empty[(String, String)]
@@ -238,7 +261,13 @@ object GeneratedStateBankAccess {
           (if (chunked) List("chunks" -> JInt(chunks), "transfer_width" -> JInt(e.width),
             "transfer_depth" -> JInt(e.depth)) else Nil))
       }
+      def liveEnable(en: Expression): Expression = DoPrim(firrtl.PrimOps.And, Seq(en,
+        DoPrim(firrtl.PrimOps.Not, Seq(firrtl.WRef("ckpt_freeze", UIntType(IntWidth(1)))), Nil,
+          UIntType(IntWidth(1)))), Nil, UIntType(IntWidth(1)))
       def rewrite(s: Statement): Statement = s match {
+        case p: Print => p.copy(en = liveEnable(p.en))
+        case s: Stop => s.copy(en = liveEnable(s.en))
+        case v: Verification => v.copy(en = liveEnable(v.en))
         case r: DefRegister => r.copy(reset = UIntLiteral(0, IntWidth(1)), init = firrtl.WRef(r.name, r.tpe))
         case mem: DefMemory => mem.copy(readers = mem.readers :+ "ckpt_read")
         case i: WDefInstance => i.copy(module = children(i.name))
