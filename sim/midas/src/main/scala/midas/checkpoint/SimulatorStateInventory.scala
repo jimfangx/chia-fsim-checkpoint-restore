@@ -40,6 +40,7 @@ object SimulatorStateInventory {
   )
 
   def discover(state: CircuitState, rootModule: String = ""): String = {
+    GeneratedSynthesisConstantAdapter.validate(state, instrumented = false)
     val circuit = state.circuit
     val modules = circuit.modules.map(m => m.name -> m).toMap
     if (modules.size != circuit.modules.size) fail("duplicate module definitions")
@@ -114,6 +115,15 @@ object SimulatorStateInventory {
             bufgceModelSHA256
           } else fail(s"opaque external module $name at $path; no exact state adapter")
         case m: Module =>
+          state.annotations.collectFirst {
+            case a: SynthesisPlusArgConstantAnnotation if a.target.module == m.name => a
+          }.foreach { a =>
+            externalAdapter = List("external_adapter" -> JObject(List(
+              "adapter" -> JString("fpga-synthesis-plusarg-constant-v1"),
+              "source_sha256" -> JString(a.sourceSHA256),
+              "original_circuit_sha256" -> JString(a.originalCircuitSHA256),
+              "width" -> JInt(a.width), "default" -> JInt(a.default), "format" -> JString(a.format))))
+          }
           def visit(s: Statement): Unit = {
             s match {
               case r: DefRegister =>

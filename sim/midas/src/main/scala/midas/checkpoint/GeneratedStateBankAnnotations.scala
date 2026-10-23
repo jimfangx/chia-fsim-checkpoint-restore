@@ -18,11 +18,13 @@ private[checkpoint] object GeneratedStateBankAnnotations {
   private def fail(why: String): Nothing =
     throw new IllegalArgumentException(s"Generated checkpoint bank unsupported: $why")
   private def supported(a: Annotation): Boolean = a match {
-    case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: firrtl.transforms.CombinationalPath => true
+    case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: firrtl.transforms.CombinationalPath |
+         _: SynthesisPlusArgConstantAnnotation => true
     case MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation => true
     case _ => false
   }
   def preflight(state: CircuitState): Unit = {
+    GeneratedSynthesisConstantAdapter.validate(state, instrumented = true)
     val unsupported = state.annotations.filterNot(supported)
     if (unsupported.nonEmpty) fail("input annotations require explicit clone/rename translation: " +
       unsupported.map(_.getClass.getName).distinct.mkString(", "))
@@ -30,7 +32,7 @@ private[checkpoint] object GeneratedStateBankAnnotations {
       fail("conflicting memory synthesis initialization policies")
   }
   def annotationJSON(annotations: Seq[Annotation]): String = JsonProtocol.serialize(annotations.filter {
-    case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation => true
+    case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: SynthesisPlusArgConstantAnnotation => true
     case MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation => true
     case _ => false
   }.distinct.sortBy(_.serialize))
@@ -78,6 +80,14 @@ private[checkpoint] object GeneratedStateBankAnnotations {
       case a @ (MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation) => Seq(a)
       case a: DontTouchAnnotation =>
         val copies = targets(a.target, false).map(t => a.copy(target = t))
+        mappings += JObject(List("source" -> JString(a.serialize),
+          "targets" -> JArray(copies.map(c => JString(c.target.serialize)).toList)))
+        copies
+      case a: SynthesisPlusArgConstantAnnotation =>
+        if (a.target.circuit != state.circuit.main) fail(s"foreign synthesis constant: ${a.target.serialize}")
+        val copies = clones.filter(_.originalModule == a.target.module).map(c =>
+          a.copy(target = firrtl.annotations.ModuleTarget(state.circuit.main, c.module)))
+        if (copies.isEmpty) fail(s"unreachable synthesis constant: ${a.target.serialize}")
         mappings += JObject(List("source" -> JString(a.serialize),
           "targets" -> JArray(copies.map(c => JString(c.target.serialize)).toList)))
         copies
