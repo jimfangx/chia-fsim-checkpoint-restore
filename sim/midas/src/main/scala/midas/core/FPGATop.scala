@@ -148,6 +148,17 @@ class FPGATop(implicit p: Parameters) extends LazyModule with HasWidgets {
   val bridgeModuleMap: ListMap[BridgeIOAnnotation, BridgeModule[_ <: Record with HasChannels]] =
     ListMap((bridgeAnnos.map(anno => anno -> addWidget(BridgeIOAnnotationToElaboration(anno)))): _*)
 
+  // Allocate after target bridges, preserving their existing stream indices.
+  // Production top-level registration requires immutable generated descriptors;
+  // the external descriptor interface remains a standalone component facility.
+  val checkpointCaptureBinding = p(CheckpointCaptureTopKey)
+  val checkpointCapture = checkpointCaptureBinding.map { binding =>
+    val cfg = binding.params
+    require(cfg.descriptors.nonEmpty,
+      "FPGATop checkpoint capture requires a generated manifest-bound descriptor ROM")
+    addWidget(new CheckpointCaptureWidget(cfg))
+  }
+
   // Find all bridges that wish to be allocated FPGA DRAM, and group them
   // according to their memoryRegionName. Requested addresses will be unified
   // across a region allowing:
@@ -290,7 +301,8 @@ class FPGATop(implicit p: Parameters) extends LazyModule with HasWidgets {
 
   val bridgesWithToHostCPUStreams = bridgeModuleMap.values
     .collect { case b: StreamToHostCPU => b }
-  val hasToHostStreams            = bridgesWithToHostCPUStreams.nonEmpty
+  val widgetsWithToHostCPUStreams = bridgesWithToHostCPUStreams.toSeq ++ checkpointCapture.toSeq
+  val hasToHostStreams            = widgetsWithToHostCPUStreams.nonEmpty
 
   val bridgesWithFromHostCPUStreams = bridgeModuleMap.values
     .collect { case b: StreamFromHostCPU => b }
@@ -318,7 +330,7 @@ class FPGATop(implicit p: Parameters) extends LazyModule with HasWidgets {
     println((header +: summaries).mkString("\n  "))
   }
 
-  val toCPUStreamParams   = bridgesWithToHostCPUStreams.map { _.streamSourceParams }
+  val toCPUStreamParams   = widgetsWithToHostCPUStreams.map { _.streamSourceParams }
   val fromCPUStreamParams = bridgesWithFromHostCPUStreams.map { _.streamSinkParams }
 
   val toQSFPStreamParams   = bridgesWithToQSFPStreams.map { _.streamSourceParams }
@@ -554,6 +566,10 @@ class FPGATopImp(outer: FPGATop)(implicit p: Parameters) extends LazyModuleImp(o
     }
   })
 
+  outer.checkpointCaptureBinding.zip(outer.checkpointCapture).foreach { case (binding, widget) =>
+    binding.connect(this, widget.capturePort.getWrappedValue)
+  }
+
   outer.printStreamSummary(outer.toCPUStreamParams, "Bridge Streams To CPU:")
   outer.printStreamSummary(outer.fromCPUStreamParams, "Bridge Streams From CPU:")
   outer.printStreamSummary(outer.toQSFPStreamParams, "Bridge Streams To QSFP")
@@ -608,7 +624,9 @@ class FPGATopImp(outer: FPGATop)(implicit p: Parameters) extends LazyModuleImp(o
   // Connect CPU bridges to CPU stream
   outer.streamingEngine.map { streamingEngine =>
     val toHost = streamingEngine.streamsToHostCPU
-    for (((sink, src), idx) <- toHost.zip(outer.bridgesWithToHostCPUStreams).zipWithIndex) {
+    require(toHost.size == outer.widgetsWithToHostCPUStreams.size,
+      "Global and bridge to-host streams must all have a stream-engine endpoint")
+    for (((sink, src), idx) <- toHost.zip(outer.widgetsWithToHostCPUStreams).zipWithIndex) {
       val allocatedIdx = src.toHostStreamIdx
       require(
         allocatedIdx == idx,

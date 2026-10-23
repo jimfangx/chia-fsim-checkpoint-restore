@@ -5,6 +5,7 @@ import chisel3._
 import chisel3.util._
 import chisel3.util.HasBlackBoxResource
 import org.chipsalliance.cde.config.Parameters
+import freechips.rocketchip.diplomacy.InModuleBody
 import firesim.lib.nasti._
 
 /** Public byte offsets shared with the host driver. The transport is not a target bridge:
@@ -220,11 +221,17 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
     extends Widget with StreamToHostCPU {
   override val customSize = Some(BigInt(256))
   val toHostCPUQueueDepth = cfg.queueDepth
+  // Like streamEnq, this port must be accessible from the containing module
+  // without relying on an anonymous WidgetImp structural refinement.
+  val capturePort = InModuleBody {
+    val capture = IO(new CheckpointCaptureSideband(cfg.ownerNames.size))
+    capture
+  }
   lazy val module = new WidgetImp(this) {
     val io = IO(new WidgetIO)
     // Exposes descriptor/bank/owners/freeze, never a target-token port. MMIO and
     // stream members are wired internally below rather than left as top ports.
-    val capture = IO(new CheckpointCaptureSideband(cfg.ownerNames.size))
+    val capture = capturePort.getWrappedValue
     val transport = Module(new CheckpointCaptureTransportBlackBox(cfg))
     val adapter = Module(new CheckpointNastiAdapter(p(CtrlNastiKey)))
     adapter.io.ctrl <> io.ctrl
