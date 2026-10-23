@@ -22,6 +22,13 @@ import org.json4s.native.JsonMethods.parse
   */
 object GeneratedStateBankAccess {
   case class Result(state: CircuitState, entries: Seq[StateAccessEntry], binding: String)
+  def validateAnnotationBinding(result: Result): Unit = {
+    GeneratedStateBankAnnotations.preflight(result.state)
+    val binding = parse(result.binding) \ "annotation_translation"
+    require((binding \ "translation_version") == JInt(1) &&
+      (binding \ "translated_sha256") == JString(GeneratedStateBankAnnotations.translatedHash(result.state)),
+      "checkpoint descriptors: missing or altered translated annotations")
+  }
   private def fail(message: String): Nothing =
     throw new IllegalArgumentException(s"Generated checkpoint bank unsupported: $message")
   private def stmts(s: Statement): Seq[Statement] = {
@@ -119,13 +126,7 @@ object GeneratedStateBankAccess {
   def generate(input: CircuitState, manifest: String,
                bindings: Option[Seq[StateAccessEntry]] = None): Result = {
     if (input.form != LowForm) fail("resolved LowForm required")
-    // Specialization invalidates module targets. CombinationalPath is the
-    // compiler's derived path cache; the Compiler below recomputes it for the
-    // specialized hierarchy. Every other annotation needs explicit translation,
-    // especially memory initialization, preservation and clock metadata.
-    val unsupportedAnnotations = input.annotations.filterNot(_.isInstanceOf[firrtl.transforms.CombinationalPath])
-    if (unsupportedAnnotations.nonEmpty) fail("input annotations require explicit clone/rename translation: " +
-      unsupportedAnnotations.map(_.getClass.getName).distinct.mkString(", "))
+    GeneratedStateBankAnnotations.preflight(input)
     val doc = parse(manifest)
     val root = input.circuit.main
     val actual = (doc \ "manifest_type") match {
@@ -154,6 +155,7 @@ object GeneratedStateBankAccess {
     val byPath = rows.zip(entries).map { case (r, e) => str(r, "hierarchy") -> e }.toMap
     val modules = input.circuit.modules.map(m => m.name -> m).toMap
     val generated = mutable.ArrayBuffer.empty[Module]
+    val clones = mutable.ArrayBuffer.empty[GeneratedStateBankAnnotations.Clone]
     val storage = mutable.ArrayBuffer.empty[JValue]
     val covered = mutable.Set.empty[String]
     val seenNames = mutable.Set.empty[String] ++ modules.keys
@@ -198,6 +200,7 @@ object GeneratedStateBankAccess {
           fail(s"derived memory port clock at $path.${mem.name}")
       }
       val nextName = if (isRoot) root else fresh()
+      clones += GeneratedStateBankAnnotations.Clone(moduleName, path, nextName, m)
       val childInstances = all.collect { case i: WDefInstance => i }
       val children = childInstances.map(i => i.name -> build(i.module, s"$path.${i.name}",
         s"$emittedPath.${i.name}", false)).toMap
@@ -272,14 +275,16 @@ ckpt_resp_error <= ckpt_saved_error""")
     // Re-resolve instance signatures and types after adding ports; compilation
     // preserves the specialized module boundaries and lowers synchronous reset.
     val circuit = input.circuit.copy(modules = generated.toSeq)
+    val (translated, annotationBinding) = GeneratedStateBankAnnotations.translate(input, clones.toSeq)
     val resolved = new Compiler(Forms.LowForm).execute(
-      CircuitState(Parser.parse(circuit.serialize), firrtl.ChirrtlForm)).copy(form = LowForm)
+      CircuitState(Parser.parse(circuit.serialize), firrtl.ChirrtlForm, translated)).copy(form = LowForm)
     val binding = SemanticStateInventory.canonical(JObject(List(
       "access_version" -> JInt(1), "protocol" -> JString("latched-banked64-v1"),
       "manifest_sha256" -> JString(SemanticStateInventory.sha256(actual)),
       "reference_sha256" -> JString(SemanticStateInventory.sha256(input.circuit.serialize)),
       "instrumented_sha256" -> JString(SemanticStateInventory.sha256(resolved.circuit.serialize)),
       "scope" -> JString("all_reachable_firrtl_state_only"),
+      "annotation_translation" -> annotationBinding,
       "state" -> JArray(storage.sortBy(e => (e \ "state_id").values.toString).toList))))
     Result(resolved, entries, binding)
   }

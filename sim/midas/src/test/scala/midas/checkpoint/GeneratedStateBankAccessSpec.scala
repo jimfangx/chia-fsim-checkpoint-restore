@@ -102,13 +102,18 @@ class GeneratedStateBankAccessSpec extends AnyFlatSpec {
     assert(intercept[IllegalArgumentException](generate(wide)).getMessage.contains("chunking"))
   }
 
-  it should "reject annotation loss and independently clocked children before generating hardware" in {
+  it should "translate initialization and reject unknown annotations and independently clocked children" in {
     val state = lower(source)
     val manifest = SemanticStateInventory.discover(state, state.circuit.main)
     val target = firrtl.annotations.ReferenceTarget("Harness", "InventoryDUT", Nil, "sram", Nil)
     val initialized = state.copy(annotations = Seq(
       firrtl.annotations.MemoryFileInlineAnnotation(target, "fixture-state.hex")))
-    assert(intercept[IllegalArgumentException](GeneratedStateBankAccess.generate(initialized, manifest))
+    val result = GeneratedStateBankAccess.generate(initialized, manifest)
+    val annotations = result.state.annotations.collect { case a: firrtl.annotations.MemoryFileInlineAnnotation => a }
+    assert(annotations.size == 1 && annotations.head.target.module != target.module)
+    assert(annotations.head.filename == "fixture-state.hex")
+    val unknown = state.copy(annotations = Seq(firrtl.options.TargetDirAnnotation("unknown-output")))
+    assert(intercept[IllegalArgumentException](GeneratedStateBankAccess.generate(unknown, manifest))
       .getMessage.contains("annotations require explicit clone/rename translation"))
     val clocks = source.replace("  module Harness :\n    input clock : Clock",
       "  module Harness :\n    input clock : Clock\n    input otherClock : Clock")

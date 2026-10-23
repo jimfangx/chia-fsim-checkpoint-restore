@@ -23,6 +23,7 @@ final class CheckpointCaptureDescriptors private (
 
 object CheckpointCaptureDescriptors {
   def fromGenerated(result: GeneratedStateBankAccess.Result, manifest: String): CheckpointCaptureDescriptors = {
+    GeneratedStateBankAccess.validateAnnotationBinding(result)
     def check(ok: Boolean, why: String): Unit = require(ok, s"checkpoint descriptors: $why")
     val doc = parse(manifest)
     val binding = parse(result.binding)
