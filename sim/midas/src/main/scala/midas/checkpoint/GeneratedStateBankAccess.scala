@@ -22,9 +22,9 @@ import org.json4s.native.JsonMethods.parse
   * endpoint. Functional storage retains its original clocks. The caller must
   * establish and hold the global freeze before access and keep it asserted
   * until all responses drain; this option supplies no clock-domain handshake.
-  * Multiple direct functional input clocks are supported only with that
-  * separate endpoint. Every child clock must trace to a named root input;
-  * derived/gated clocks and opaque clock owners still require an adapter.
+  * Multiple functional input clocks are supported only with that separate
+  * endpoint. Transparent clock routing through concrete hierarchy is resolved
+  * to named root inputs; derived/gated clocks and opaque owners still reject.
   * This is not an all-owner simulator cut or a FireSim bridge integration.
   */
 object GeneratedStateBankAccess {
@@ -59,43 +59,99 @@ object GeneratedStateBankAccess {
     visit(s); out.toSeq
   }
 
-  /** Independently reconstruct provenance from actual instance clock wiring.
-    * The transport clock is deliberately absent from the functional owners.
-    * This is a wiring contract, not a CDC or atomic-cut acknowledgement.
+  /** Resolve transparent hierarchy in the defining scope. Never use a register's
+    * next-state driver as an alias, or assume an opaque output is a clock wire.
+    * Lazy per-pin resolution permits acyclic sibling forwarding even when the
+    * forwarding module's unrelated inputs depend on its consumer's outputs.
     */
-  private def clockDomains(circuit: Circuit, hasAccessClock: Boolean): JArray = {
-    val modules = circuit.modules.map(m => m.name -> m).toMap
-    val domains = mutable.ArrayBuffer.empty[JValue]
-    def visit(name: String, path: String, roots: Map[String, String]): Unit = {
-      val m = modules(name) match {
-        case value: Module => value
-        case _ => fail(s"opaque functional clock owner at $path")
-      }
-      val clocks = m.ports.filter(p => p.tpe == ClockType &&
-        !(hasAccessClock && path == circuit.main && p.name == "ckpt_clock"))
-      clocks.foreach { p =>
-        if (p.direction != Input || !roots.contains(p.name))
-          fail(s"unresolved functional clock at $path.${p.name}")
-        domains += JObject(List("clock_hierarchy" -> JString(s"$path.${p.name}"),
-          "root_clock" -> JString(roots(p.name))))
-      }
+  private class ClockProvenance(circuit: Circuit, hasAccessClock: Boolean) {
+    private val modules = circuit.modules.map(m => m.name -> m).toMap
+    private def concrete(name: String, path: String): Module = modules(name) match {
+      case m: Module => m
+      case _ => fail(s"opaque functional clock owner at $path")
+    }
+    private def carrier(t: Type): Boolean = t == ClockType || t == UIntType(IntWidth(1))
+    class Scope(val m: Module, val path: String, incoming: (String, Set[String]) => String,
+                ancestors: Set[String]) {
+      if (ancestors(m.name)) fail(s"recursive clock hierarchy at $path")
       val all = stmts(m.body)
-      val drivers = all.collect { case c: Connect => c.loc.serialize -> c.expr.serialize }.toMap
-      all.collect { case i: WDefInstance => i }.foreach { i =>
-        val child = modules(i.module).ports.filter(_.tpe == ClockType).map { p =>
-          val source = drivers.getOrElse(s"${i.name}.${p.name}", "")
-          if (p.direction != Input || !roots.contains(source))
-            fail(s"derived or unresolved child clock at $path.${i.name}.${p.name}")
-          p.name -> roots(source)
-        }.toMap
-        visit(i.module, s"$path.${i.name}", child)
+      val drivers = mutable.Map.empty[String, Expression]
+      val aliases = all.collect { case d: DefNode => d.name; case d: DefWire => d.name }.toSet
+      all.foreach {
+        case c: Connect =>
+          if (drivers.contains(c.loc.serialize)) fail(s"multiple clock/net drivers at $path.${c.loc.serialize}")
+          drivers(c.loc.serialize) = c.expr
+        case n: DefNode => drivers(n.name) = n.value
+        case _ => ()
+      }
+      val inputs = m.ports.filter(p => p.direction == Input && carrier(p.tpe)).map(_.name).toSet
+      val outputs = m.ports.filter(p => p.direction == Output && carrier(p.tpe)).map(_.name).toSet
+      val instances = all.collect { case i: WDefInstance => i.name -> i }.toMap
+      private val children = mutable.Map.empty[String, Scope]
+      def child(i: WDefInstance): Scope = children.getOrElseUpdate(i.name,
+        new Scope(concrete(i.module, s"$path.${i.name}"), s"$path.${i.name}", (pin, seen) =>
+          clock(drivers.getOrElse(s"${i.name}.$pin", fail(s"missing child clock at $path.${i.name}.$pin")), seen),
+          ancestors + m.name))
+      def clock(e: Expression, seen: Set[String] = Set.empty): String = {
+        val name = e.serialize
+        val key = s"$path::$name"
+        if (seen(key)) fail(s"clock alias cycle at $path.$name")
+        val next = seen + key
+        if (!carrier(e.tpe)) fail(s"non-clock alias at $path.$name")
+        if (inputs(name)) incoming(name, next)
+        else e match {
+          case DoPrim(firrtl.PrimOps.AsClock, Seq(value), Nil, ClockType)
+              if value.tpe == UIntType(IntWidth(1)) => clock(value, next)
+          case DoPrim(firrtl.PrimOps.AsUInt, Seq(value), Nil, UIntType(IntWidth(width)))
+              if width == 1 && value.tpe == ClockType => clock(value, next)
+          case DoPrim(firrtl.PrimOps.Bits, Seq(value), Seq(hi, lo), UIntType(IntWidth(width)))
+              if width == 1 && hi == 0 && lo == 0 && value.tpe == UIntType(IntWidth(1)) => clock(value, next)
+          case _ => name.split("\\.", -1).toSeq match {
+            case Seq(instance, pin) if instances.contains(instance) =>
+              val scope = child(instances(instance))
+              val port = scope.m.ports.find(p => p.name == pin && carrier(p.tpe) && p.tpe == e.tpe)
+                .getOrElse(fail(s"reshaped/non-clock child pin at $path.$name"))
+              if (port.direction == Input) clock(drivers.getOrElse(name,
+                fail(s"undriven child clock pin at $path.$name")), next)
+              else scope.clock(firrtl.WRef(pin, port.tpe), next)
+            case _ => drivers.get(name) match {
+              case Some(value) if value.tpe == e.tpe && (aliases(name) || outputs(name)) => clock(value, next)
+              case _ => fail(s"derived, gated, or undriven clock/child clock at $path.$name")
+            }
+          }
+        }
       }
     }
-    val rootClocks = modules(circuit.main).ports.filter(p => p.tpe == ClockType &&
-      !(hasAccessClock && p.name == "ckpt_clock")).map(p => p.name -> p.name).toMap
-    visit(circuit.main, circuit.main, rootClocks)
-    JArray(domains.sortBy(v => (v \ "clock_hierarchy").values.toString).toList)
+    val root = new Scope(concrete(circuit.main, circuit.main), circuit.main, (pin, _) => {
+      if (!modules(circuit.main).ports.exists(p => p.name == pin && p.direction == Input && p.tpe == ClockType) ||
+          (hasAccessClock && pin == "ckpt_clock")) fail(s"non-functional root clock at ${circuit.main}.$pin")
+      pin
+    }, Set.empty)
+    private val scopes = mutable.Map(circuit.main -> root)
+    def scope(path: String): Scope = scopes.getOrElseUpdate(path, {
+      val split = path.lastIndexOf('.')
+      val parent = scope(path.take(split))
+      parent.child(parent.instances(path.drop(split + 1)))
+    })
+    def domains: JArray = {
+      val rows = mutable.ArrayBuffer.empty[JValue]
+      def walk(s: Scope): Unit = {
+        s.m.ports.filter(p => p.tpe == ClockType &&
+          !(hasAccessClock && s.path == circuit.main && p.name == "ckpt_clock")).foreach { p =>
+          rows += JObject(List("clock_hierarchy" -> JString(s"${s.path}.${p.name}"),
+            "root_clock" -> JString(s.clock(firrtl.WRef(p.name, p.tpe)))))
+        }
+        s.instances.values.toSeq.sortBy(_.name).foreach(i => walk(s.child(i)))
+      }
+      walk(root)
+      JArray(rows.sortBy(v => (v \ "clock_hierarchy").values.toString).toList)
+    }
   }
+  /** Reconstruct provenance from the actual emitted circuit, independently of
+    * input bindings. This proves wiring only, not CDC or atomic-cut ownership.
+    */
+  private def clockDomains(circuit: Circuit, hasAccessClock: Boolean): JArray =
+    new ClockProvenance(circuit, hasAccessClock).domains
   private def snippet(text: String): Seq[Statement] = {
     val m = Parser.parse("circuit Scratch :\n  module Scratch :\n" +
       text.linesIterator.map("    " + _).mkString("\n") + "\n").modules.head.asInstanceOf[Module]
@@ -108,10 +164,10 @@ object GeneratedStateBankAccess {
     * RW rdata on *every* enabled edge, including write edges. Lowering with a
     * generic memory-delay pass would change those owners and their StateIDs.
     */
-  private def materializePipelines(m: Module, path: String): (Module, Map[String, String]) = {
+  private def materializePipelines(m: Module, path: String): (Module, Map[String, String], Map[String, Expression]) = {
     val all = stmts(m.body)
     val memories = all.collect { case mem: DefMemory if mem.readLatency == 1 => mem }
-    if (memories.isEmpty) return (m, Map.empty)
+    if (memories.isEmpty) return (m, Map.empty, Map.empty)
     val drivers = all.collect { case c: Connect => c.loc.serialize -> c.expr }.toMap
     val names = mutable.Set.empty[String] ++ m.ports.map(_.name) ++
       all.collect { case d: IsDeclaration => d.name }
@@ -121,6 +177,7 @@ object GeneratedStateBankAccess {
     val connections = mutable.ArrayBuffer.empty[() => String]
     val normalized = mutable.Map.empty[String, DefMemory]
     val logicalNames = mutable.Map.empty[String, String]
+    val pipelineClocks = mutable.Map.empty[String, Expression]
     def expr(e: Expression): Expression = replacements.getOrElse(e.serialize, e.mapExpr(expr))
     def driver(mem: DefMemory, port: String, field: String): String = {
       val key = s"${mem.name}.$port.$field"
@@ -134,7 +191,16 @@ object GeneratedStateBankAccess {
       val name = s"CheckpointPipeline_$logicalName"
       if (!names.add(name)) fail(s"memory pipeline identifier collision at $path.$name")
       logicalNames += name -> logicalName
-      declarations += s"reg $name : ${ref.tpe.serialize}, ${drivers(s"${mem.name}.$port.clk").serialize}"
+      // A port clock may use a local node declared after the memory. Declare
+      // a clock wire first and connect it after the original body, so newly
+      // materialized pipeline registers never create forward references.
+      val clockName = s"${name}_clock"
+      if (!names.add(clockName)) fail(s"memory pipeline clock collision at $path.$clockName")
+      val portClock = drivers(s"${mem.name}.$port.clk")
+      pipelineClocks += clockName -> portClock
+      declarations += s"wire $clockName : Clock"
+      declarations += s"reg $name : ${ref.tpe.serialize}, $clockName"
+      connections += (() => s"$clockName <= ${portClock.serialize}")
       if (field != "addr") replacements += ref.serialize -> firrtl.WRef(name, ref.tpe)
       name
     }
@@ -177,7 +243,7 @@ object GeneratedStateBankAccess {
       case x => x.mapStmt(rewrite).mapExpr(expr)
     }
     (m.copy(body = Block(snippet(declarations.mkString("\n")) ++ Seq(rewrite(m.body)) ++
-      snippet(connections.map(_()).mkString("\n")))), logicalNames.toMap)
+      snippet(connections.map(_()).mkString("\n")))), logicalNames.toMap, pipelineClocks.toMap)
   }
 
   /** manifest must be the exact current semantic or generated-simulator
@@ -222,6 +288,8 @@ object GeneratedStateBankAccess {
     val logicalByPath = rows.map(r => str(r, "hierarchy") -> r).toMap
     val chunked = rows.exists(r => num(r, "width") > 64)
     val modules = input.circuit.modules.map(m => m.name -> m).toMap
+    val clockProvenance = new ClockProvenance(input.circuit, false)
+    val originalDomains = clockProvenance.domains
     val generated = mutable.ArrayBuffer.empty[Module]
     val clones = mutable.ArrayBuffer.empty[GeneratedStateBankAnnotations.Clone]
     val storage = mutable.ArrayBuffer.empty[JValue]
@@ -234,7 +302,7 @@ object GeneratedStateBankAccess {
       if (seenNames(n)) fresh() else { seenNames += n; n }
     }
     def build(moduleName: String, path: String, emittedPath: String, isRoot: Boolean): String = {
-      val (m, pipelineNames) = modules(moduleName) match {
+      val (m, pipelineNames, pipelineClocks) = modules(moduleName) match {
         case x: Module => materializePipelines(x, path)
         case _ => fail(s"opaque module at $path")
       }
@@ -246,18 +314,33 @@ object GeneratedStateBankAccess {
         fail(s"analog attachment at $path")
       if ((m.ports.map(_.name) ++ all.collect { case d: IsDeclaration => d.name }).exists(_.startsWith("ckpt_")))
         fail(s"reserved ckpt_ identifier at $path")
-      val clocks = m.ports.filter(_.tpe == ClockType)
+      val clocks = m.ports.filter(p => p.tpe == ClockType && p.direction == Input)
       val hasLocalClockedState = all.exists {
         case _: DefRegister | _: DefMemory | _: Print | _: Stop | _: Verification => true
         case _ => false
       }
-      if ((!separateAccessClock && clocks.size > 1) || clocks.exists(_.direction != Input) ||
+      if ((!separateAccessClock && clocks.size > 1) ||
           ((isRoot || hasLocalClockedState) && clocks.isEmpty))
         fail(s"direct input clocks required (multiple clocks need separate access clock) at $path")
       // Clockless helpers may route the combinational bank network. They must
       // not hide sequential children; child clock connections are checked below.
       val clock = clocks.headOption.map(_.name).getOrElse("")
-      val clockNames = clocks.map(_.name).toSet
+      val clockScope = clockProvenance.scope(path)
+      // Pipeline declarations/connections are parsed snippets until the final
+      // resolver. Recover only their exact original, already typed clock
+      // expressions; never guess a type for a newly introduced clock.
+      val typedClocks = clockScope.all.flatMap {
+        case r: DefRegister => Seq(r.clock)
+        case c: Connect if c.expr.tpe == ClockType => Seq(c.expr)
+        case p: Print => Seq(p.clk)
+        case s: Stop => Seq(s.clk)
+        case v: Verification => Seq(v.clk)
+        case _ => Nil
+      }.map(e => e.serialize -> e).toMap
+      def functionalClock(e: Expression): String = clockScope.clock(
+        if (pipelineClocks.contains(e.serialize)) pipelineClocks(e.serialize)
+        else if (e.tpe == UnknownType) typedClocks.getOrElse(e.serialize,
+          fail(s"unresolved materialized clock at $path.${e.serialize}")) else e)
       all.foreach {
         case p: Print => checkEffect(p.clk, p.en)
         case s: Stop => checkEffect(s.clk, s.en)
@@ -265,13 +348,15 @@ object GeneratedStateBankAccess {
         case _ => ()
       }
       def checkEffect(clk: Expression, en: Expression): Unit = {
-        if (!clockNames(clk.serialize) || en.tpe != UIntType(IntWidth(1)))
+        functionalClock(clk)
+        if (en.tpe != UIntType(IntWidth(1)))
           fail(s"derived clock or unresolved clocked effect at $path")
       }
       val regs = all.collect { case r: DefRegister => r.name -> r }.toMap
       val mems = all.collect { case mem: DefMemory => mem.name -> mem }.toMap
       regs.values.foreach { r =>
-        if (!clockNames(r.clock.serialize) || r.reset.tpe != UIntType(IntWidth(1)))
+        functionalClock(r.clock)
+        if (r.reset.tpe != UIntType(IntWidth(1)))
           fail(s"derived clock or asynchronous reset at $path.${r.name}")
       }
       mems.values.foreach { mem =>
@@ -279,21 +364,14 @@ object GeneratedStateBankAccess {
           fail(s"hidden synchronous/readwrite memory pipeline at $path.${mem.name}")
         if ((mem.readers ++ mem.writers).contains("ckpt_read")) fail(s"reserved memory reader at $path.${mem.name}")
         val clockDrivers = all.collect { case c: Connect if
-          (mem.readers ++ mem.writers).exists(p => c.loc.serialize == s"${mem.name}.$p.clk") => c.expr.serialize }
-        if (clockDrivers.size != mem.readers.size + mem.writers.size || clockDrivers.exists(c => !clockNames(c)))
+          (mem.readers ++ mem.writers).exists(p => c.loc.serialize == s"${mem.name}.$p.clk") => c.expr }
+        clockDrivers.foreach(functionalClock)
+        if (clockDrivers.size != mem.readers.size + mem.writers.size)
           fail(s"derived memory port clock at $path.${mem.name}")
       }
       val nextName = if (isRoot) root else fresh()
       clones += GeneratedStateBankAnnotations.Clone(moduleName, path, nextName, m)
       val childInstances = all.collect { case i: WDefInstance => i }
-      val drivers = all.collect { case c: Connect => c.loc.serialize -> c.expr }.toMap
-      childInstances.foreach { i =>
-        modules(i.module).ports.filter(_.tpe == ClockType).foreach { port =>
-          if (port.direction != Input ||
-              !drivers.get(s"${i.name}.${port.name}").exists(e => clockNames(e.serialize)))
-            fail(s"derived or independent child clock at $path.${i.name}.${port.name}")
-        }
-      }
       val children = childInstances.map(i => i.name -> build(i.module, s"$path.${i.name}",
         s"$emittedPath.${i.name}", false)).toMap
       val readers = mutable.ArrayBuffer.empty[(String, String)]
@@ -393,7 +471,7 @@ ckpt_resp_error <= ckpt_saved_error""")
     val (translated, annotationBinding) = GeneratedStateBankAnnotations.translate(input, clones.toSeq)
     val resolved = new Compiler(Forms.LowForm).execute(
       CircuitState(Parser.parse(circuit.serialize), firrtl.ChirrtlForm, translated)).copy(form = LowForm)
-    val domains = clockDomains(input.circuit, false)
+    val domains = originalDomains
     require(domains == clockDomains(resolved.circuit, separateAccessClock),
       "checkpoint bank changed functional clock provenance")
     val binding = SemanticStateInventory.canonical(JObject(List(

@@ -110,6 +110,9 @@ class MultipleFunctionalClocksSpec extends AnyFlatSpec {
     assert(domains.size == 6)
     assert(domains.exists(row => (row \ "clock_hierarchy") == JString("MultiClockStorage.right_.a") &&
       (row \ "root_clock") == JString("clock_b")), domains.toString)
+    save(state, result, manifest, "multiple-clocks")
+  }
+  private def save(state: CircuitState, result: GeneratedStateBankAccess.Result, manifest: String, label: String): Unit = {
     val reference = state.copy(circuit = state.circuit.copy(main = "OriginalMultiClockStorage",
       modules = state.circuit.modules.map {
         case m: Module =>
@@ -121,7 +124,7 @@ class MultipleFunctionalClocksSpec extends AnyFlatSpec {
         case _ => fail("opaque reference")
       }))
     sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { dir =>
-      val out = Paths.get(dir).resolve("multiple-clocks"); Files.createDirectories(out)
+      val out = Paths.get(dir).resolve(label); Files.createDirectories(out)
       Seq("generated-bank-input.fir" -> state.circuit.serialize,
         "generated-bank.fir" -> result.state.circuit.serialize,
         "generated-bank.sv" -> emit(result.state), "reference.sv" -> emit(reference),
@@ -158,4 +161,92 @@ class MultipleFunctionalClocksSpec extends AnyFlatSpec {
       }
     }
   }
+  private def forwardedSource: String = source
+    .replace("  module DomainStorage :", """  module ClockPin :
+    input pad : UInt<1>
+    output value : UInt<1>
+    value <= pad
+  module ClockRoute :
+    input input_a : Clock
+    input input_b : Clock
+    output a : Clock
+    output b : Clock
+    inst pin of ClockPin
+    pin.pad <= bits(asUInt(input_a), 0, 0)
+    a <= asClock(pin.value)
+    node alias_b = input_b
+    b <= alias_b
+  module DomainStorage :""")
+    .replace("    reg saved_a :", "    node local_a = a\n    reg saved_a :")
+    .replace("saved_a : UInt<9>, a", "saved_a : UInt<9>, local_a")
+    .replace("ram.r.clk <= a", "ram.r.clk <= local_a")
+    .replace("    inst left of DomainStorage", """    inst route_a of ClockRoute
+    inst route_b of ClockRoute
+    route_a.input_a <= clock_a
+    route_a.input_b <= route_b.b
+    route_b.input_a <= clock_b
+    route_b.input_b <= clock_a
+    inst left of DomainStorage""")
+    .replace("left.a <= clock_a", "left.a <= route_a.a")
+    .replace("left.b <= clock_b", "left.b <= route_b.a")
+    .replace("right.a <= clock_b", "right.a <= route_b.a")
+    .replace("right.b <= clock_a", "right.b <= route_a.b")
+
+  it should "resolve concrete sibling forwarding and bit-transparent clock IO without changing functional owners" in {
+    val state = lower(forwardedSource)
+    val manifest = SimulatorStateInventory.discover(state)
+    val result = GeneratedStateBankAccess.generate(state, manifest, separateAccessClock = true)
+    midas.widgets.CheckpointCaptureDescriptors.fromGenerated(result, manifest)
+    assert(result.entries.size == 9 && result.entries.map(_.depth).sum == 15)
+    val domains = (parse(result.binding) \ "functional_clock_domains").asInstanceOf[JArray].arr
+    assert(domains.size == 14)
+    assert(domains.exists(row => (row \ "clock_hierarchy") == JString("MultiClockStorage.route_a.b") &&
+      (row \ "root_clock") == JString("clock_a")))
+    // Reordering siblings must not make a valid routing dependency cyclic.
+    val reordered = lower(forwardedSource.replace("    inst route_a of ClockRoute\n    inst route_b of ClockRoute",
+      "    inst route_b of ClockRoute\n    inst route_a of ClockRoute"))
+    val other = GeneratedStateBankAccess.generate(reordered, SimulatorStateInventory.discover(reordered), separateAccessClock = true)
+    assert((parse(other.binding) \ "functional_clock_domains") == JArray(domains))
+    save(state, result, manifest, "forwarded-clocks")
+  }
+  it should "reject derived sequential undriven and cyclic clock forwarding and altered output provenance" in {
+    for (bad <- Seq(
+      forwardedSource.replace("value <= pad", "value <= not(pad)"),
+      forwardedSource.replace("pin.pad <= bits(asUInt(input_a), 0, 0)", "pin.pad <= UInt<1>(0)"),
+      forwardedSource.replace("a <= asClock(pin.value)", "a is invalid"),
+      forwardedSource.replace("value <= pad", "reg delayed : UInt<1>, asClock(pad)\n    delayed <= pad\n    value <= delayed"))) {
+      val state = lower(bad)
+      assert(intercept[IllegalArgumentException] {
+        GeneratedStateBankAccess.generate(state, SimulatorStateInventory.discover(state), separateAccessClock = true)
+      }.getMessage.contains("clock"))
+    }
+    val state = lower(forwardedSource)
+    val manifest = SimulatorStateInventory.discover(state)
+    val result = GeneratedStateBankAccess.generate(state, manifest, separateAccessClock = true)
+    val doc = parse(result.binding)
+    val changed = doc.transformField { case ("functional_clock_domains", JArray(rows)) =>
+      "functional_clock_domains" -> JArray(rows.map { row =>
+        if ((row \ "clock_hierarchy") == JString("MultiClockStorage.route_a.b"))
+          row.transformField { case ("root_clock", _) => "root_clock" -> JString("clock_b") }
+        else row
+      })
+    }
+    assert(intercept[IllegalArgumentException] {
+      midas.widgets.CheckpointCaptureDescriptors.fromGenerated(result.copy(binding = SemanticStateInventory.canonical(changed)), manifest)
+    }.getMessage.contains("functional clock domains"))
+    // Inject a netlist cycle after normal lowering (FIRRTL rejects textual loops).
+    def cycle(s: Statement): Statement = s match {
+      case c: Connect if c.loc.serialize == "route_b.input_b" =>
+        c.copy(expr = firrtl.WSubField(firrtl.WRef("route_a"), "b", ClockType))
+      case x => x.mapStmt(cycle)
+    }
+    val cyclic = state.copy(circuit = state.circuit.copy(modules = state.circuit.modules.map {
+      case m: Module if m.name == state.circuit.main => m.copy(body = cycle(m.body))
+      case m => m
+    }))
+    assert(intercept[IllegalArgumentException] {
+      GeneratedStateBankAccess.generate(cyclic, SimulatorStateInventory.discover(cyclic), separateAccessClock = true)
+    }.getMessage.contains("clock alias cycle"))
+  }
+
 }
