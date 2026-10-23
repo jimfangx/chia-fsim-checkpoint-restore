@@ -354,6 +354,85 @@ class MultipleFunctionalClocksSpec extends AnyFlatSpec {
     .replace("static_zero.unused <= asClock(UInt<1>(0))", "static_zero.unused is invalid")
     .replace("static_one.unused <= asClock(UInt<1>(1))", "static_one.unused is invalid")
 
+  private def dataSource: String = staticSource
+    .replace("static_zero.unused <= asClock(UInt<1>(0))", "static_zero.unused <= asClock(eq(bits(data, 0, 0), UInt<1>(0)))")
+    .replace("static_one.unused <= asClock(UInt<1>(1))", "static_one.unused <= asClock(lt(data, UInt<17>(65536)))")
+    .replace("metadata_out <= metadata\n    saved_a <= bits(data, 8, 0)",
+      "metadata_out <= metadata\n    saved_a <= mux(asUInt(metadata), bits(data, 8, 0), UInt<9>(0))")
+
+  it should "preserve computed Clock token data through repeated routes and functional data consumers" in {
+    val state = lower(dataSource)
+    val manifest = SimulatorStateInventory.discover(state)
+    val result = GeneratedStateBankAccess.generate(state, manifest, separateAccessClock = true)
+    midas.widgets.CheckpointCaptureDescriptors.fromGenerated(result, manifest)
+    assert(result.entries.size == 9 && result.entries.map(_.depth).sum == 15)
+    val domains = (parse(result.binding) \ "functional_clock_domains").asInstanceOf[JArray].arr
+    val data = domains.filter(row => (row \ "data_clock") != JNothing)
+    assert(domains.size == 22 && data.size == 8)
+    for ((side, route, expression) <- Seq(("left_", "zero", "eq(bits(data, 0, 0), UInt<1>(\"h0\"))"),
+      ("right_", "one", "lt(data, UInt<17>(\"h10000\"))"));
+      pin <- Seq(s"$side.metadata", s"$side.metadata_out", s"static_$route.unused", s"static_$route.forwarded")) {
+      assert(data.contains(JObject(List("clock_hierarchy" -> JString(s"MultiClockStorage.$pin"),
+        "data_clock" -> JObject(List("hierarchy" -> JString("MultiClockStorage"), "expression" -> JString(expression)))))))
+    }
+    save(state, result, manifest, "data-clocks")
+  }
+
+  it should "reject computed token data as any sequential clock including memory pipelines and effects" in {
+    for (bad <- Seq(
+      dataSource.replace("reg saved_a : UInt<9>, local_a", "reg saved_a : UInt<9>, metadata"),
+      dataSource.replace("ram.r.clk <= local_a", "ram.r.clk <= metadata"),
+      dataSource.replace("ram.w.clk <= b", "ram.w.clk <= metadata"),
+      dataSource.replace("saved_b <= data", "saved_b <= data\n    printf(metadata, wen, \"token effect\\n\")"),
+      dataSource.replace("saved_b <= data", "saved_b <= data\n    stop(metadata, wen, 1)"),
+      dataSource.replace("saved_b <= data", "saved_b <= data\n    assert(metadata, wen, UInt<1>(1), \"token verify\")"))) {
+      val state = lower(bad)
+      assert(intercept[IllegalArgumentException] {
+        GeneratedStateBankAccess.generate(state, SimulatorStateInventory.discover(state), separateAccessClock = true)
+      }.getMessage.contains("computed clock data drives functional"))
+    }
+  }
+
+  it should "independently reconstruct token origins and reject coherently rehashed sequential rewiring" in {
+    val state = lower(dataSource)
+    val manifest = SimulatorStateInventory.discover(state)
+    val result = GeneratedStateBankAccess.generate(state, manifest, separateAccessClock = true)
+    val doc = parse(result.binding)
+    val domains = (doc \ "functional_clock_domains").asInstanceOf[JArray].arr
+    for (bad <- Seq(JArray(domains.filter(row => (row \ "data_clock") == JNothing)),
+      JArray(domains.map(_.transformField { case ("hierarchy", _) => "hierarchy" -> JString("invented") })),
+      JArray(domains.map(_.transformField { case ("expression", _) => "expression" -> JString("invented") })),
+      JArray(domains.map(_.transformField { case ("data_clock", _) => "root_clock" -> JString("clock_a") })))) {
+      val binding = doc.transformField { case ("functional_clock_domains", _) => "functional_clock_domains" -> bad }
+      assert(intercept[IllegalArgumentException] {
+        midas.widgets.CheckpointCaptureDescriptors.fromGenerated(result.copy(
+          binding = SemanticStateInventory.canonical(binding)), manifest)
+      }.getMessage.contains("functional clock domains"))
+    }
+    for (consumer <- Seq("register", "memory", "effect")) {
+      def rewire(s: Statement): Statement = s match {
+        case r: DefRegister if consumer == "register" && r.name == "saved_a" =>
+          r.copy(clock = firrtl.WRef("metadata", ClockType))
+        case c: Connect if consumer == "memory" && c.loc.serialize == "ram.w.clk" =>
+          c.copy(expr = firrtl.WRef("metadata", ClockType))
+        case x => x.mapStmt(rewire)
+      }
+      val mutated = result.state.copy(circuit = result.state.circuit.copy(modules = result.state.circuit.modules.map {
+        case m: Module if m.ports.exists(_.name == "metadata") =>
+          val body = rewire(m.body)
+          m.copy(body = if (consumer != "effect") body else Block(Seq(body,
+            Stop(NoInfo, 1, firrtl.WRef("metadata", ClockType), UIntLiteral(1, IntWidth(1))))))
+        case m => m
+      }))
+      val binding = doc.transformField { case ("instrumented_sha256", _) =>
+        "instrumented_sha256" -> JString(SemanticStateInventory.sha256(mutated.circuit.serialize)) }
+      assert(intercept[IllegalArgumentException] {
+        midas.widgets.CheckpointCaptureDescriptors.fromGenerated(result.copy(state = mutated,
+          binding = SemanticStateInventory.canonical(binding)), manifest)
+      }.getMessage.contains("computed clock data drives functional"))
+    }
+  }
+
   it should "preserve explicitly invalid metadata origins through repeated transparent hierarchy" in {
     val state = lower(invalidSource)
     val manifest = SimulatorStateInventory.discover(state)

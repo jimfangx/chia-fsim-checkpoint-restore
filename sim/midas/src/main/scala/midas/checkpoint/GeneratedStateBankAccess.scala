@@ -77,10 +77,12 @@ object GeneratedStateBankAccess {
     * forwarding module's unrelated inputs depend on its consumer's outputs.
     */
   private case class ClockOrigin(root: Option[String], constant: Option[BigInt] = None,
-                                 gates: Seq[String] = Nil, invalid: Option[String] = None) {
+                                 gates: Seq[String] = Nil, invalid: Option[String] = None,
+                                 data: Option[(String, String)] = None) {
     def functional(path: String): ClockOrigin = {
       if (constant.nonEmpty) fail(s"constant clock drives functional storage/effect at $path")
       if (invalid.nonEmpty) fail(s"invalid clock drives functional storage/effect at $path (origin ${invalid.get})")
+      if (data.nonEmpty) fail(s"computed clock data drives functional storage/effect at $path (origin ${data.get._1})")
       this
     }
     def gated(path: String): ClockOrigin = {
@@ -91,6 +93,8 @@ object GeneratedStateBankAccess {
       root.map(v => "root_clock" -> JString(v)).toList ++
       constant.map(v => "constant_clock" -> JInt(v)).toList ++
       invalid.map(v => "invalid_clock" -> JString(v)).toList ++
+      data.map { case (scope, expression) => "data_clock" -> JObject(List(
+        "hierarchy" -> JString(scope), "expression" -> JString(expression))) }.toList ++
       (if (gates.isEmpty) Nil else List("gate_chain" -> JArray(gates.map(JString(_)).toList))))
   }
   private class ClockProvenance(circuit: Circuit, hasAccessClock: Boolean,
@@ -156,6 +160,13 @@ object GeneratedStateBankAccess {
               if width == 1 && value.tpe == ClockType => clock(value, next)
           case DoPrim(firrtl.PrimOps.Bits, Seq(value), Seq(hi, lo), UIntType(IntWidth(width)))
               if width == 1 && hi == 0 && lo == 0 && value.tpe == UIntType(IntWidth(1)) => clock(value, next)
+          // FAME carries target clock tokens as Clock-typed *data*. Preserve
+          // the first concrete one-bit computation through transparent routes,
+          // without inferring an oscillator/root from its data dependencies.
+          // Storage/effect/gate consumers must still call functional(). Missing
+          // drivers, opaque outputs and bare storage references do not qualify.
+          case _: DoPrim | _: Mux | _: ValidIf if e.tpe == UIntType(IntWidth(1)) =>
+            ClockOrigin(None, data = Some(path -> e.serialize))
           case _ => name.split("\\.", -1).toSeq match {
             case Seq(instance, pin) if instances.contains(instance) =>
               val scope = child(instances(instance))

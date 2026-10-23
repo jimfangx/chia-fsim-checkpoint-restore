@@ -79,7 +79,7 @@ class ClockedEffectsStateBankSpec extends AnyFlatSpec {
     assert(intercept[IllegalArgumentException] {
       val state = lower(bad)
       GeneratedStateBankAccess.generate(state, SimulatorStateInventory.discover(state))
-    }.getMessage.contains("child clock"))
+    }.getMessage.contains("computed clock data drives functional storage/effect at EffectsStorage.helper.hidden"))
   }
   it should "instrument the exact retained Rocket DTLB subtree including clockless barriers and assertions" in {
     val filename = sys.props.getOrElse("checkpoint.rocket.reference",
