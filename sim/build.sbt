@@ -119,6 +119,7 @@ lazy val firesimLib = (project in file("firesim-lib"))
 lazy val firesimRef = ProjectRef(file("."), "firesim")
 
 lazy val midas = (project in file("midas"))
+  .settings(Compile / unmanagedResourceDirectories += baseDirectory.value / "src" / "main" / "verilog")
   .dependsOn(rocketchip, targetutils, firesimLib)
   .settings(libraryDependencies ++= Seq(
     "org.scalatestplus" %% "scalacheck-1-14" % "3.1.3.0" % "test"))
