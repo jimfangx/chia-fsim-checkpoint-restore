@@ -32,6 +32,13 @@ object CheckpointCaptureABI {
     sb.append(s"#define ${prefix}_ENTRIES ${cfg.entries}U\n")
     sb.append(s"#define ${prefix}_OWNERS ${cfg.ownerNames.size}U\n")
     sb.append(s"#define ${prefix}_MANIFEST_SHA256 \"${cfg.manifestSha256}\"\n")
+    cfg.descriptors.foreach { descriptors =>
+      sb.append(s"#define ${prefix}_DESCRIPTOR_BINDING_SHA256 \"${descriptors.bindingSha256}\"\n")
+      sb.append(s"#define ${prefix}_INTERNAL_DESCRIPTOR_ROM 1U\n")
+      descriptors.entries.zipWithIndex.foreach { case (entry, index) =>
+        sb.append(s"// descriptor[$index] StateID: ${entry.stateID}\n")
+      }
+    }
     Seq("CheckpointCaptureTransport.sv", "CheckpointCaptureCut.sv").foreach { resource =>
       val in = getClass.getResourceAsStream("/" + resource)
       require(in != null, s"missing checkpoint RTL resource: $resource")
@@ -49,13 +56,18 @@ object CheckpointCaptureABI {
 }
 
 case class CheckpointCaptureWidgetParams(entries: Int, manifestSha256: String,
-    ownerNames: Seq[String], queueDepth: Int = 64) {
-  require(entries > 0, "checkpoint descriptor network is missing")
+    ownerNames: Seq[String], queueDepth: Int = 64,
+    descriptors: Option[CheckpointCaptureDescriptors] = None) {
+  require(entries > 0 && entries <= 65535, "checkpoint descriptor network is missing or too large")
   require(manifestSha256.matches("[0-9a-f]{64}") && BigInt(manifestSha256, 16) != 0,
     "checkpoint requires a nonzero generated manifest SHA256")
   require(ownerNames.nonEmpty && ownerNames.distinct.size == ownerNames.size &&
     ownerNames.forall(_.matches("[A-Za-z0-9_.:/-]+")), "checkpoint owners must be explicit, unique and named")
   require(queueDepth > 0)
+  descriptors.foreach { d =>
+    require(d.entries.size == entries && d.manifestSha256 == manifestSha256,
+      "checkpoint descriptor ROM does not match transport manifest/count")
+  }
 }
 
 /** Flat protocol matches CheckpointCaptureTransport.sv, including its dedicated reset.
@@ -219,6 +231,15 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
     transport.io.clock := clock
     transport.io.reset := reset.asBool
     capture.connect(transport.io)
+    cfg.descriptors.foreach { descriptors =>
+      val rom = Module(new CheckpointCaptureDescriptorROM(descriptors))
+      rom.io.entry := transport.io.descriptor_entry
+      transport.io.descriptor_valid := rom.io.valid
+      transport.io.descriptor_bank := rom.io.bank
+      transport.io.descriptor_slot := rom.io.slot
+      transport.io.descriptor_width := rom.io.bitWidth
+      transport.io.descriptor_depth := rom.io.depth
+    }
     capture.controllerReset := reset.asBool
     streamEnq.valid := transport.io.dma_valid
     streamEnq.bits := transport.io.dma_data
@@ -275,6 +296,14 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
     when(localValid && adapter.io.response.ready) { localValid := false.B }
     override def genHeader(base: BigInt, memoryRegions: Map[String, BigInt], sb: StringBuilder): Unit = {
       sb.append(CheckpointCaptureABI.header(getWName.toUpperCase, base, cfg, toHostStreamIdx))
+      // Unlike target bridge constructors, this global driver has no target
+      // bridge id/plusargs. Emit the actual constructor signature explicitly.
+      cfg.descriptors.foreach { descriptors =>
+        sb.append("#ifdef GET_INCLUDES\n#include \"bridges/checkpoint_capture.h\"\n#endif\n")
+        sb.append("#ifdef GET_BRIDGE_CONSTRUCTOR\n")
+        sb.append(s"registry.add_widget(new checkpoint_capture_t(simif, *registry.get_stream_engine(), ${base}ULL, ${toHostStreamIdx}U,\n")
+        sb.append(s"  ${descriptors.cppManifest}));\n#endif\n")
+      }
     }
   }
 }
