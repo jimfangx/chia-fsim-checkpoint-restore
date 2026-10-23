@@ -350,4 +350,97 @@ class MultipleFunctionalClocksSpec extends AnyFlatSpec {
     }
   }
 
+  private def invalidSource: String = staticSource
+    .replace("static_zero.unused <= asClock(UInt<1>(0))", "static_zero.unused is invalid")
+    .replace("static_one.unused <= asClock(UInt<1>(1))", "static_one.unused is invalid")
+
+  it should "preserve explicitly invalid metadata origins through repeated transparent hierarchy" in {
+    val state = lower(invalidSource)
+    val manifest = SimulatorStateInventory.discover(state)
+    val result = GeneratedStateBankAccess.generate(state, manifest, separateAccessClock = true)
+    midas.widgets.CheckpointCaptureDescriptors.fromGenerated(result, manifest)
+    assert(result.entries.size == 9 && result.entries.map(_.depth).sum == 15)
+    val domains = (parse(result.binding) \ "functional_clock_domains").asInstanceOf[JArray].arr
+    val invalid = domains.filter(row => (row \ "invalid_clock") != JNothing)
+    assert(domains.size == 22 && invalid.size == 8)
+    for ((side, route) <- Seq("left_" -> "static_zero", "right_" -> "static_one");
+         pin <- Seq(s"$side.metadata", s"$side.metadata_out", s"$route.unused", s"$route.forwarded")) {
+      assert(invalid.contains(JObject(List("clock_hierarchy" -> JString(s"MultiClockStorage.$pin"),
+        "invalid_clock" -> JString(s"MultiClockStorage.$route.unused")))))
+    }
+    assert(invalid.forall(row => (row \ "root_clock") == JNothing &&
+      (row \ "constant_clock") == JNothing && (row \ "gate_chain") == JNothing))
+    save(state, result, manifest, "invalid-clocks")
+  }
+
+  it should "reject invalid metadata on registers memory ports pipelines and clocked effects" in {
+    for (bad <- Seq(
+      invalidSource.replace("reg saved_a : UInt<9>, local_a", "reg saved_a : UInt<9>, metadata"),
+      invalidSource.replace("ram.r.clk <= local_a", "ram.r.clk <= metadata"),
+      invalidSource.replace("ram.w.clk <= b", "ram.w.clk <= metadata"),
+      invalidSource.replace("saved_a <= bits(data, 8, 0)",
+        "saved_a <= bits(data, 8, 0)\n    printf(metadata, wen, \"invalid effect\\n\")"),
+      invalidSource.replace("saved_a <= bits(data, 8, 0)",
+        "saved_a <= bits(data, 8, 0)\n    stop(metadata, wen, 1)"),
+      invalidSource.replace("saved_a <= bits(data, 8, 0)",
+        "saved_a <= bits(data, 8, 0)\n    assert(metadata, wen, UInt<1>(1), \"invalid verify\")"))) {
+      val state = lower(bad)
+      assert(intercept[IllegalArgumentException] {
+        GeneratedStateBankAccess.generate(state, SimulatorStateInventory.discover(state), separateAccessClock = true)
+      }.getMessage.contains("invalid clock drives functional"))
+    }
+    // An absent connection is not evidence of an intentional invalid pin.
+    val state = lower(invalidSource)
+    def drop(s: Statement): Statement = s match {
+      case i: IsInvalid if i.expr.serialize == "static_zero.unused" => EmptyStmt
+      case x => x.mapStmt(drop)
+    }
+    val undriven = state.copy(circuit = state.circuit.copy(modules = state.circuit.modules.map {
+      case m: Module if m.name == state.circuit.main => m.copy(body = drop(m.body))
+      case m => m
+    }))
+    assert(intercept[IllegalArgumentException] {
+      GeneratedStateBankAccess.generate(undriven, SimulatorStateInventory.discover(undriven), separateAccessClock = true)
+    }.getMessage.contains("missing child clock"))
+  }
+
+  it should "reconstruct invalid provenance and reject changed binding or rewired functional clocks independently" in {
+    val state = lower(invalidSource)
+    val manifest = SimulatorStateInventory.discover(state)
+    val result = GeneratedStateBankAccess.generate(state, manifest, separateAccessClock = true)
+    val doc = parse(result.binding)
+    val domains = (doc \ "functional_clock_domains").asInstanceOf[JArray].arr
+    for (bad <- Seq(JArray(domains.filter(row => (row \ "invalid_clock") == JNothing)),
+      JArray(domains.map(_.transformField { case ("invalid_clock", _) => "invalid_clock" -> JString("invented") })),
+      JArray(domains.map(_.transformField { case ("invalid_clock", _) => "root_clock" -> JString("clock_a") })),
+      JArray(domains.map(_.transformField { case ("invalid_clock", _) => "constant_clock" -> JInt(0) })))) {
+      val binding = doc.transformField { case ("functional_clock_domains", _) => "functional_clock_domains" -> bad }
+      assert(intercept[IllegalArgumentException] {
+        midas.widgets.CheckpointCaptureDescriptors.fromGenerated(result.copy(
+          binding = SemanticStateInventory.canonical(binding)), manifest)
+      }.getMessage.contains("functional clock domains"))
+    }
+    for (consumer <- Seq("register", "memory", "effect")) {
+      def rewire(s: Statement): Statement = s match {
+        case r: DefRegister if consumer == "register" && r.name == "saved_a" =>
+          r.copy(clock = firrtl.WRef("metadata", ClockType))
+        case c: Connect if consumer == "memory" && c.loc.serialize == "ram.w.clk" =>
+          c.copy(expr = firrtl.WRef("metadata", ClockType))
+        case x => x.mapStmt(rewire)
+      }
+      val mutated = result.state.copy(circuit = result.state.circuit.copy(modules = result.state.circuit.modules.map {
+        case m: Module if m.ports.exists(_.name == "metadata") =>
+          val body = rewire(m.body)
+          m.copy(body = if (consumer != "effect") body else Block(Seq(body,
+            Stop(NoInfo, 1, firrtl.WRef("metadata", ClockType), UIntLiteral(1, IntWidth(1))))))
+        case m => m
+      }))
+      val binding = doc.transformField { case ("instrumented_sha256", _) =>
+        "instrumented_sha256" -> JString(SemanticStateInventory.sha256(mutated.circuit.serialize)) }
+      assert(intercept[IllegalArgumentException] {
+        midas.widgets.CheckpointCaptureDescriptors.fromGenerated(result.copy(state = mutated,
+          binding = SemanticStateInventory.canonical(binding)), manifest)
+      }.getMessage.contains("invalid clock drives functional"))
+    }
+  }
 }

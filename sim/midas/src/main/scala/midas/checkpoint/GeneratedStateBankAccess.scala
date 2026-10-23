@@ -77,9 +77,10 @@ object GeneratedStateBankAccess {
     * forwarding module's unrelated inputs depend on its consumer's outputs.
     */
   private case class ClockOrigin(root: Option[String], constant: Option[BigInt] = None,
-                                 gates: Seq[String] = Nil) {
+                                 gates: Seq[String] = Nil, invalid: Option[String] = None) {
     def functional(path: String): ClockOrigin = {
       if (constant.nonEmpty) fail(s"constant clock drives functional storage/effect at $path")
+      if (invalid.nonEmpty) fail(s"invalid clock drives functional storage/effect at $path (origin ${invalid.get})")
       this
     }
     def gated(path: String): ClockOrigin = {
@@ -89,6 +90,7 @@ object GeneratedStateBankAccess {
     def row(path: String): JObject = JObject(List("clock_hierarchy" -> JString(path)) ++
       root.map(v => "root_clock" -> JString(v)).toList ++
       constant.map(v => "constant_clock" -> JInt(v)).toList ++
+      invalid.map(v => "invalid_clock" -> JString(v)).toList ++
       (if (gates.isEmpty) Nil else List("gate_chain" -> JArray(gates.map(JString(_)).toList))))
   }
   private class ClockProvenance(circuit: Circuit, hasAccessClock: Boolean,
@@ -104,11 +106,16 @@ object GeneratedStateBankAccess {
       if (ancestors(m.name)) fail(s"recursive clock hierarchy at $path")
       val all = stmts(m.body)
       val drivers = mutable.Map.empty[String, Expression]
+      val invalids = mutable.Set.empty[String]
       val aliases = all.collect { case d: DefNode => d.name; case d: DefWire => d.name }.toSet
       all.foreach {
         case c: Connect =>
-          if (drivers.contains(c.loc.serialize)) fail(s"multiple clock/net drivers at $path.${c.loc.serialize}")
+          if (drivers.contains(c.loc.serialize) || invalids(c.loc.serialize))
+            fail(s"multiple clock/net drivers at $path.${c.loc.serialize}")
           drivers(c.loc.serialize) = c.expr
+        case i: IsInvalid =>
+          if (drivers.contains(i.expr.serialize) || !invalids.add(i.expr.serialize))
+            fail(s"multiple clock/net drivers at $path.${i.expr.serialize}")
         case n: DefNode => drivers(n.name) = n.value
         case _ => ()
       }
@@ -117,9 +124,13 @@ object GeneratedStateBankAccess {
       val instances = all.collect { case i: WDefInstance => i.name -> i }.toMap
       if (gatePaths(path)) GeneratedClockGateAdapter.validate(m, path, instrumented)
       private val children = mutable.Map.empty[String, Scope]
+      private def drivenClock(name: String, seen: Set[String]): ClockOrigin = {
+        if (invalids(name)) ClockOrigin(None, invalid = Some(s"$path.$name"))
+        else clock(drivers.getOrElse(name, fail(s"missing child clock at $path.$name")), seen)
+      }
       def child(i: WDefInstance): Scope = children.getOrElseUpdate(i.name,
         new Scope(concrete(i.module, s"$path.${i.name}"), s"$path.${i.name}", (pin, seen) =>
-          clock(drivers.getOrElse(s"${i.name}.$pin", fail(s"missing child clock at $path.${i.name}.$pin")), seen),
+          drivenClock(s"${i.name}.$pin", seen),
           ancestors + m.name))
       def clock(e: Expression, seen: Set[String] = Set.empty): ClockOrigin = {
         val name = e.serialize
@@ -129,6 +140,11 @@ object GeneratedStateBankAccess {
         if (!carrier(e.tpe)) fail(s"non-clock alias at $path.$name")
         if (gatePaths(path) && name == "O") clock(firrtl.WRef("I", ClockType), next).gated(path)
         else if (inputs(name)) incoming(name, next)
+        // Preserve an explicit FIRRTL invalid origin through transparent
+        // metadata routes. Missing drivers still reject. Every sequential
+        // consumer is audited separately and cannot use this origin.
+        else if (invalids(name) && (aliases(name) || outputs(name)))
+          ClockOrigin(None, invalid = Some(s"$path.$name"))
         else e match {
           // Static metadata ports remain explicit in the domain binding. They
           // are never root clocks and may not drive any sequential consumer.
@@ -145,8 +161,7 @@ object GeneratedStateBankAccess {
               val scope = child(instances(instance))
               val port = scope.m.ports.find(p => p.name == pin && carrier(p.tpe) && p.tpe == e.tpe)
                 .getOrElse(fail(s"reshaped/non-clock child pin at $path.$name"))
-              if (port.direction == Input) clock(drivers.getOrElse(name,
-                fail(s"undriven child clock pin at $path.$name")), next)
+              if (port.direction == Input) drivenClock(name, next)
               else scope.clock(firrtl.WRef(pin, port.tpe), next)
             case _ => drivers.get(name) match {
               case Some(value) if value.tpe == e.tpe && (aliases(name) || outputs(name)) => clock(value, next)
