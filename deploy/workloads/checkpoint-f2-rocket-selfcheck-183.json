@@ -1,0 +1,9 @@
+{
+  "benchmark_name": "checkpoint-f2-rocket-selfcheck-183",
+  "common_bootbinary": "rocket-quad.riscv",
+  "common_rootfs": null,
+  "common_simulation_outputs": [
+    "uartlog",
+    "memory_stats*.csv"
+  ]
+}

@@ -39,7 +39,9 @@ object CheckpointCaptureDescriptors {
       case JArray(values) => values
       case _ => throw new IllegalArgumentException("checkpoint descriptors: missing state")
     }
-    check(integer(binding, "access_version") == 1 && text(binding, "protocol") == "latched-banked64-v1",
+    val chunked = integer(binding, "access_version") == 2 &&
+      text(binding, "protocol") == "latched-banked64-chunked-v2"
+    check(chunked || (integer(binding, "access_version") == 1 && text(binding, "protocol") == "latched-banked64-v1"),
       "unsupported generated bank protocol")
     check(text(binding, "scope") == "all_reachable_firrtl_state_only", "unsupported coverage scope")
     val manifestHash = SemanticStateInventory.sha256(SemanticStateInventory.canonical(doc))
@@ -54,9 +56,16 @@ object CheckpointCaptureDescriptors {
       Seq("state_id", "hierarchy").foreach(k => check(text(bound, k) == text(logical, k), s"state order/$k mismatch"))
       Seq("width", "depth").foreach(k => check(integer(bound, k) == integer(logical, k), s"state $k mismatch"))
       check(text(bound, "storage_hierarchy").nonEmpty, "missing emitted storage path")
+      val width = integer(logical, "width"); val depth = integer(logical, "depth")
+      val chunks = (width.toLong + 63) / 64
+      val words = chunks * depth
+      check(width > 0 && depth > 0 && words <= Int.MaxValue, "flattened depth exceeds supported transport ABI")
+      if (chunked) {
+        check(integer(bound, "chunks") == chunks && integer(bound, "transfer_width") == math.min(width, 64) &&
+          integer(bound, "transfer_depth") == words, "incompatible chunk mapping")
+      } else check(width <= 64, "wide state requires versioned chunk mapping")
       val entry = StateAccessEntry(text(bound, "state_id"), integer(bound, "bank"), integer(bound, "slot"),
-        integer(bound, "width"), integer(bound, "depth"))
-      check(entry.depth <= 65535, "depth exceeds transport ABI")
+        math.min(width, 64), words.toInt)
       entry
     }
     check(entries == result.entries, "bank result and descriptor binding disagree")

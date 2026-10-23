@@ -143,8 +143,13 @@ object GeneratedStateBankAccess {
     }
     val expected = rows.map { row =>
       val width = num(row, "width"); val depth = num(row, "depth")
-      if (width < 1 || width > 64 || depth < 1 || depth > 65535) fail("wide/deep state requires explicit chunking")
-      (str(row, "state_id"), width, depth)
+      if (width < 1 || depth < 1) fail("empty state")
+      val chunks = (width.toLong + 63) / 64
+      val words = chunks * depth
+      // StateAccessEntry is Int-based even though the physical address is 32 bits.
+      // Check before narrowing so oversized storage can never wrap or alias.
+      if (words > Int.MaxValue) fail("flattened state exceeds supported 31-bit transfer depth")
+      (str(row, "state_id"), math.min(width, 64), words.toInt)
     }
     if (expected.isEmpty || expected.size > 65535) fail("empty inventory or descriptor index overflow")
     val entries = bindings.getOrElse(expected.zipWithIndex.map { case ((id, w, d), index) =>
@@ -153,6 +158,8 @@ object GeneratedStateBankAccess {
     if (entries.map(e => (e.stateID, e.width, e.depth)) != expected ||
         entries.map(e => (e.bank, e.slot)).distinct.size != entries.size) fail("incomplete/reordered/reshaped/duplicate bindings")
     val byPath = rows.zip(entries).map { case (r, e) => str(r, "hierarchy") -> e }.toMap
+    val logicalByPath = rows.map(r => str(r, "hierarchy") -> r).toMap
+    val chunked = rows.exists(r => num(r, "width") > 64)
     val modules = input.circuit.modules.map(m => m.name -> m).toMap
     val generated = mutable.ArrayBuffer.empty[Module]
     val clones = mutable.ArrayBuffer.empty[GeneratedStateBankAnnotations.Clone]
@@ -212,10 +219,24 @@ object GeneratedStateBankAccess {
         val index = readers.size
         val hit = s"ckpt_hit_$index"
         val value = if (mems.contains(name)) s"$name.ckpt_read.data" else name
-        readers += hit -> s"asUInt($value)"
+        val row = logicalByPath(p)
+        val width = num(row, "width"); val depth = num(row, "depth")
+        val chunks = ((width.toLong + 63) / 64).toInt
+        // Little-endian chunks, address-major: at = logical_address * chunks + chunk.
+        // Explicit fixed slices keep signed words bit-exact and zero the final padding.
+        val sliced = if (chunks == 1) s"asUInt($value)" else {
+          (0 until chunks).foldRight("UInt<64>(0)") { case (chunk, acc) =>
+            val low = chunk * 64
+            val high = math.min(width.toLong - 1, low.toLong + 63).toInt
+            s"mux(eq(rem(ckpt_address, UInt<32>($chunks)), UInt<32>($chunk)), pad(bits(asUInt($value), $high, $low), 64), $acc)"
+          }
+        }
+        readers += hit -> sliced
         storage += JObject(List("state_id" -> JString(e.stateID), "hierarchy" -> JString(p),
           "storage_hierarchy" -> JString(s"$emittedPath.$name"), "bank" -> JInt(e.bank),
-          "slot" -> JInt(e.slot), "width" -> JInt(e.width), "depth" -> JInt(e.depth)))
+          "slot" -> JInt(e.slot), "width" -> JInt(width), "depth" -> JInt(depth)) ++
+          (if (chunked) List("chunks" -> JInt(chunks), "transfer_width" -> JInt(e.width),
+            "transfer_depth" -> JInt(e.depth)) else Nil))
       }
       def rewrite(s: Statement): Statement = s match {
         case r: DefRegister => r.copy(reset = UIntLiteral(0, IntWidth(1)), init = firrtl.WRef(r.name, r.tpe))
@@ -239,7 +260,8 @@ object GeneratedStateBankAccess {
         mems.get(name).foreach { mem =>
           val bits = math.max(1, (mem.depth - 1).bitLength)
           readStatements ++= Seq(s"$name.ckpt_read.clk <= $clock", s"$name.ckpt_read.en <= UInt<1>(1)",
-            s"$name.ckpt_read.addr <= bits(ckpt_address, ${bits - 1}, 0)")
+            s"$name.ckpt_read.addr <= bits(${if (num(logicalByPath(logicalPath(name)), "width") <= 64) "ckpt_address"
+              else s"div(ckpt_address, UInt<32>(${(num(logicalByPath(logicalPath(name)), "width").toLong + 63) / 64}))"}, ${bits - 1}, 0)")
         }
       }
       childInstances.foreach { i =>
@@ -279,7 +301,8 @@ ckpt_resp_error <= ckpt_saved_error""")
     val resolved = new Compiler(Forms.LowForm).execute(
       CircuitState(Parser.parse(circuit.serialize), firrtl.ChirrtlForm, translated)).copy(form = LowForm)
     val binding = SemanticStateInventory.canonical(JObject(List(
-      "access_version" -> JInt(1), "protocol" -> JString("latched-banked64-v1"),
+      "access_version" -> JInt(if (chunked) 2 else 1),
+      "protocol" -> JString(if (chunked) "latched-banked64-chunked-v2" else "latched-banked64-v1"),
       "manifest_sha256" -> JString(SemanticStateInventory.sha256(actual)),
       "reference_sha256" -> JString(SemanticStateInventory.sha256(input.circuit.serialize)),
       "instrumented_sha256" -> JString(SemanticStateInventory.sha256(resolved.circuit.serialize)),

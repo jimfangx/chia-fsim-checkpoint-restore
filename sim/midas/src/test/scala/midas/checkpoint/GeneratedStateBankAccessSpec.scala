@@ -87,7 +87,7 @@ class GeneratedStateBankAccessSpec extends AnyFlatSpec {
       lower(source.replace("UInt<9>(0)", "UInt<9>(1)")), manifest))
   }
 
-  it should "include synchronous and readwrite pipeline owners and reject wide unchunked state" in {
+  it should "include synchronous and readwrite pipeline owners and chunk wide state" in {
     val sync = lower(source.replace("read-latency => 0", "read-latency => 1"))
     val manifest = SimulatorStateInventory.discover(sync)
     assert(GeneratedStateBankAccess.generate(sync, manifest).entries.size == 10)
@@ -99,7 +99,9 @@ class GeneratedStateBankAccessSpec extends AnyFlatSpec {
     val rw = lower(rwSource)
     assert(GeneratedStateBankAccess.generate(rw, SimulatorStateInventory.discover(rw)).entries.size == 10)
     val wide = source.replace("reg harnessOnly : UInt<1>", "reg harnessOnly : UInt<65>")
-    assert(intercept[IllegalArgumentException](generate(wide)).getMessage.contains("chunking"))
+    val result = generate(wide)
+    assert((parse(result.binding) \ "protocol") == JString("latched-banked64-chunked-v2"))
+    assert(result.entries.count(e => e.width == 64 && e.depth == 2) == 1)
   }
 
   it should "translate initialization and reject unknown annotations and independently clocked children" in {
