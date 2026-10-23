@@ -18,16 +18,32 @@ import org.json4s.native.JsonMethods.parse
   * endpoint reset, never the functional target reset. An accepted read latches
   * its complete response; releasing freeze/aborting cannot modify a held beat.
   * Added asynchronous memory read ports may change FPGA RAM inference/cost.
+  * separateAccessClock adds an always-running ckpt_clock for the root response
+  * endpoint. Functional storage retains its original clocks. The caller must
+  * establish and hold the global freeze before access and keep it asserted
+  * until all responses drain; this option supplies no clock-domain handshake.
   * This is not an all-owner simulator cut or a FireSim bridge integration.
   */
 object GeneratedStateBankAccess {
   case class Result(state: CircuitState, entries: Seq[StateAccessEntry], binding: String)
   def validateAnnotationBinding(result: Result): Unit = {
     GeneratedStateBankAnnotations.preflight(result.state)
-    val binding = parse(result.binding) \ "annotation_translation"
+    val doc = parse(result.binding)
+    val binding = doc \ "annotation_translation"
     require((binding \ "translation_version") == JInt(1) &&
       (binding \ "translated_sha256") == JString(GeneratedStateBankAnnotations.translatedHash(result.state)),
       "checkpoint descriptors: missing or altered translated annotations")
+    val root = result.state.circuit.modules.collectFirst {
+      case m: Module if m.name == result.state.circuit.main => m
+    }.getOrElse(throw new IllegalArgumentException("checkpoint descriptors: missing access-clock root"))
+    val accessClock = doc \ "access_clock"
+    require(root.ports.exists(p => p.direction == Input && p.tpe == ClockType &&
+      accessClock == JString(p.name)) &&
+      stmts(root.body).collect { case r: DefRegister if
+        Set("ckpt_pending", "ckpt_saved_data", "ckpt_saved_error")(r.name) => r.clock.serialize
+      }.map(JString(_)) == Seq.fill(3)(accessClock) &&
+      (doc \ "freeze_contract") == JString("externally_held_all_functional_owners_before_access_until_drain"),
+      "checkpoint descriptors: missing or altered access clock/freeze contract")
   }
   private def fail(message: String): Nothing =
     throw new IllegalArgumentException(s"Generated checkpoint bank unsupported: $message")
@@ -124,7 +140,8 @@ object GeneratedStateBankAccess {
     * inventory rooted at circuit.main. Optional bindings are checked completely.
     */
   def generate(input: CircuitState, manifest: String,
-               bindings: Option[Seq[StateAccessEntry]] = None): Result = {
+               bindings: Option[Seq[StateAccessEntry]] = None,
+               separateAccessClock: Boolean = false): Result = {
     if (input.form != LowForm) fail("resolved LowForm required")
     GeneratedStateBankAnnotations.preflight(input)
     val doc = parse(manifest)
@@ -304,10 +321,11 @@ object GeneratedStateBankAccess {
         ("address", Input, 32), ("match", Output, 1), ("data", Output, 64)) ++
         (if (isRoot) Seq(("reset", Input, 1), ("req_valid", Input, 1), ("req_ready", Output, 1),
           ("resp_valid", Output, 1), ("resp_ready", Input, 1), ("resp_data", Output, 64), ("resp_error", Output, 1)) else Nil)
-      val endpoint = if (!isRoot) Nil else snippet(s"""reg ckpt_pending : UInt<1>, $clock with :
+      val endpointClock = if (separateAccessClock) "ckpt_clock" else clock
+      val endpoint = if (!isRoot) Nil else snippet(s"""reg ckpt_pending : UInt<1>, $endpointClock with :
   reset => (ckpt_reset, UInt<1>(0))
-reg ckpt_saved_data : UInt<64>, $clock
-reg ckpt_saved_error : UInt<1>, $clock
+reg ckpt_saved_data : UInt<64>, $endpointClock
+reg ckpt_saved_error : UInt<1>, $endpointClock
 node ckpt_accept = and(ckpt_req_valid, ckpt_req_ready)
 ckpt_pending <= mux(ckpt_accept, UInt<1>(1), mux(ckpt_resp_ready, UInt<1>(0), ckpt_pending))
 ckpt_saved_data <= mux(ckpt_accept, mux(and(ckpt_freeze, ckpt_match), ckpt_data, UInt<64>(0)), ckpt_saved_data)
@@ -317,7 +335,8 @@ ckpt_resp_valid <= and(ckpt_pending, not(ckpt_reset))
 ckpt_resp_data <= ckpt_saved_data
 ckpt_resp_error <= ckpt_saved_error""")
       generated += m.copy(name = nextName,
-        ports = m.ports ++ ports.map { case (n, dir, w) => Port(NoInfo, s"ckpt_$n", dir, UIntType(IntWidth(w))) },
+        ports = m.ports ++ ports.map { case (n, dir, w) => Port(NoInfo, s"ckpt_$n", dir, UIntType(IntWidth(w))) } ++
+          (if (isRoot && separateAccessClock) Seq(Port(NoInfo, "ckpt_clock", Input, ClockType)) else Nil),
         body = Block(Seq(rewrite(m.body)) ++ snippet(readStatements.mkString("\n")) ++ endpoint))
       nextName
     }
@@ -336,6 +355,9 @@ ckpt_resp_error <= ckpt_saved_error""")
       "reference_sha256" -> JString(SemanticStateInventory.sha256(input.circuit.serialize)),
       "instrumented_sha256" -> JString(SemanticStateInventory.sha256(resolved.circuit.serialize)),
       "scope" -> JString("all_reachable_firrtl_state_only"),
+      "access_clock" -> JString(if (separateAccessClock) "ckpt_clock" else
+        input.circuit.modules.find(_.name == root).get.ports.find(_.tpe == ClockType).get.name),
+      "freeze_contract" -> JString("externally_held_all_functional_owners_before_access_until_drain"),
       "annotation_translation" -> annotationBinding,
       "state" -> JArray(storage.sortBy(e => (e \ "state_id").values.toString).toList))))
     Result(resolved, entries, binding)
