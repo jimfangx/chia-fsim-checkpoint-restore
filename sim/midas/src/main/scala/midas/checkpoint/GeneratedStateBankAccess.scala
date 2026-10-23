@@ -35,6 +35,84 @@ object GeneratedStateBankAccess {
     m.body match { case Block(xs) => xs; case x => Seq(x) }
   }
 
+  /** Expose exactly the sequential owners used by FIRRTL 1.6's passthrough
+    * memory emitter. Address-register readers implement new/undefined reads;
+    * old readers and readwriters store data. In particular the emitter updates
+    * RW rdata on *every* enabled edge, including write edges. Lowering with a
+    * generic memory-delay pass would change those owners and their StateIDs.
+    */
+  private def materializePipelines(m: Module, path: String): (Module, Map[String, String]) = {
+    val all = stmts(m.body)
+    val memories = all.collect { case mem: DefMemory if mem.readLatency == 1 => mem }
+    if (memories.isEmpty) return (m, Map.empty)
+    val drivers = all.collect { case c: Connect => c.loc.serialize -> c.expr }.toMap
+    val names = mutable.Set.empty[String] ++ m.ports.map(_.name) ++
+      all.collect { case d: IsDeclaration => d.name }
+    val replacements = mutable.Map.empty[String, Expression]
+    val removed = mutable.Set.empty[String]
+    val declarations = mutable.ArrayBuffer.empty[String]
+    val connections = mutable.ArrayBuffer.empty[() => String]
+    val normalized = mutable.Map.empty[String, DefMemory]
+    val logicalNames = mutable.Map.empty[String, String]
+    def expr(e: Expression): Expression = replacements.getOrElse(e.serialize, e.mapExpr(expr))
+    def driver(mem: DefMemory, port: String, field: String): String = {
+      val key = s"${mem.name}.$port.$field"
+      expr(drivers.getOrElse(key, fail(s"missing memory driver at $path.$key"))).serialize
+    }
+    def pipeline(mem: DefMemory, port: String, field: String): String = {
+      val ref = firrtl.passes.MemPortUtils.memPortField(mem, port, field)
+      val logicalName = firrtl.passes.LowerTypes.loweredName(ref)
+      // An explicit register cannot share an emitter-lowered port wire name.
+      // Bind a distinct physical name to the original semantic pipeline owner.
+      val name = s"CheckpointPipeline_$logicalName"
+      if (!names.add(name)) fail(s"memory pipeline identifier collision at $path.$name")
+      logicalNames += name -> logicalName
+      declarations += s"reg $name : ${ref.tpe.serialize}, ${drivers(s"${mem.name}.$port.clk").serialize}"
+      if (field != "addr") replacements += ref.serialize -> firrtl.WRef(name, ref.tpe)
+      name
+    }
+    memories.foreach { mem =>
+      if (mem.writeLatency != 1 || (mem.readwriters.nonEmpty && mem.readUnderWrite == ReadUnderWrite.New))
+        fail(s"unsupported synchronous/readwrite memory pipeline at $path.${mem.name}")
+      if ((mem.readers ++ mem.writers ++ mem.readwriters).exists(_.startsWith("ckpt_")))
+        fail(s"reserved memory port at $path.${mem.name}")
+      mem.readers.foreach { r =>
+        val addressPipeline = mem.readUnderWrite != ReadUnderWrite.Old
+        val saved = pipeline(mem, r, if (addressPipeline) "addr" else "data")
+        Seq("clk", "en", "addr").foreach(f => removed += s"${mem.name}.$r.$f")
+        connections += (() => s"${mem.name}.$r.clk <= ${driver(mem, r, "clk")}")
+        connections += (() => s"${mem.name}.$r.en <= ${driver(mem, r, "en")}")
+        connections += (() => s"${mem.name}.$r.addr <= ${if (addressPipeline) saved else driver(mem, r, "addr")}")
+        connections += (() => s"$saved <= mux(${driver(mem, r, "en")}, ${if (addressPipeline) driver(mem, r, "addr") else s"${mem.name}.$r.data"}, $saved)")
+      }
+      val rwPorts = mem.readwriters.zipWithIndex.map { case (rw, index) =>
+        val r = s"ckpt_rw_${index}_r"; val w = s"ckpt_rw_${index}_w"
+        val saved = pipeline(mem, rw, "rdata")
+        Seq("clk", "en", "addr", "wmode", "wmask", "wdata").foreach(f => removed += s"${mem.name}.$rw.$f")
+        Seq(r, w).foreach { p =>
+          connections += (() => s"${mem.name}.$p.clk <= ${driver(mem, rw, "clk")}")
+          connections += (() => s"${mem.name}.$p.addr <= ${driver(mem, rw, "addr")}")
+        }
+        connections += (() => s"${mem.name}.$r.en <= ${driver(mem, rw, "en")}")
+        connections += (() => s"${mem.name}.$w.en <= and(${driver(mem, rw, "en")}, ${driver(mem, rw, "wmode")})")
+        connections += (() => s"${mem.name}.$w.mask <= ${driver(mem, rw, "wmask")}")
+        connections += (() => s"${mem.name}.$w.data <= ${driver(mem, rw, "wdata")}")
+        connections += (() => s"$saved <= mux(${driver(mem, rw, "en")}, ${mem.name}.$r.data, $saved)")
+        (r, w)
+      }
+      normalized += mem.name -> mem.copy(readLatency = 0, readwriters = Nil,
+        readers = mem.readers ++ rwPorts.map(_._1), writers = mem.writers ++ rwPorts.map(_._2))
+    }
+    def rewrite(s: Statement): Statement = s match {
+      case mem: DefMemory if normalized.contains(mem.name) => normalized(mem.name)
+      case c: Connect if removed(c.loc.serialize) => EmptyStmt
+      case c: Connect => c.copy(expr = expr(c.expr))
+      case x => x.mapStmt(rewrite).mapExpr(expr)
+    }
+    (m.copy(body = Block(snippet(declarations.mkString("\n")) ++ Seq(rewrite(m.body)) ++
+      snippet(connections.map(_()).mkString("\n")))), logicalNames.toMap)
+  }
+
   /** manifest must be the exact current semantic or generated-simulator
     * inventory rooted at circuit.main. Optional bindings are checked completely.
     */
@@ -86,10 +164,11 @@ object GeneratedStateBankAccess {
       if (seenNames(n)) fresh() else { seenNames += n; n }
     }
     def build(moduleName: String, path: String, emittedPath: String, isRoot: Boolean): String = {
-      val m = modules(moduleName) match {
-        case x: Module => x
+      val (m, pipelineNames) = modules(moduleName) match {
+        case x: Module => materializePipelines(x, path)
         case _ => fail(s"opaque module at $path")
       }
+      def logicalPath(name: String): String = s"$path.${pipelineNames.getOrElse(name, name)}"
       val all = stmts(m.body)
       // Non-storage effects require their own cut contract. Leaving a printf,
       // stop/assertion, or analog attachment active would repeat or externally
@@ -124,7 +203,7 @@ object GeneratedStateBankAccess {
         s"$emittedPath.${i.name}", false)).toMap
       val readers = mutable.ArrayBuffer.empty[(String, String)]
       (regs.keys ++ mems.keys).toSeq.sorted.foreach { name =>
-        val p = s"$path.$name"
+        val p = logicalPath(name)
         val e = byPath.getOrElse(p, fail(s"state omitted from inventory: $p"))
         if (!covered.add(p)) fail(s"duplicate state: $p")
         val index = readers.size
@@ -152,7 +231,7 @@ object GeneratedStateBankAccess {
       }
       val readStatements = mutable.ArrayBuffer.empty[String]
       (regs.keys ++ mems.keys).toSeq.sorted.zipWithIndex.foreach { case (name, index) =>
-        val e = byPath(s"$path.$name")
+        val e = byPath(logicalPath(name))
         readStatements += s"node ckpt_hit_$index = and(and(eq(ckpt_bank, UInt<8>(${e.bank})), eq(ckpt_slot, UInt<16>(${e.slot}))), lt(ckpt_address, UInt<32>(${e.depth})))"
         mems.get(name).foreach { mem =>
           val bits = math.max(1, (mem.depth - 1).bitLength)

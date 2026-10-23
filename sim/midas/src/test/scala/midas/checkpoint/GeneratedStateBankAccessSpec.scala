@@ -87,19 +87,17 @@ class GeneratedStateBankAccessSpec extends AnyFlatSpec {
       lower(source.replace("UInt<9>(0)", "UInt<9>(1)")), manifest))
   }
 
-  it should "reject synchronous and readwrite memory pipelines and wide unchunked state" in {
+  it should "include synchronous and readwrite pipeline owners and reject wide unchunked state" in {
     val sync = lower(source.replace("read-latency => 0", "read-latency => 1"))
     val manifest = SimulatorStateInventory.discover(sync)
-    assert(intercept[IllegalArgumentException](GeneratedStateBankAccess.generate(sync, manifest))
-      .getMessage.contains("hidden synchronous/readwrite memory pipeline"))
+    assert(GeneratedStateBankAccess.generate(sync, manifest).entries.size == 10)
     val rwSource = source.replace("reader => r", "readwriter => r")
       .replace("read-latency => 0", "read-latency => 1")
       .replace("read-under-write => undefined", "read-under-write => old")
       .replace("sram.r.en <= UInt<1>(1)", "sram.r.en <= UInt<1>(1)\n    sram.r.wmode <= UInt<1>(0)\n    sram.r.wmask <= UInt<1>(1)\n    sram.r.wdata <= data")
       .replace("sram.r.data", "sram.r.rdata")
     val rw = lower(rwSource)
-    assert(intercept[IllegalArgumentException](GeneratedStateBankAccess.generate(rw,
-      SimulatorStateInventory.discover(rw))).getMessage.contains("hidden synchronous/readwrite memory pipeline"))
+    assert(GeneratedStateBankAccess.generate(rw, SimulatorStateInventory.discover(rw)).entries.size == 10)
     val wide = source.replace("reg harnessOnly : UInt<1>", "reg harnessOnly : UInt<65>")
     assert(intercept[IllegalArgumentException](generate(wide)).getMessage.contains("chunking"))
   }
