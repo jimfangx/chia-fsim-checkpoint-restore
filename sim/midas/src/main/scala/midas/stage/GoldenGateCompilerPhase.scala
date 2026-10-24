@@ -126,7 +126,7 @@ class GoldenGateCompilerPhase extends Phase {
       emissionInput.annotations.filterNot(_.isInstanceOf[firrtl.EmitCircuitAnnotation]) :+
         firrtl.EmitCircuitAnnotation(verilogEmitter.getClass)) else emissionInput)
     val bankProbeFiles = midas.checkpoint.SimulatorBankProbe.emissionBinding(
-      postLoweredSimulator, emitted.getEmittedCircuit.value)
+      postLoweredSimulator, emitted.getEmittedCircuit.value, emitted.annotations)
     val fpgaConstantFiles = midas.checkpoint.SimulatorFPGASynthesisConstants.emissionBinding(
       postLoweredSimulator, emitted.getEmittedCircuit.value)
     val semanticMapFiles = if (!semanticMap) Seq.empty else {

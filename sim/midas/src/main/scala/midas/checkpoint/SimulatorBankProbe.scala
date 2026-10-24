@@ -74,7 +74,8 @@ object SimulatorBankProbe {
       GoldenGateOutputFileAnnotation(descriptorJSON, ".bank-probe-descriptors.json")))
   }
 
-  def emissionBinding(state: CircuitState, verilog: String): Seq[GoldenGateOutputFileAnnotation] = {
+  def emissionBinding(state: CircuitState, verilog: String,
+                      emittedAnnotations: firrtl.AnnotationSeq): Seq[GoldenGateOutputFileAnnotation] = {
     if (!state.annotations.contains(SimulatorBankProbeAnnotation)) return Nil
     val files = state.annotations.collect { case a: GoldenGateOutputFileAnnotation => a.fileSuffix -> a.body }.toMap
     val names = Seq(".bank-probe-reference.fir", ".bank-probe-state.json", ".bank-probe-instrumented.fir",
@@ -83,10 +84,17 @@ object SimulatorBankProbe {
       val body = files.getOrElse(n, fail(s"missing generated artifact $n"))
       n -> JString(sha256(body))
     }
+    val xdc = emittedAnnotations.collect { case midas.passes.XDCOutputAnnotation(body, Some(suffix)) =>
+      suffix -> JString(sha256(body))
+    }
+    val suffixes = midas.targetutils.xdc.XDCFiles.allFiles.map(_.fileSuffix).toSet
+    if (xdc.size != suffixes.size || xdc.map(_._1).toSet != suffixes)
+      fail("missing or duplicate emitted physical-constraint files")
     val binding = canonical(JObject(List(
       "binding_version" -> JInt(1), "scope" -> JString("generated_rtl_probe_only"),
       "external_runtime_required" -> JBool(true), "deployable_capture_image" -> JBool(false),
       "emitted_verilog_sha256" -> JString(sha256(verilog)),
+      "emitted_xdc_sha256" -> JObject(xdc.toList),
       "inputs" -> JObject(hashes.toList))))
     Seq(GoldenGateOutputFileAnnotation(binding, ".bank-probe-emission.json"))
   }

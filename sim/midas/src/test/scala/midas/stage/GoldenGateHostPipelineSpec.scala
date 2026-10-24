@@ -116,7 +116,15 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
 
   it should "emit functional generated banks through the real backend and bind every probe input" in {
     val injection = new InjectBankHostState
-    val a = compile(inventory = true, Seq(injection), Seq(midas.checkpoint.SimulatorBankProbeAnnotation))
+    val constraints = Seq(
+      midas.InternalXDCAnnotation(midas.targetutils.xdc.XDCFiles.Synthesis,
+        "set_property DONT_TOUCH true [get_cells {}]",
+        ReferenceTarget("HostPipeline", "HostPipeline", Nil, "consumer", Nil)),
+      midas.InternalXDCAnnotation(midas.targetutils.xdc.XDCFiles.Implementation,
+        "set_false_path -from [get_ports {}]",
+        ReferenceTarget("HostPipeline", "HostPipeline", Nil, "reset", Nil)))
+    val a = compile(inventory = true, Seq(injection),
+      Seq(midas.checkpoint.SimulatorBankProbeAnnotation) ++ constraints)
     val sv = verilog(a)
     assert(sv.contains("ckpt_freeze") && sv.contains("ckpt_clock") && sv.contains("ckpt_saved_data"))
     val names = Seq(".bank-probe-reference.fir", ".bank-probe-state.json", ".bank-probe-instrumented.fir",
@@ -132,6 +140,21 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
     assert(rows.exists(r => (r \ "hierarchy") == JString("HostPipeline.consumer.always")))
     // Final emitted-state inventory additionally owns the bank response latch.
     assert((parse(file(a, ".simulator-state.json")) \ "state").asInstanceOf[JArray].arr.size == 5)
+    val xdc = a.collect { case midas.passes.XDCOutputAnnotation(body, Some(suffix)) => suffix -> body }.toMap
+    assert(xdc.size == 2)
+    xdc.foreach { case (suffix, body) =>
+      assert((binding \ "emitted_xdc_sha256" \ suffix) == JString(SemanticStateInventory.sha256(body)))
+      save("bank-probe" + suffix, body)
+    }
+    assert(xdc(".synthesis.xdc").contains("set_property DONT_TOUCH true [get_cells consumer]"))
+    assert(xdc(".implementation.xdc").contains("set_false_path -from [get_ports reset]"))
+    val noXDC = intercept[IllegalArgumentException] {
+      midas.checkpoint.SimulatorBankProbe.emissionBinding(lower.copy(annotations =
+        Seq(midas.checkpoint.SimulatorBankProbeAnnotation) ++ a.collect {
+          case f: GoldenGateOutputFileAnnotation if names.dropRight(1).contains(f.fileSuffix) => f
+        }), sv, a.filterNot(_.isInstanceOf[midas.passes.XDCOutputAnnotation]))
+    }
+    assert(noXDC.getMessage.contains("constraint files"))
     save("bank-probe.sv", sv)
     names.foreach(n => save(n.drop(1), file(a, n)))
   }

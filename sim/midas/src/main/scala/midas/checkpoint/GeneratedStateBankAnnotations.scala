@@ -3,10 +3,13 @@ package midas.checkpoint
 
 import scala.collection.mutable
 import firrtl.CircuitState
-import firrtl.annotations.{Annotation, CircuitName, ComponentName, JsonProtocol, MemoryFileInlineAnnotation, MemorySynthInit, MemoryNoSynthInit, ModuleName, ModuleTarget, ReferenceTarget}
+import firrtl.annotations.{Annotation, CircuitName, ComponentName, JsonProtocol, MemoryFileInlineAnnotation, MemorySynthInit, MemoryNoSynthInit, ModuleName, ModuleTarget, ReferenceTarget, TargetToken}
 import firrtl.ir._
 import firrtl.transforms.DontTouchAnnotation
 import org.json4s._
+import midas.InternalXDCAnnotation
+import midas.targetutils.FirrtlMemModelAnnotation
+import midas.targetutils.xdc.XDCAnnotation
 
 /** Explicit annotation contracts for instance-specialized storage. Never copy
   * an annotation with an old module target or silently drop an unknown owner.
@@ -20,10 +23,68 @@ private[checkpoint] object GeneratedStateBankAnnotations {
   private def supported(a: Annotation): Boolean = a match {
     case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: firrtl.transforms.CombinationalPath |
          _: firrtl.transforms.NoDedupAnnotation | _: firrtl.passes.InlineAnnotation |
-         _: SynthesisPlusArgConstantAnnotation => true
+         _: SynthesisPlusArgConstantAnnotation | _: FirrtlMemModelAnnotation |
+         _: InternalXDCAnnotation | _: XDCAnnotation => true
     case MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation => true
     case _ => false
   }
+  private def declarations(m: Module): Seq[IsDeclaration] = {
+    val all = mutable.ArrayBuffer.empty[IsDeclaration]
+    def visit(s: Statement): Unit = {
+      s match { case d: IsDeclaration => all += d; case _ => () }
+      s.foreachStmt(visit)
+    }
+    visit(m.body); all.toSeq
+  }
+
+  /** XDC arguments are correlated under one explicit root. Never expand them
+    * independently: a Cartesian product would constrain unrelated instances.
+    * Only exact ground declarations and concrete instance ports survive this
+    * contract; RAM implementation pins/aggregates need their own mapping.
+    */
+  private def validateXDC(state: CircuitState, format: String, args: Seq[ReferenceTarget]): Unit = {
+    if ("\\{}".r.findAllIn(format).size != args.size) fail("XDC argument/specifier count mismatch")
+    if (args.isEmpty) return
+    if (args.map(_.module).distinct.size != 1) fail("XDC arguments require a common explicit root")
+    val modules = state.circuit.modules.map(m => m.name -> m).toMap
+    val reachable = GeneratedExternalOwners.instances(state, state.circuit.main).map(_._2.name).toSet
+    def concrete(name: String): Module = modules.get(name) match {
+      case Some(m: Module) if reachable(name) => m
+      case _ => fail(s"XDC target requires a reachable concrete module: $name")
+    }
+    def ground(t: Type): Boolean = t match {
+      case ClockType | ResetType | AsyncResetType | UIntType(IntWidth(_)) | SIntType(IntWidth(_)) => true
+      case _ => false
+    }
+    args.foreach { a =>
+      if (a.circuit != state.circuit.main) fail(s"foreign XDC target: ${a.serialize}")
+      var owner = concrete(a.module)
+      a.path.foreach { case (instance, child) =>
+        if (!declarations(owner).exists {
+          case i: firrtl.WDefInstance => i.name == instance.value && i.module == child.value
+          case _ => false
+        }) fail(s"XDC instance path mismatch: ${a.serialize}")
+        owner = concrete(child.value)
+      }
+      val declared = declarations(owner).find(_.name == a.ref)
+      val valid = a.component match {
+        case Nil => owner.ports.exists(p => p.name == a.ref && ground(p.tpe)) || declared.exists {
+          case d: DefRegister => ground(d.tpe)
+          case d: DefWire => ground(d.tpe)
+          case d: DefNode => ground(d.value.tpe)
+          case i: firrtl.WDefInstance => concrete(i.module); true
+          case _ => false
+        }
+        case Seq(TargetToken.Field(port)) => declared.exists {
+          case i: firrtl.WDefInstance => concrete(i.module).ports.exists(p => p.name == port && ground(p.tpe))
+          case _ => false
+        }
+        case _ => false
+      }
+      if (!valid) fail(s"XDC target requires an exact ground declaration or concrete instance port: ${a.serialize}")
+    }
+  }
+
   def preflight(state: CircuitState): Unit = {
     GeneratedSynthesisConstantAdapter.validate(state, instrumented = true)
     val unsupported = state.annotations.filterNot(supported)
@@ -67,6 +128,10 @@ private[checkpoint] object GeneratedStateBankAnnotations {
       }
       case a: DontTouchAnnotation if !reachable(a.target.module) =>
         fail(s"annotation target is unreachable: ${a.target.serialize}")
+      case a: InternalXDCAnnotation => validateXDC(state, a.formatString, a.argumentList)
+      case a: XDCAnnotation => validateXDC(state, a.formatString, a.argumentList)
+      case a: FirrtlMemModelAnnotation if !reachable(a.target.module) =>
+        fail(s"annotation target is unreachable: ${a.target.serialize}")
       case a: MemoryFileInlineAnnotation if !reachable(a.target.module) =>
         fail(s"annotation target is unreachable: ${a.target.serialize}")
       case a: SynthesisPlusArgConstantAnnotation if !reachable(a.target.module) =>
@@ -76,7 +141,8 @@ private[checkpoint] object GeneratedStateBankAnnotations {
   }
   def annotationJSON(annotations: Seq[Annotation]): String = JsonProtocol.serialize(annotations.filter {
     case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: SynthesisPlusArgConstantAnnotation |
-         _: firrtl.transforms.NoDedupAnnotation | _: firrtl.passes.InlineAnnotation => true
+         _: firrtl.transforms.NoDedupAnnotation | _: firrtl.passes.InlineAnnotation |
+         _: FirrtlMemModelAnnotation | _: InternalXDCAnnotation | _: XDCAnnotation => true
     case MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation => true
     case _ => false
   }.distinct.sortBy(_.serialize))
@@ -85,11 +151,6 @@ private[checkpoint] object GeneratedStateBankAnnotations {
   def translate(state: CircuitState, clones: Seq[Clone]): (Seq[Annotation], JValue) = {
     preflight(state)
     val modules = state.circuit.modules.map(m => m.name -> m).toMap
-    def declarations(m: Module): Seq[IsDeclaration] = {
-      val all = mutable.ArrayBuffer.empty[IsDeclaration]
-      def visit(s: Statement): Unit = { s match { case d: IsDeclaration => all += d; case _ => () }; s.foreachStmt(visit) }
-      visit(m.body); all.toSeq
-    }
     def targets(target: ReferenceTarget, memory: Boolean): Seq[ReferenceTarget] = {
       if (target.circuit != state.circuit.main || target.component.nonEmpty)
         fail(s"annotation requires an exact ground declaration target: ${target.serialize}")
@@ -125,6 +186,20 @@ private[checkpoint] object GeneratedStateBankAnnotations {
       if (copies.isEmpty) fail(s"annotation module is unreachable: $module")
       copies
     }
+    def xdcCopies(args: Seq[ReferenceTarget]): Seq[Seq[ReferenceTarget]] = {
+      if (args.isEmpty) return Seq(Nil)
+      moduleClones(args.head.circuit, args.head.module).map { parent =>
+        args.map { a =>
+          var path = parent.originalPath
+          val renamedPath = a.path.map { case (instance, _) =>
+            path = s"$path.${instance.value}"
+            val child = clones.find(_.originalPath == path).getOrElse(fail(s"missing XDC clone: $path"))
+            (instance, TargetToken.OfModule(child.module))
+          }
+          a.copy(module = parent.module, path = renamedPath)
+        }
+      }
+    }
     def record(source: Annotation, targets: Seq[String]): Unit =
       mappings += JObject(List("source" -> JString(source.serialize),
         "targets" -> JArray(targets.map(JString(_)).toList)))
@@ -148,6 +223,20 @@ private[checkpoint] object GeneratedStateBankAnnotations {
             a.copy(target = ComponentName(i.name, ModuleName(c.module, CircuitName(state.circuit.main)))))
           case target => fail(s"inline annotation target has no translation contract: ${target.serialize}")
         }
+        record(a, copies.map(_.target.serialize))
+        copies
+      case a: InternalXDCAnnotation =>
+        val copies = xdcCopies(a.argumentList).map(args =>
+          InternalXDCAnnotation(a.destinationFile, a.formatString, args: _*))
+        record(a, copies.map(_.serialize))
+        copies
+      case a: XDCAnnotation =>
+        val copies = xdcCopies(a.argumentList).map(args =>
+          XDCAnnotation(a.destinationFile, a.formatString, args: _*))
+        record(a, copies.map(_.serialize))
+        copies
+      case a: FirrtlMemModelAnnotation =>
+        val copies = targets(a.target, true).map(t => a.copy(target = t))
         record(a, copies.map(_.target.serialize))
         copies
       case a: DontTouchAnnotation =>
