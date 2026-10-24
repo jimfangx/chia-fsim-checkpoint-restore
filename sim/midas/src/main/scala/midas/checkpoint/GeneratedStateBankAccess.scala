@@ -98,7 +98,8 @@ object GeneratedStateBankAccess {
       (if (gates.isEmpty) Nil else List("gate_chain" -> JArray(gates.map(JString(_)).toList))))
   }
   private class ClockProvenance(circuit: Circuit, hasAccessClock: Boolean,
-                                gatePaths: Set[String] = Set.empty, instrumented: Boolean = false) {
+                                gatePaths: Set[String] = Set.empty, instrumented: Boolean = false,
+                                physicalPaths: Set[String] = Set.empty) {
     private val modules = circuit.modules.map(m => m.name -> m).toMap
     private def concrete(name: String, path: String): Module = modules(name) match {
       case m: Module => m
@@ -126,7 +127,7 @@ object GeneratedStateBankAccess {
       val inputs = m.ports.filter(p => p.direction == Input && carrier(p.tpe)).map(_.name).toSet
       val outputs = m.ports.filter(p => p.direction == Output && carrier(p.tpe)).map(_.name).toSet
       val instances = all.collect { case i: WDefInstance => i.name -> i }.toMap
-      if (gatePaths(path)) GeneratedClockGateAdapter.validate(m, path, instrumented)
+      if (gatePaths(path) && !physicalPaths(path)) GeneratedClockGateAdapter.validate(m, path, instrumented)
       private val children = mutable.Map.empty[String, Scope]
       private def drivenClock(name: String, seen: Set[String]): ClockOrigin = {
         if (invalids(name)) ClockOrigin(None, invalid = Some(s"$path.$name"))
@@ -228,7 +229,9 @@ object GeneratedStateBankAccess {
           case s: Stop => clock(s.clk).functional(s"$path.stop")
           case v: Verification => clock(v.clk).functional(s"$path.verification")
           case mem: DefMemory =>
-            (mem.readers ++ mem.writers ++ mem.readwriters).filterNot(p => instrumented && p == "ckpt_read").foreach { port =>
+            (mem.readers ++ mem.writers ++ mem.readwriters).filterNot(p =>
+              (instrumented && p == "ckpt_read") ||
+                (physicalPaths.nonEmpty && mem.readLatency == 0 && mem.readers.contains(p))).foreach { port =>
               val pin = s"${mem.name}.$port.clk"
               memoryOrigin(drivers.getOrElse(pin, fail(s"missing memory clock at $path.$pin"))).functional(s"$path.$pin")
             }
@@ -264,6 +267,60 @@ object GeneratedStateBankAccess {
     }
     private def collectPaths(s: Scope): Set[String] = Set(s.path) ++
       s.instances.values.flatMap(i => collectPaths(s.child(i))).toSet
+
+    /** Full sequential clock obligations, including emitter-owned memory
+      * pipelines through their original port. This does not prove CE data
+      * dependencies, reset stability, external memory or host ownership.
+      */
+    def physicalConsumers: JArray = {
+      val rows = mutable.ArrayBuffer.empty[JValue]
+      def walk(s: Scope): Unit = {
+        def add(name: String, kind: String, expression: Expression, origin: ClockOrigin): Unit = {
+          val resolved = origin.functional(s"${s.path}.$name")
+          rows += JObject(List("hierarchy" -> JString(s"${s.path}.$name"),
+            "kind" -> JString(kind), "clock_expression" -> JString(expression.serialize),
+            "origin" -> resolved.row(s"${s.path}.$name")))
+        }
+        s.all.foreach {
+          case r: DefRegister => add(r.name, "register", r.clock, s.clock(r.clock))
+          case mem: DefMemory =>
+            ((if (mem.readLatency == 0) Nil else mem.readers) ++ mem.writers ++ mem.readwriters).foreach { p =>
+              val pin = s"${mem.name}.$p"
+              val clk = s.drivers.getOrElse(pin + ".clk", fail(s"missing memory clock at ${s.path}.$pin"))
+              val en = s.drivers.getOrElse(pin + ".en", fail(s"missing memory enable at ${s.path}.$pin"))
+              add(pin, "memory_port", clk, s.memoryClock(clk, en))
+            }
+          case p: Print => add("print_" + rows.size, "print", p.clk, s.clock(p.clk))
+          case p: Stop => add("stop_" + rows.size, "stop", p.clk, s.clock(p.clk))
+          case p: Verification => add("verification_" + rows.size, "verification", p.clk, s.clock(p.clk))
+          case _ => ()
+        }
+        s.instances.values.toSeq.sortBy(_.name).foreach(i => walk(s.child(i)))
+      }
+      walk(root)
+      JArray(rows.sortBy(v => (v \ "hierarchy").values.toString).toList)
+    }
+  }
+
+  /** Analysis-only view of exact native gates. The temporary transparent
+    * bodies can never reach generate(), a bank endpoint or a Verilog emitter.
+    * PhysicalClockGateContract.requireCaptureOwner remains unconditional.
+    */
+  private[checkpoint] def physicalClockTopology(input: CircuitState): (JArray, JArray) = {
+    val live = GeneratedExternalOwners.instances(input, input.circuit.main)
+    val physical = live.collect { case (path, m: ExtModule) if m.defname == "BUFGCE" =>
+      PhysicalClockGateContract.validate(input, m); path -> m.name
+    }.toMap
+    val physicalModules = physical.values.toSet
+    val liveModules = live.map(_._2.name).toSet
+    val circuit = input.circuit.copy(modules = input.circuit.modules.filter(m => liveModules(m.name)).map {
+      case m: ExtModule if physicalModules(m.name) => Module(m.info, m.name, m.ports,
+        Connect(NoInfo, firrtl.WRef("O", ClockType), firrtl.WRef("I", ClockType)))
+      case m: ExtModule => fail(s"opaque owner in physical clock plan: ${m.name}")
+      case m => m
+    })
+    val provenance = new ClockProvenance(circuit, false, physical.keySet, physicalPaths = physical.keySet)
+    (provenance.domains, provenance.physicalConsumers)
   }
   /** Reconstruct provenance from the actual emitted circuit, independently of
     * input bindings. This proves wiring only, not CDC or atomic-cut ownership.
