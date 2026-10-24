@@ -65,6 +65,11 @@ class CheckpointNativeDescriptorsSpec extends AnyFlatSpec {
     save("physical-clock-plan.json", plan); save("physical-clock-dependencies.json", deps)
     save("functional-inventory.json", inventory); save("functional-binding.json", generated.binding)
     save("instrumented.fir", generated.state.circuit.serialize); save("instrumented.sv", emit(generated.state))
+    save("NativeReference.sv", emit(reference.copy(circuit = reference.circuit.copy(main = "NativeReference",
+      modules = reference.circuit.modules.map {
+        case m: firrtl.ir.Module if m.name == reference.circuit.main => m.copy(name = "NativeReference")
+        case m => m
+      }), annotations = Nil)))
     PhysicalClockStateBank.emit(reference, manifest, plan, deps).foreach { f =>
       save(f.fileSuffix.stripPrefix("."), f.body)
     }

@@ -18,8 +18,9 @@ case object NativeFunctionalBankProbeAnnotation extends NoTargetAnnotation with 
 }
 
 /** Separate sibling only. Native clock gates are never modeled as registers or
-  * replaced by transparent emitted bodies. This does not wire the physical cut,
-  * CE bank, transport or external owners into the generated functional banks.
+  * replaced by transparent emitted bodies. The clock-cut sibling masks the
+  * functional network and keeps its bank endpoint ungated; the controller,
+  * CE bank, transport and external owners still require explicit connections.
   */
 object NativeFunctionalBankProbe {
   import SemanticStateInventory.{canonical, sha256}
@@ -36,7 +37,8 @@ object NativeFunctionalBankProbe {
       fail("native companion cannot admit ordinary bank capture or semantic mapping")
     if (state.annotations.exists {
       case a: GoldenGateOutputFileAnnotation =>
-        a.fileSuffix.startsWith(".native-functional") || a.fileSuffix.startsWith(".native-descriptors")
+        a.fileSuffix.startsWith(".native-functional") || a.fileSuffix.startsWith(".native-descriptors") ||
+          a.fileSuffix.startsWith(".native-clock-cut")
       case _ => false
     }) fail("existing native companion output")
   }
@@ -108,9 +110,30 @@ object NativeFunctionalBankProbe {
       "production_freeze_owners_bound" -> JBool(false), "metasim_restore_supported" -> JBool(false),
       "inputs" -> JObject((descriptorFiles :+ (".native-functional-emission.json" -> binding))
         .map { case (name, body) => name -> JString(sha256(body)) }.toList))))
-    input.copy(annotations = input.annotations ++ (files ++ descriptorFiles).map { case (name, body) =>
+    val wired = PhysicalClockCutWiring.generateNative(reference, manifest, plan, deps, generated)
+    val wiredConstrained = midas.passes.WriteXDCFile.execute(wired.state.copy(
+      annotations = wired.state.annotations ++ mappings))
+    val wiredEmitter = new SemanticCleanEmitter
+    val wiredEmission = new Compiler(Seq(firrtl.options.Dependency.fromTransform(wiredEmitter)), Forms.LowForm, Set(wiredEmitter))
+      .execute(wiredConstrained.copy(annotations = wiredConstrained.annotations :+
+        firrtl.EmitCircuitAnnotation(wiredEmitter.getClass)))
+    val wiredFiles = Seq(
+      ".native-clock-cut.fir" -> wired.state.circuit.serialize,
+      ".native-clock-cut.json" -> wired.binding,
+      ".native-clock-cut.sv" -> wiredEmission.getEmittedCircuit.value) ++ wiredConstrained.annotations.collect {
+        case a: midas.passes.XDCOutputAnnotation => (".native-clock-cut" + a.suffix.get) -> a.fileBody
+      }
+    val wiredBinding = canonical(JObject(List(
+      "binding_version" -> JInt(1), "scope" -> JString("native_functional_clock_cut_companion_only"),
+      "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
+      "production_freeze_owners_bound" -> JBool(false), "metasim_restore_supported" -> JBool(false),
+      "inputs" -> JObject((wiredFiles ++ Seq(
+        ".native-functional-emission.json" -> binding, ".native-descriptors-emission.json" -> descriptorBinding))
+        .map { case (name, body) => name -> JString(sha256(body)) }.toList))))
+    input.copy(annotations = input.annotations ++ (files ++ descriptorFiles ++ wiredFiles).map { case (name, body) =>
       GoldenGateOutputFileAnnotation(body, name)
     } ++ Seq(GoldenGateOutputFileAnnotation(binding, ".native-functional-emission.json"),
-      GoldenGateOutputFileAnnotation(descriptorBinding, ".native-descriptors-emission.json")))
+      GoldenGateOutputFileAnnotation(descriptorBinding, ".native-descriptors-emission.json"),
+      GoldenGateOutputFileAnnotation(wiredBinding, ".native-clock-cut-emission.json")))
   }
 }

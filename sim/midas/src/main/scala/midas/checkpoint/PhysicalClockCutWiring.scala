@@ -56,12 +56,28 @@ object PhysicalClockCutWiring {
       fail("exactly one clock plan and wiring probe request required")
   }
 
-  def generate(input: CircuitState, manifest: String, plan: String): Result = {
+  def generate(input: CircuitState, manifest: String, plan: String): Result =
+    generateImpl(input, manifest, plan, None)
+
+  /** Compose only independently reconstructed native banks from this original
+    * circuit. The endpoint's ckpt_clock is deliberately not root-clock masked.
+    * No reset/external-owner acknowledgement or production admission is added.
+    */
+  def generateNative(input: CircuitState, manifest: String, plan: String, dependencies: String,
+      banks: GeneratedStateBankAccess.Result): Result = {
+    // The descriptor factory reconstructs the banks and checks annotations,
+    // selectors, instrumentation and same-reference physical CE identities.
+    midas.widgets.CheckpointCaptureDescriptors.fromNativeGenerated(banks, input, manifest, plan, dependencies)
+    generateImpl(input, manifest, plan, Some(banks))
+  }
+
+  private def generateImpl(input: CircuitState, manifest: String, plan: String,
+      banks: Option[GeneratedStateBankAccess.Result]): Result = {
     if (input.form != LowForm) fail("resolved LowForm required")
     if (plan != PhysicalClockCutPlan.discover(input, manifest)) fail("stale or altered clock plan")
     val doc = parse(plan)
     val rootClock = (doc \ "common_source_clock").asInstanceOf[JString].s
-    val state = PhysicalClockCutPlan.explicitConnections(input)
+    val state = PhysicalClockCutPlan.explicitConnections(banks.map(_.state).getOrElse(input))
     val live = GeneratedExternalOwners.instances(state, state.circuit.main)
     val reachable = live.map(_._2.name).toSet
     val modules = state.circuit.modules.map(m => m.name -> m).toMap
@@ -149,9 +165,17 @@ object PhysicalClockCutWiring {
     val flowed = firrtl.passes.ResolveFlows.run(typed)
     firrtl.passes.CheckTypes.run(flowed)
     firrtl.passes.CheckFlows.run(flowed)
-    val resolved = CircuitState(flowed, LowForm, Seq(firrtl.transforms.NoCircuitDedupAnnotation))
+    // Wiring adds ports and one root primitive, but renames no existing target.
+    // Preserve the native bank generator's independently validated annotations
+    // and their specialized physical pin constraints. The ordinary detached
+    // probe keeps its original annotation policy.
+    val annotations: firrtl.AnnotationSeq = banks match {
+      case Some(b) => b.state.annotations
+      case None => Seq(firrtl.transforms.NoCircuitDedupAnnotation)
+    }
+    val resolved = CircuitState(flowed, LowForm, annotations)
     val binding = canonical(JObject(List("wiring_version" -> JInt(1),
-      "scope" -> JString("physical_clock_wiring_probe_only"),
+      "scope" -> JString(if (banks.nonEmpty) "native_functional_clock_cut_companion_only" else "physical_clock_wiring_probe_only"),
       "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
       "ce_dependency_closure_proven" -> JBool(false), "production_annotations_translated" -> JBool(false),
       "reference_sha256" -> JString(sha256(input.circuit.serialize)),
@@ -165,7 +189,14 @@ object PhysicalClockCutWiring {
       "remaining_obligations" -> JArray(Seq("connected_atomic_cut_controller", "external_ce_reset_and_memory_writer_freeze",
         "physical_latch_bank_and_metasim_restore_mapping", "production_annotation_and_xdc_translation",
         "functional_memory_timing_bridge_host_and_pre_fame_ownership", "connected_ungated_mmio_dma_transport")
-        .map(JString(_)).toList))))
+        .map(JString(_)).toList)) ++ banks.toList.flatMap { b => List(
+          "functional_binding_sha256" -> JString(sha256(b.binding)),
+          "functional_instrumented_sha256" -> JString(sha256(b.state.circuit.serialize)),
+          "access_clock" -> JString("ckpt_clock"),
+          "access_clock_contract" -> JString("tie_to_ungated_common_source"),
+          "functional_freeze_contract" -> JString("hold_clock_mask_through_endpoint_drain"),
+          "bank_annotations_preserved" -> JBool(true),
+          "production_freeze_owners_bound" -> JBool(false), "metasim_restore_supported" -> JBool(false)) }))
     Result(resolved, binding)
   }
 

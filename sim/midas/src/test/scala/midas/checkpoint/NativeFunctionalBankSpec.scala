@@ -152,7 +152,7 @@ class NativeFunctionalBankSpec extends AnyFlatSpec {
     val result = NativeFunctionalBankProbe(requested)
     assert(result.circuit == original.circuit)
     val files = result.annotations.collect { case a: midas.stage.GoldenGateOutputFileAnnotation => a }
-    assert(files.size == 17 && files.map(_.fileSuffix).distinct.size == 17)
+    assert(files.size == 23 && files.map(_.fileSuffix).distinct.size == 23)
     val receipt = parse(files.find(_.fileSuffix == ".native-functional-emission.json").get.body)
     assert((receipt \ "deployable_capture_image") == JBool(false))
     files.filter(f => f.fileSuffix.startsWith(".native-functional") && f.fileSuffix != ".native-functional-emission.json").foreach { f =>
@@ -166,8 +166,14 @@ class NativeFunctionalBankSpec extends AnyFlatSpec {
     }
     assert((descriptors \ "inputs" \ ".native-functional-emission.json") ==
       JString(SemanticStateInventory.sha256(files.find(_.fileSuffix == ".native-functional-emission.json").get.body)))
+    val wiring = parse(files.find(_.fileSuffix == ".native-clock-cut-emission.json").get.body)
+    files.filter(f => f.fileSuffix.startsWith(".native-clock-cut") &&
+      f.fileSuffix != ".native-clock-cut-emission.json").foreach { f =>
+      assert((wiring \ "inputs" \ f.fileSuffix) == JString(SemanticStateInventory.sha256(f.body)))
+    }
     intercept[IllegalArgumentException] { NativeFunctionalBankProbe(result) }
-    Seq(".native-descriptors.json", ".native-descriptors-host.inc", ".native-descriptors-emission.json").foreach { suffix =>
+    Seq(".native-descriptors.json", ".native-descriptors-host.inc", ".native-descriptors-emission.json",
+      ".native-clock-cut.sv", ".native-clock-cut-emission.json").foreach { suffix =>
       intercept[IllegalArgumentException] { NativeFunctionalBankProbe(requested.copy(annotations =
         requested.annotations :+ midas.stage.GoldenGateOutputFileAnnotation("existing", suffix))) }
     }
@@ -198,6 +204,34 @@ class NativeFunctionalBankSpec extends AnyFlatSpec {
     val xdc = emitted.annotations.collect { case a: midas.passes.XDCOutputAnnotation => a.fileBody }.mkString
     assert(xdc.contains("left_/gate/O") && xdc.contains("right_/gate/O"))
     GeneratedStateBankAccess.validateAnnotationBinding(generated)
+    val wired = PhysicalClockCutWiring.generateNative(s, m, p, d, generated)
+    val wiredXDC = midas.passes.WriteXDCFile.execute(wired.state.copy(annotations =
+      wired.state.annotations :+ XDCPathToCircuitAnnotation(None, None)))
+      .annotations.collect { case a: midas.passes.XDCOutputAnnotation => a.fileBody }.mkString
+    assert(wiredXDC == xdc)
+    val rtl = emit(wired.state)
+    assert(rtl.contains("assign gate_I = checkpoint_physical_source_clock;"))
+    assert(rtl.contains("always @(posedge ckpt_clock)"))
+    assert((parse(wired.binding) \ "bank_annotations_preserved") == JBool(true))
+  }
+
+  it should "reject native wiring with coherently changed banks, selectors or source identity" in {
+    val s = input
+    val m = SimulatorStateInventory.discover(s); val p = PhysicalClockCutPlan.discover(s, m)
+    val d = PhysicalClockCutDependencies.discover(s, m, p)
+    val good = GeneratedStateBankAccess.generatePhysicalCompanion(s, m, p, d)
+    val changed = good.state.copy(circuit = good.state.circuit.copy(info = firrtl.ir.FileInfo("changed")))
+    val binding = SemanticStateInventory.canonical(parse(good.binding) merge JObject(List(
+      "instrumented_sha256" -> JString(SemanticStateInventory.sha256(changed.circuit.serialize)))))
+    Seq(good.copy(state = changed, binding = binding),
+      good.copy(entries = good.entries.updated(0, good.entries.head.copy(slot = 12))),
+      good.copy(binding = good.binding.replace("\"complete_fpga_capture\":false", "\"complete_fpga_capture\":true")))
+      .foreach { bad => intercept[IllegalArgumentException] {
+        PhysicalClockCutWiring.generateNative(s, m, p, d, bad)
+      }}
+    intercept[IllegalArgumentException] {
+      PhysicalClockCutWiring.generateNative(s, m, p, d + " ", good)
+    }
   }
 
 }
