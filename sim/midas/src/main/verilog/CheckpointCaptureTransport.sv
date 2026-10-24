@@ -106,7 +106,10 @@ module CheckpointCaptureTransport #(
     assign dma_valid = (state == HEADER || state == DATA || state == TRAILER)
                        && read_enable && !abort && !reset;
     assign dma_last = state == TRAILER;
-    assign dma_abort = abort || fault || (freeze && !read_enable &&
+    // Reset invalidates even a complete trailer waiting for publication. Do
+    // not depend on freeze: the coordinator drops freeze immediately on reset.
+    // The downstream DMA adapter must discard its unpublished stream on abort.
+    assign dma_abort = reset || abort || fault || (freeze && !read_enable &&
                        state != WAIT_CUT && state != WAIT_PUBLISH && state != IDLE);
 
     always @* begin

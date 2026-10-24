@@ -9,12 +9,16 @@ module CheckpointPhysicalCaptureTransport #(
     parameter integer GATES = 3,
     parameter integer OWNERS = 1,
     parameter integer ENTRIES = 1,
+    // Use the compiler's hierarchy-preserving native gate network. Control,
+    // transport and the network's source clock must remain ungated.
+    parameter integer EXTERNAL_CLOCK_NETWORK = 0,
     parameter [255:0] MANIFEST_SHA256 = 256'b0
 ) (
     input wire clock, reset,
     input wire [GATES-1:0] ce,
     output wire root_clock,
     output wire [GATES-1:0] gate_clock,
+    output wire clock_mask,
     output wire [GATES-1:0] captured_ce,
     output wire physical_stopped, physical_read_enable, physical_failed,
     output wire [63:0] physical_cut_cycle,
@@ -59,10 +63,12 @@ module CheckpointPhysicalCaptureTransport #(
     // source edge, after the common falling-edge unmask. Feeding this extended
     // hold back into freeze_request would deadlock release.
     assign freeze = transport_freeze || physical_stopped;
-    CheckpointPhysicalClockCut #(.GATES(GATES), .OWNERS(OWNERS)) physical (
+    CheckpointPhysicalClockCut #(.GATES(GATES), .OWNERS(OWNERS),
+        .EXTERNAL_CLOCK_NETWORK(EXTERNAL_CLOCK_NETWORK)) physical (
         .clock(clock), .reset(reset), .freeze_request(transport_freeze), .ce(ce),
         .target_cycle(target_cycle), .owner_present(owner_present),
         .root_clock(root_clock), .gate_clock(gate_clock),
+        .clock_mask(clock_mask),
         .stopped(physical_stopped), .read_enable(physical_read_enable),
         .failed(physical_failed), .captured_ce(captured_ce),
         .cut_cycle(physical_cut_cycle), .error(physical_error)
