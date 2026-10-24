@@ -5,7 +5,7 @@ import firrtl.annotations.{Annotation, DeletedAnnotation}
 import firrtl.options.{InputAnnotationFileAnnotation, TargetDirAnnotation}
 import firrtl.stage.{AllowUnrecognizedAnnotations, FirrtlFileAnnotation, InfoModeAnnotation, OutputFileAnnotation}
 import chisel3.experimental.EnumAnnotations.EnumDefAnnotation
-import midas.passes.{ChannelClockInfoAnnotation, PreLinkRenamingResultAnnotation}
+import midas.passes.{ChannelClockInfoAnnotation, PreLinkRenamingResultAnnotation, BridgeExtractionResultAnnotation}
 import midas.stage.{ConfigPackageAnnotation, ConfigStringAnnotation, OutputBaseFilenameAnnotation}
 import org.json4s._
 
@@ -60,6 +60,28 @@ private[checkpoint] object SimulatorBankProbeContext {
           "input_sha256" -> JString(a.inputSHA256), "output_sha256" -> JString(a.outputSHA256),
           "module_renames" -> JArray(pairs.map { case (from, to) => JObject(List(
             "from" -> JString(from), "to" -> JString(to))) }.toList))))
+      // Bridge extraction has removed this temporary wrapper and promoted
+      // instances. Preserve their historical identities, never remap them to
+      // the current simulator or infer that they cover physical bridge state.
+      case a: BridgeExtractionResultAnnotation =>
+        def name(s: String): Boolean = s.matches("[A-Za-z_][A-Za-z0-9_$]*")
+        val instances = a.bridgeInstances
+        require(name(a.circuit) && name(a.wrapper) && a.circuit != a.wrapper &&
+          Seq(a.inputSHA256, a.promotedSHA256, a.outputSHA256, a.connectivitySHA256)
+            .forall(_.matches("[0-9a-f]{64}")) && instances.nonEmpty &&
+          instances.distinct.size == instances.size && instances.forall { value =>
+            firrtl.annotations.Target.deserialize(value) match {
+              case t: firrtl.annotations.InstanceTarget => t.circuit == a.wrapper &&
+                t.module == a.wrapper && t.path.isEmpty && name(t.instance) && name(t.ofModule)
+              case _ => false
+            }
+          }, "Simulator bank context: invalid consumed bridge extraction history")
+        Some("bridge_extraction" -> JObject(List(
+          "producer" -> JString("midas.passes.BridgeExtraction"),
+          "circuit" -> JString(a.circuit), "wrapper" -> JString(a.wrapper),
+          "input_sha256" -> JString(a.inputSHA256), "promoted_sha256" -> JString(a.promotedSHA256),
+          "output_sha256" -> JString(a.outputSHA256), "connectivity_sha256" -> JString(a.connectivitySHA256),
+          "bridge_instances" -> JArray(instances.map(JString(_)).toList))))
       // Keys are FAME GLOBAL channel names, not FIRRTL hierarchy references.
       // UpdateBridgeClockInfo consumes these frequencies before SimulationMapping;
       // banking must retain every label and unreduced ratio, not reinterpret it
@@ -80,12 +102,14 @@ private[checkpoint] object SimulatorBankProbeContext {
   def snapshot(annotations: Seq[Annotation], reference: String, instrumented: String): String = {
     val rows = annotations.map(a => row(a).getOrElse(throw new IllegalArgumentException(
       s"Simulator bank context unsupported: ${a.getClass.getName}")))
-    val singleton = rows.filterNot(r => Set("enum_type", "deleted_input", "pre_link_renaming")(r._1)).groupBy(_._1)
+    val singleton = rows.filterNot(r => Set("enum_type", "deleted_input", "pre_link_renaming", "bridge_extraction")(r._1)).groupBy(_._1)
     require(!singleton.exists(_._2.size != 1), "Simulator bank context: duplicate compiler option")
     val deleted = rows.filter(_._1 == "deleted_input")
     require(deleted.distinct.size == deleted.size, "Simulator bank context: duplicate deleted input event")
     val prelinks = rows.filter(_._1 == "pre_link_renaming")
     require(prelinks.distinct.size == prelinks.size, "Simulator bank context: duplicate consumed pre-link history")
+    val extractions = rows.filter(_._1 == "bridge_extraction")
+    require(extractions.size <= 1, "Simulator bank context: duplicate consumed bridge extraction history")
     val enums = rows.collect { case ("enum_type", value) => value }.groupBy(_ \ "name")
     require(!enums.exists(_._2.distinct.size != 1), "Simulator bank context: conflicting enum type definition")
     canonical(JObject(List(

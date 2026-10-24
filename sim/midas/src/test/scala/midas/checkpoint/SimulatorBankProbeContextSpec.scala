@@ -188,6 +188,52 @@ class SimulatorBankProbeContextSpec extends AnyFlatSpec {
     }
   }
 
+  it should "preserve consumed extraction history without retargeting the removed wrapper" in {
+    val h = midas.passes.BridgeExtractionTestFixture.history
+    val result = probe(Seq(h))
+    assert(result.annotations.contains(h) && result.circuit == probe(Nil).circuit)
+    val row = (context(Seq(h)) \ "annotations").asInstanceOf[JArray].arr.head
+    assert((row \ "kind") == JString("bridge_extraction"))
+    assert((row \ "value" \ "wrapper") == JString(h.wrapper))
+    assert((row \ "value" \ "bridge_instances") == JArray(h.bridgeInstances.map(JString(_)).toList))
+    assert((row \ "value" \ "connectivity_sha256") == JString(h.connectivitySHA256))
+    Seq(h, h.copy(inputSHA256 = "1" * 64)).foreach { other =>
+      assert(intercept[IllegalArgumentException](probe(Seq(h, other))).getMessage.contains("duplicate consumed bridge"))
+    }
+  }
+
+  it should "reject malformed extraction names hashes instances and wrappers" in {
+    val h = midas.passes.BridgeExtractionTestFixture.history
+    val first = Target.deserialize(h.bridgeInstances.head).asInstanceOf[InstanceTarget]
+    Seq(h.copy(circuit = ""), h.copy(wrapper = h.circuit), h.copy(inputSHA256 = "bad"),
+      h.copy(promotedSHA256 = "A" * 64), h.copy(outputSHA256 = ""), h.copy(connectivitySHA256 = "no"),
+      h.copy(bridgeInstances = Nil), h.copy(bridgeInstances = h.bridgeInstances :+ h.bridgeInstances.head),
+      h.copy(bridgeInstances = Seq(first.copy(circuit = "Other").serialize)),
+      h.copy(bridgeInstances = Seq(first.copy(module = h.circuit).serialize)),
+      h.copy(bridgeInstances = Seq(first.instOf("nested", "Other").serialize)),
+      h.copy(bridgeInstances = Seq(ModuleTarget(h.wrapper, h.wrapper).serialize))).foreach { a =>
+      assert(intercept[IllegalArgumentException](probe(Seq(a))).getMessage.contains("invalid consumed bridge"))
+    }
+  }
+
+  it should "reject dropped or altered extraction history at both final-emission boundaries" in {
+    val h = midas.passes.BridgeExtractionTestFixture.history
+    val original = probe(Seq(h))
+    val xdc = midas.targetutils.xdc.XDCFiles.allFiles.map(f => midas.passes.XDCOutputAnnotation("", Some(f.fileSuffix)))
+    SimulatorBankProbe.emissionBinding(original, "fixture RTL", original.annotations ++ xdc)
+    Seq(None, Some(h.copy(inputSHA256 = "0" * 64)), Some(h.copy(promotedSHA256 = "1" * 64)),
+      Some(h.copy(outputSHA256 = "2" * 64)), Some(h.copy(connectivitySHA256 = "3" * 64)),
+      Some(h.copy(bridgeInstances = h.bridgeInstances.reverse))).foreach { change =>
+      val annotations = original.annotations.filterNot(_ == h) ++ change.toSeq
+      Seq((original.copy(annotations = annotations), original.annotations ++ xdc),
+        (original, annotations ++ xdc), (original.copy(annotations = annotations), annotations ++ xdc)).foreach {
+        case (state, emitted) => assert(intercept[IllegalArgumentException] {
+          SimulatorBankProbe.emissionBinding(state, "fixture RTL", emitted)
+        }.getMessage.contains("compiler context changed"))
+      }
+    }
+  }
+
   it should "reject duplicate compiler options and conflicting enum definitions" in {
     Seq(Seq(InfoModeAnnotation("use"), InfoModeAnnotation("ignore")),
       Seq(ConfigStringAnnotation("A"), ConfigStringAnnotation("A")),

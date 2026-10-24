@@ -15,6 +15,21 @@ import firrtl.annotations._
 
 import scala.collection.mutable
 
+/** Historical extraction identities are intentionally strings, not live FIRRTL
+  * targets: their temporary wrapper and bridge instances no longer exist.
+  * Keep the actual promoted circuit and generated connectivity hash bound to
+  * the event; this is compiler provenance, not physical bridge-owner coverage.
+  */
+case class BridgeExtractionResultAnnotation(
+  circuit: String,
+  wrapper: String,
+  inputSHA256: String,
+  promotedSHA256: String,
+  outputSHA256: String,
+  bridgeInstances: Seq[String],
+  connectivitySHA256: String,
+) extends NoTargetAnnotation
+
 private[passes] class BridgeExtraction extends firrtl.Transform {
 
   case class BridgeInstance(target: InstanceTarget) extends SingleTargetAnnotation[InstanceTarget] {
@@ -25,8 +40,6 @@ private[passes] class BridgeExtraction extends firrtl.Transform {
   override def name = "[MIDAS] Bridge Extraction"
   def inputForm     = MidForm
   def outputForm    = MidForm
-
-  private val bridgeMods = new mutable.HashSet[String]()
 
   // Taken from extract model -- recursively calls PromoteSubmodule until all
   // bridges live at the top of the module hierarchy
@@ -58,7 +71,7 @@ private[passes] class BridgeExtraction extends firrtl.Transform {
     val instAnnos = bridgeInsts.collect({ case bridge :: parent :: _ =>
       BridgeInstance(InstanceTarget(c.main, parent.module, Nil, bridge.name, bridge.module))
     })
-    state.copy(annotations = state.annotations ++ instAnnos)
+    state.copy(annotations = state.annotations ++ instAnnos.distinct)
   }
 
   def getBridgeConnectivity(
@@ -213,11 +226,26 @@ private[passes] class BridgeExtraction extends firrtl.Transform {
     val commutedState = commuteBridgeAnnotations(promotedState)
 
     // Remove all bridge modules and the dummy top wrapper
-    val modulesToRemove = bridgeMods += topWrapperName
+    val modulesToRemove = Set(topWrapperName)
     val prunedCircuit   = commutedState.circuit.copy(
       modules = promotedState.circuit.modules.filterNot(m => modulesToRemove(m.name)),
       main    = c.main,
     )
-    commutedState.copy(circuit = prunedCircuit)
+    val instances = promotedState.annotations.collect { case BridgeInstance(target) => target.serialize }
+    require(instances.nonEmpty && instances.distinct.size == instances.size,
+      "BridgeExtraction requires unique promoted bridge instances")
+    require(promotedState.annotations.collect { case BridgeInstance(target) => target }.forall(t =>
+      t.circuit == topWrapperName && t.module == topWrapperName && t.path.isEmpty),
+      "BridgeExtraction requires every bridge at the temporary wrapper")
+    val connectivity = commutedState.annotations.collect {
+      case a: firesim.lib.bridgeutils.BridgeIOAnnotation => a
+      case a: FAMEChannelConnectionAnnotation => a
+    }
+    val hash = midas.checkpoint.SemanticStateInventory.sha256 _
+    val history = BridgeExtractionResultAnnotation(c.main, topWrapperName,
+      hash(c.serialize), hash(promotedState.circuit.serialize), hash(prunedCircuit.serialize),
+      instances, hash(JsonProtocol.serialize(connectivity)))
+    commutedState.copy(circuit = prunedCircuit,
+      annotations = commutedState.annotations.filterNot(_.isInstanceOf[BridgeInstance]) :+ history)
   }
 }

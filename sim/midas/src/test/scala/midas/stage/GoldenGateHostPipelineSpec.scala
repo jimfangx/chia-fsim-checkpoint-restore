@@ -121,6 +121,7 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
       firrtl.passes.memlib.PassthroughSimpleSyncReadMemsAnnotation)
     val context = Seq(
       midas.passes.PreLinkRenamingTestFixture.history,
+      midas.passes.BridgeExtractionTestFixture.history,
       firrtl.stage.InfoModeAnnotation("use"),
       firrtl.stage.OutputFileAnnotation("fixture.fir"),
       firrtl.options.TargetDirAnnotation("checkpoint-fixture"),
@@ -153,6 +154,12 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
     val historicalLink = midas.passes.PreLinkRenamingTestFixture.run()
     save("pre-link-input.fir", midas.passes.PreLinkRenamingTestFixture.input.serialize)
     save("pre-link-output.fir", historicalLink.circuit.serialize)
+    val extraction = midas.passes.BridgeExtractionTestFixture.run()
+    save("bridge-extraction-input.fir", midas.passes.BridgeExtractionTestFixture.input.circuit.serialize)
+    save("bridge-extraction-promoted.fir", extraction.promoted.circuit.serialize)
+    save("bridge-extraction-output.fir", midas.passes.BridgeExtractionTestFixture.result().circuit.serialize)
+    save("bridge-extraction-connectivity.json", firrtl.annotations.JsonProtocol.serialize(
+      midas.passes.BridgeExtractionTestFixture.connectivity(extraction.commuted)))
     policies.foreach(c => assert(a.contains(c)))
     val sv = verilog(a)
     assert(sv.contains("ckpt_freeze") && sv.contains("ckpt_clock") && sv.contains("ckpt_saved_data"))
