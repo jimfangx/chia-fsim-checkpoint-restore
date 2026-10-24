@@ -3,7 +3,7 @@ package midas.checkpoint
 
 import scala.collection.mutable
 import firrtl.CircuitState
-import firrtl.annotations.{Annotation, JsonProtocol, MemoryFileInlineAnnotation, MemorySynthInit, MemoryNoSynthInit, ReferenceTarget}
+import firrtl.annotations.{Annotation, CircuitName, ComponentName, JsonProtocol, MemoryFileInlineAnnotation, MemorySynthInit, MemoryNoSynthInit, ModuleName, ModuleTarget, ReferenceTarget}
 import firrtl.ir._
 import firrtl.transforms.DontTouchAnnotation
 import org.json4s._
@@ -19,6 +19,7 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     throw new IllegalArgumentException(s"Generated checkpoint bank unsupported: $why")
   private def supported(a: Annotation): Boolean = a match {
     case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: firrtl.transforms.CombinationalPath |
+         _: firrtl.transforms.NoDedupAnnotation | _: firrtl.passes.InlineAnnotation |
          _: SynthesisPlusArgConstantAnnotation => true
     case MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation => true
     case _ => false
@@ -34,7 +35,36 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     // A preservation/initialization contract on one must fail here, rather
     // than be deleted by a compiler rename or an invalid-target cleanup pass.
     val reachable = GeneratedExternalOwners.instances(state, state.circuit.main).map(_._2.name).toSet
+    def moduleTarget(circuit: String, module: String, serialized: String): Unit = {
+      if (circuit != state.circuit.main) fail(s"foreign annotation target: $serialized")
+      if (!reachable(module)) fail(s"annotation target is unreachable: $serialized")
+      if (!state.circuit.modules.exists { case m: Module => m.name == module; case _ => false })
+        fail(s"opaque annotation target: $serialized")
+    }
     state.annotations.foreach {
+      case a: firrtl.transforms.NoDedupAnnotation =>
+        moduleTarget(a.target.circuit, a.target.module, a.target.serialize)
+      case a: firrtl.passes.InlineAnnotation => a.target match {
+        case c: CircuitName =>
+          if (c.name != state.circuit.main) fail(s"foreign annotation target: ${c.serialize}")
+        case m: ModuleName => moduleTarget(m.circuit.name, m.name, m.serialize)
+        case c: ComponentName =>
+          moduleTarget(c.module.circuit.name, c.module.name, c.serialize)
+          val m = state.circuit.modules.collectFirst { case m: Module if m.name == c.module.name => m }.get
+          var concreteInstance = false
+          def visit(s: Statement): Unit = {
+            s match {
+              case i: firrtl.WDefInstance if i.name == c.name =>
+                moduleTarget(c.module.circuit.name, i.module, c.serialize)
+                concreteInstance = true
+              case _ => ()
+            }
+            s.foreachStmt(visit)
+          }
+          visit(m.body)
+          if (!concreteInstance) fail(s"inline annotation requires an exact concrete instance: ${c.serialize}")
+        case target => fail(s"inline annotation requires a circuit, module name or exact instance name: ${target.serialize}")
+      }
       case a: DontTouchAnnotation if !reachable(a.target.module) =>
         fail(s"annotation target is unreachable: ${a.target.serialize}")
       case a: MemoryFileInlineAnnotation if !reachable(a.target.module) =>
@@ -45,7 +75,8 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     }
   }
   def annotationJSON(annotations: Seq[Annotation]): String = JsonProtocol.serialize(annotations.filter {
-    case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: SynthesisPlusArgConstantAnnotation => true
+    case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: SynthesisPlusArgConstantAnnotation |
+         _: firrtl.transforms.NoDedupAnnotation | _: firrtl.passes.InlineAnnotation => true
     case MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation => true
     case _ => false
   }.distinct.sortBy(_.serialize))
@@ -88,9 +119,37 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     }
     val initTargets = mutable.Set.empty[ReferenceTarget]
     val mappings = mutable.ArrayBuffer.empty[JValue]
+    def moduleClones(circuit: String, module: String): Seq[Clone] = {
+      if (circuit != state.circuit.main) fail(s"foreign annotation module: $circuit.$module")
+      val copies = clones.filter(_.originalModule == module)
+      if (copies.isEmpty) fail(s"annotation module is unreachable: $module")
+      copies
+    }
+    def record(source: Annotation, targets: Seq[String]): Unit =
+      mappings += JObject(List("source" -> JString(source.serialize),
+        "targets" -> JArray(targets.map(JString(_)).toList)))
     val requested = state.annotations.flatMap {
       case _: firrtl.transforms.CombinationalPath => Nil // Invalidated path cache, recomputed by Compiler.
       case a @ (MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation) => Seq(a)
+      case a: firrtl.transforms.NoDedupAnnotation =>
+        val copies = moduleClones(a.target.circuit, a.target.module).map(c =>
+          a.copy(target = ModuleTarget(state.circuit.main, c.module)))
+        record(a, copies.map(_.target.serialize))
+        copies
+      case a: firrtl.passes.InlineAnnotation =>
+        // Keep the pending inline request, with every module/instance target
+        // renamed. The bank resolver does not run InlineInstances; consuming
+        // this request later requires rebuilding the hierarchy-bound bank map.
+        val copies = a.target match {
+          case _: CircuitName => Seq(a)
+          case m: ModuleName => moduleClones(m.circuit.name, m.name).map(c =>
+            a.copy(target = ModuleName(c.module, CircuitName(state.circuit.main))))
+          case i: ComponentName => moduleClones(i.module.circuit.name, i.module.name).map(c =>
+            a.copy(target = ComponentName(i.name, ModuleName(c.module, CircuitName(state.circuit.main)))))
+          case target => fail(s"inline annotation target has no translation contract: ${target.serialize}")
+        }
+        record(a, copies.map(_.target.serialize))
+        copies
       case a: DontTouchAnnotation =>
         val copies = targets(a.target, false).map(t => a.copy(target = t))
         mappings += JObject(List("source" -> JString(a.serialize),

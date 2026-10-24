@@ -29,10 +29,12 @@ object SimulatorBankProbe {
     * hierarchy references, must fail rather than silently lose their contract.
     */
   private def bookkeeping(a: firrtl.annotations.Annotation): Boolean = a match {
-    case SimulatorBankProbeAnnotation | _: SimulatorCheckpointInventoryAnnotation |
+    case SimulatorBankProbeAnnotation | SimulatorFPGASynthesisConstantsAnnotation | _: SimulatorCheckpointInventoryAnnotation |
          _: midas.stage.phases.ConfigParametersAnnotation |
          _: firrtl.EmitCircuitAnnotation |
+         _: firrtl.transforms.BlackBoxTargetDirAnno |
          _: midas.targetutils.xdc.XDCPathToCircuitAnnotation => true
+    case a: GoldenGateOutputFileAnnotation if SimulatorFPGASynthesisConstants.isProvenanceFile(a) => true
     case _ => false
   }
 
