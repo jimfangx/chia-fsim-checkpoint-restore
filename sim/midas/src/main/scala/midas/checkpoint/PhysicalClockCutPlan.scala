@@ -28,6 +28,7 @@ object PhysicalClockCutPlan {
     throw new IllegalArgumentException(s"Physical clock cut plan unsupported: $why")
 
   def validateCardinality(annotations: firrtl.AnnotationSeq): Unit = {
+    PhysicalClockCutWiring.validateRequest(annotations)
     val n = annotations.count(_ == PhysicalClockCutPlanAnnotation)
     if (n == 0) return
     if (n != 1) fail("exactly one clock-plan request is required")
@@ -48,7 +49,7 @@ object PhysicalClockCutPlan {
     * them only for analysis, preserving input/output direction and full pin
     * identity. Never infer connectivity from the emitted Verilog spelling.
     */
-  private def explicitConnections(state: CircuitState): CircuitState = {
+  private[checkpoint] def explicitConnections(state: CircuitState): CircuitState = {
     val modules = state.circuit.modules.map(m => m.name -> m).toMap
     def rewrite(s: Statement): Statement = s match {
       case i: WDefInstanceConnector =>
@@ -167,6 +168,7 @@ object PhysicalClockCutPlan {
         "scope" -> JString("physical_clock_topology_only"), "complete_fpga_capture" -> JBool(false),
         "deployable_capture_image" -> JBool(false), "reference_sha256" -> JString(sha256(state.circuit.serialize)),
         "simulator_manifest_sha256" -> JString(sha256(manifest)), "plan_sha256" -> JString(sha256(plan)),
-        "emitted_verilog_sha256" -> JString(sha256(verilog))))), ".physical-clock-plan-emission.json"))
+        "emitted_verilog_sha256" -> JString(sha256(verilog))))), ".physical-clock-plan-emission.json")) ++
+      PhysicalClockCutWiring.emit(state, manifest, plan)
   }
 }

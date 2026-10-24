@@ -1,12 +1,16 @@
 // Component for default SYNC BUFGCEs with ONE common ungated source clock.
-// Not yet wired into the Rocket compiler/image. All positive-edge simulator
+// EXTERNAL_CLOCK_NETWORK connects clock_mask to the compiler-generated mask
+// network, retaining native gates at their original hierarchy. The default
+// component instantiates its own gates. Neither mode admits a Rocket image.
+// All positive-edge simulator
 // owners, including every CE driver and target-cycle counter, must use either
 // root_clock or gate_clock. The transport/control clock remains ungated.
 // Negative-edge, transparent-latch, unrelated-clock and external write owners
 // need separate contracts; owner_present must come from a complete manifest.
 module CheckpointPhysicalClockCut #(
     parameter integer GATES = 3,
-    parameter integer OWNERS = 1
+    parameter integer OWNERS = 1,
+    parameter integer EXTERNAL_CLOCK_NETWORK = 0
 ) (
     input wire clock,
     input wire reset,
@@ -16,6 +20,7 @@ module CheckpointPhysicalClockCut #(
     input wire [OWNERS-1:0] owner_present,
     output wire root_clock,
     output wire [GATES-1:0] gate_clock,
+    output wire clock_mask,
     output wire stopped,
     output wire read_enable,
     output wire failed,
@@ -32,6 +37,7 @@ module CheckpointPhysicalClockCut #(
                          sampled && ce != captured_ce, missing_owner};
     assign failed = |error || (sampled && |faults);
     assign stopped = freeze_low;
+    assign clock_mask = freeze_low;
     // Publication/read permission disappears combinationally on a new fault.
     assign read_enable = sampled && freeze_low && freeze_request && !failed && !reset;
 
@@ -43,10 +49,16 @@ module CheckpointPhysicalClockCut #(
         else if (freeze_request || |error) freeze_low <= 1'b1;
         else if (release_pending) freeze_low <= 1'b0;
     end
+    // The external mode must instantiate no duplicate clock gates.
+    generate if (EXTERNAL_CLOCK_NETWORK == 0) begin : internal_clock_network
     BUFGCE root_gate (.I(clock), .CE(!freeze_low), .O(root_clock));
     genvar g;
-    generate for (g = 0; g < GATES; g = g + 1) begin : gates
+    for (g = 0; g < GATES; g = g + 1) begin : gates
         BUFGCE gate (.I(clock), .CE(ce[g] && !freeze_low), .O(gate_clock[g]));
+    end
+    end else begin : external_clock_network
+        assign root_clock = 1'b0;
+        assign gate_clock = {GATES{1'b0}};
     end endgenerate
 
     // This ungated positive edge is AFTER the stopped low phase. CE drivers

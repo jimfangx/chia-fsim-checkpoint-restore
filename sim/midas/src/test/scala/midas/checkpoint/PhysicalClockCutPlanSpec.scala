@@ -12,7 +12,7 @@ import org.json4s.native.JsonMethods.parse
 import org.scalatest.flatspec.AnyFlatSpec
 
 class PhysicalClockCutPlanSpec extends AnyFlatSpec {
-  private val source = """circuit PhysicalPlanTop :
+  private[checkpoint] val source = """circuit PhysicalPlanTop :
   extmodule Native :
     input I : Clock
     input CE : UInt<1>
@@ -81,6 +81,12 @@ class PhysicalClockCutPlanSpec extends AnyFlatSpec {
     val emittedPlan = plan(emittedState)
     assert((emittedPlan \ "common_source_clock") == (doc \ "common_source_clock"))
     assert((emittedPlan \ "sequential_consumers").asInstanceOf[JArray].arr.size == consumers.size)
+    // The real emitter reference includes internal width-preserving primops
+    // (addw/subw), which cannot be round-tripped through FIRRTL's parser.
+    val finalManifest = SimulatorStateInventory.discover(emittedState)
+    val finalWiring = PhysicalClockCutWiring.generate(emittedState, finalManifest,
+      PhysicalClockCutPlan.discover(emittedState, finalManifest))
+    assert(finalWiring.state.circuit.serialize.contains("checkpoint_physical_root_gate"))
     val requested = s.copy(annotations = s.annotations ++ Seq(PhysicalClockCutPlanAnnotation,
       SimulatorCheckpointInventoryAnnotation(s.circuit.main)))
     val sv = new Compiler(Seq(firrtl.options.Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm)
@@ -102,12 +108,94 @@ class PhysicalClockCutPlanSpec extends AnyFlatSpec {
     }.getMessage.contains("requires a synthesized capture owner"))
   }
 
+  it should "wire independent hierarchy masks with ordered logical CE output and preserve native sources" in {
+    val s = lower(source.replace("output count : UInt<8>", "output count : UInt<64>")
+      .replace("reg cycles : UInt<8>", "reg cycles : UInt<64>"))
+    val manifest = SimulatorStateInventory.discover(s)
+    val requested = s.copy(annotations = s.annotations ++ Seq(PhysicalClockCutPlanAnnotation,
+      PhysicalClockCutWiringProbeAnnotation, SimulatorCheckpointInventoryAnnotation(s.circuit.main)))
+    val files = PhysicalClockCutPlan.emit(requested, manifest, "fixture reference")
+    val fir = files.find(_.fileSuffix == ".physical-clock-wiring.fir").get.body
+    val sv = files.find(_.fileSuffix == ".physical-clock-wiring.sv").get.body
+    val binding = parse(files.find(_.fileSuffix == ".physical-clock-wiring.json").get.body)
+    assert((binding \ "logical_ce_bit_order") == JArray(List(
+      JString("PhysicalPlanTop.left.gate"), JString("PhysicalPlanTop.right.gate"))))
+    assert((binding \ "deployable_capture_image") == JBool(false))
+    assert((binding \ "production_annotations_translated") == JBool(false))
+    assert(fir.contains("reg cycles : UInt<64>, checkpoint_physical_root_gate.O"))
+    assert(fir.contains("gate.I <= checkpoint_physical_source_clock"))
+    assert(fir.contains("left.clock <= checkpoint_physical_root_gate.O"))
+    assert(fir.contains("left.checkpoint_physical_source_clock <= clock"))
+    assert(fir.contains("and(checkpoint_physical_ce_0, not(checkpoint_physical_mask))"))
+    assert(sv.contains("BUFGCE checkpoint_physical_root_gate"))
+    assert(!sv.contains("module BUFGCE"))
+    val r = PhysicalClockCutWiring.generate(s, manifest, PhysicalClockCutPlan.discover(s, manifest))
+    assert(intercept[IllegalArgumentException] {
+      GeneratedStateBankAccess.generate(r.state, SimulatorStateInventory.discover(r.state), separateAccessClock = true)
+    }.getMessage.contains("requires a synthesized capture owner"))
+    intercept[IllegalArgumentException] { PhysicalClockCutWiring.generate(s, manifest, "{}") }
+    val collision = lower(source.replace("    output count : UInt<8>", "    output count : UInt<8>\n    wire checkpoint_physical_mask : UInt<1>\n    checkpoint_physical_mask <= UInt<1>(0)"))
+    assert(intercept[IllegalArgumentException] {
+      PhysicalClockCutWiring.generate(collision, SimulatorStateInventory.discover(collision),
+        PhysicalClockCutPlan.discover(collision, SimulatorStateInventory.discover(collision)))
+    }.getMessage.contains("identifier collision"))
+    for (as <- Seq(Seq(PhysicalClockCutWiringProbeAnnotation),
+      Seq(PhysicalClockCutPlanAnnotation, PhysicalClockCutWiringProbeAnnotation, PhysicalClockCutWiringProbeAnnotation)))
+      intercept[IllegalArgumentException] { PhysicalClockCutPlan.validateCardinality(as) }
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { dir =>
+      val out = Paths.get(dir).resolve("physical-wiring"); Files.createDirectories(out)
+      val emitter = new SemanticCleanEmitter
+      val original = new Compiler(Seq(firrtl.options.Dependency.fromTransform(emitter)), Forms.LowForm, Set(emitter))
+        .execute(s.copy(annotations = Seq(firrtl.EmitCircuitAnnotation(emitter.getClass))))
+      (Seq("reference.fir" -> s.circuit.serialize, "manifest.json" -> manifest,
+        "reference.sv" -> original.getEmittedCircuit.value) ++ files.map(a => a.fileSuffix.stripPrefix(".") -> a.body))
+        .foreach { case (name, value) => Files.write(out.resolve(name), value.getBytes(UTF_8)) }
+    }
+  }
+
   it should "reject independent roots and cascaded physical sources" in {
     val independent = source.replace("    input clock : Clock\n    input reset : UInt<1>\n    output a", "    input clock : Clock\n    input other : Clock\n    input reset : UInt<1>\n    output a")
       .replace("right.clock <= clock", "right.clock <= other")
     assert(intercept[IllegalArgumentException](plan(lower(independent))).getMessage.contains("one functional root"))
     val cascaded = source.replace("    left.clock <= clock", "    inst outer of Native\n    outer.I <= clock\n    outer.CE <= UInt<1>(1)\n    left.clock <= outer.O")
     assert(intercept[IllegalArgumentException](plan(lower(cascaded))).getMessage.contains("cascaded physical source"))
+  }
+
+  it should "route complete CE vectors through repeated nested modules and direct native gates" in {
+    val nested = source.replace("circuit PhysicalPlanTop :", "circuit PhysicalPlanTop :")
+      .replace("  module PhysicalPlanTop :", "  module Cluster :") + """
+  module PhysicalPlanTop :
+    input clock : Clock
+    input reset : UInt<1>
+    output a : UInt<8>
+    output b : UInt<8>
+    inst east of Cluster
+    inst west of Cluster
+    east.clock <= clock
+    west.clock <= clock
+    east.reset <= reset
+    west.reset <= reset
+    a <= east.a
+    b <= west.b
+    inst direct of Native
+    direct.I <= clock
+    direct.CE <= bits(east.count, 0, 0)
+    reg direct_saved : UInt<8>, direct.O
+    direct_saved <= east.count
+"""
+    val s = lower(nested); val manifest = SimulatorStateInventory.discover(s)
+    val result = PhysicalClockCutWiring.generate(s, manifest, PhysicalClockCutPlan.discover(s, manifest))
+    val binding = parse(result.binding)
+    assert((binding \ "logical_ce_bit_order") == JArray(List("direct", "east.left.gate", "east.right.gate",
+      "west.left.gate", "west.right.gate").map(p => JString("PhysicalPlanTop." + p))))
+    val fir = result.state.circuit.serialize
+    assert(fir.contains("direct.I <= clock"))
+    assert(fir.contains("direct.CE <= and(checkpoint_physical_ce_0, not(checkpoint_physical_mask))"))
+    assert(fir.contains("east.checkpoint_physical_source_clock <= clock"))
+    assert(fir.contains("left.checkpoint_physical_source_clock <= checkpoint_physical_source_clock"))
+    assert(fir.contains("bits(east.checkpoint_physical_logical_ce, 1, 1)"))
+    assert(fir.contains("input checkpoint_physical_source_clock : Clock"))
+    assert(fir.contains("output checkpoint_physical_logical_ce : UInt<5>"))
   }
 
   it should "reject stale inventory computed clocks opaque owners and altered native definitions" in {
