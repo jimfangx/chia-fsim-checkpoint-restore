@@ -52,7 +52,8 @@ object SimulatorBankProbe {
     validateRequest(input)
     if (!input.annotations.contains(SimulatorBankProbeAnnotation)) return input
     val (metadata, storage) = input.annotations.partition(bookkeeping)
-    val reference = input.copy(annotations = storage)
+    val (context, owners) = storage.partition(SimulatorBankProbeContext.accepts)
+    val reference = input.copy(annotations = owners)
     val manifest = SimulatorStateInventory.discover(reference)
     // generate() preflights every remaining annotation and translates all
     // supported targets. No user/physical constraint is dropped here.
@@ -66,11 +67,14 @@ object SimulatorBankProbe {
       "state" -> JArray(descriptors.entries.map(e => JObject(List(
         "state_id" -> JString(e.stateID), "bank" -> JInt(e.bank), "slot" -> JInt(e.slot),
         "width" -> JInt(e.width), "depth" -> JInt(e.depth)))).toList))))
-    generated.state.copy(annotations = generated.state.annotations ++ metadata ++ Seq(
+    val compilerContext = SimulatorBankProbeContext.snapshot(context,
+      reference.circuit.serialize, generated.state.circuit.serialize)
+    generated.state.copy(annotations = generated.state.annotations ++ metadata ++ context ++ Seq(
       GoldenGateOutputFileAnnotation(reference.circuit.serialize, ".bank-probe-reference.fir"),
       GoldenGateOutputFileAnnotation(manifest, ".bank-probe-state.json"),
       GoldenGateOutputFileAnnotation(generated.state.circuit.serialize, ".bank-probe-instrumented.fir"),
       GoldenGateOutputFileAnnotation(generated.binding, ".bank-probe-binding.json"),
+      GoldenGateOutputFileAnnotation(compilerContext, ".bank-probe-context.json"),
       GoldenGateOutputFileAnnotation(descriptorJSON, ".bank-probe-descriptors.json")))
   }
 
@@ -79,7 +83,7 @@ object SimulatorBankProbe {
     if (!state.annotations.contains(SimulatorBankProbeAnnotation)) return Nil
     val files = state.annotations.collect { case a: GoldenGateOutputFileAnnotation => a.fileSuffix -> a.body }.toMap
     val names = Seq(".bank-probe-reference.fir", ".bank-probe-state.json", ".bank-probe-instrumented.fir",
-      ".bank-probe-binding.json", ".bank-probe-descriptors.json")
+      ".bank-probe-binding.json", ".bank-probe-descriptors.json", ".bank-probe-context.json")
     val hashes = names.map { n =>
       val body = files.getOrElse(n, fail(s"missing generated artifact $n"))
       n -> JString(sha256(body))

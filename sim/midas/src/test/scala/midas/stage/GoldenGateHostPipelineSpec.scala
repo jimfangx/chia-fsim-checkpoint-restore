@@ -116,6 +116,13 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
 
   it should "emit functional generated banks through the real backend and bind every probe input" in {
     val injection = new InjectBankHostState
+    val context = Seq(
+      firrtl.stage.InfoModeAnnotation("use"),
+      firrtl.stage.OutputFileAnnotation("fixture.fir"),
+      firrtl.options.TargetDirAnnotation("checkpoint-fixture"),
+      ConfigPackageAnnotation("fixture.config"), ConfigStringAnnotation("FixtureConfig"),
+      OutputBaseFilenameAnnotation("fixture"), firrtl.stage.AllowUnrecognizedAnnotations,
+      chisel3.experimental.EnumAnnotations.EnumDefAnnotation("fixture.Mode", Map("idle" -> BigInt(0), "busy" -> BigInt(3))))
     val constraints = Seq(
       midas.InternalXDCAnnotation(midas.targetutils.xdc.XDCFiles.Synthesis,
         "set_property DONT_TOUCH true [get_cells {}]",
@@ -124,17 +131,22 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
         "set_false_path -from [get_ports {}]",
         ReferenceTarget("HostPipeline", "HostPipeline", Nil, "reset", Nil)))
     val a = compile(inventory = true, Seq(injection),
-      Seq(midas.checkpoint.SimulatorBankProbeAnnotation) ++ constraints)
+      Seq(midas.checkpoint.SimulatorBankProbeAnnotation) ++ constraints ++ context)
+    context.foreach(c => assert(a.contains(c)))
     val sv = verilog(a)
     assert(sv.contains("ckpt_freeze") && sv.contains("ckpt_clock") && sv.contains("ckpt_saved_data"))
     val names = Seq(".bank-probe-reference.fir", ".bank-probe-state.json", ".bank-probe-instrumented.fir",
-      ".bank-probe-binding.json", ".bank-probe-descriptors.json", ".bank-probe-emission.json")
+      ".bank-probe-binding.json", ".bank-probe-descriptors.json", ".bank-probe-context.json", ".bank-probe-emission.json")
     val binding = parse(file(a, names.last))
     assert((binding \ "deployable_capture_image") == JBool(false))
     assert((binding \ "emitted_verilog_sha256") == JString(SemanticStateInventory.sha256(sv)))
     names.dropRight(1).foreach { n =>
       assert((binding \ "inputs" \ n) == JString(SemanticStateInventory.sha256(file(a, n))))
     }
+    val compilerContext = parse(file(a, ".bank-probe-context.json"))
+    assert((compilerContext \ "reference_sha256") == JString(SemanticStateInventory.sha256(file(a, names.head))))
+    assert((compilerContext \ "instrumented_sha256") == JString(SemanticStateInventory.sha256(file(a, names(2)))))
+    assert((compilerContext \ "annotations").asInstanceOf[JArray].arr.size == context.size)
     val rows = (parse(file(a, ".bank-probe-state.json")) \ "state").asInstanceOf[JArray].arr
     assert(rows.size == 2 && rows.exists(r => (r \ "hierarchy") == JString("HostPipeline.host_owner")))
     assert(rows.exists(r => (r \ "hierarchy") == JString("HostPipeline.consumer.always")))
