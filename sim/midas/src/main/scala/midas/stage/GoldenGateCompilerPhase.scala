@@ -57,6 +57,15 @@ class GoldenGateCompilerPhase extends Phase {
       new Compiler(Forms.LowForm ++ Seq(Dependency[InferReadWrite], Dependency[MidasTransforms]), Forms.LowForm)
         .execute(loweredTarget)
 
+    compileSimulator(simulator)
+  }
+
+  /** Shared production path from the mapped simulator to its final RTL.
+    * Keep the returned host-transform state: injected storage, clock wiring and
+    * annotations must reach both the FPGA backend and checkpoint inventory.
+    */
+  private[stage] def compileSimulator(simulator: CircuitState)(
+      implicit p: org.chipsalliance.cde.config.Parameters): AnnotationSeq = {
     // Note: the final lowering to Verilog is broken up into multiple firrtl.Compiler steps
     // to avoid breakages that can emerge from "legal" but unsound pass orderings
     // due to underspecified pass constraints + invalidations
@@ -72,7 +81,7 @@ class GoldenGateCompilerPhase extends Phase {
     )
     logger.info("Post-GG Host Transformation Ordering\n")
     logger.info(loweringCompiler.prettyPrint("  "))
-    loweringCompiler.execute(simulator)
+    val hostTransformedSimulator = loweringCompiler.execute(simulator)
 
     // Ensure FPGA backend passes run after all user-provided + ILA transforms, but before final emission
     val fpgaBackendCompiler  = new Compiler(
@@ -86,19 +95,24 @@ class GoldenGateCompilerPhase extends Phase {
     )
     logger.info("FPGA Backend Transformation Ordering\n")
     logger.info(fpgaBackendCompiler.prettyPrint("  "))
-    val postLoweredSimulator = fpgaBackendCompiler.execute(simulator)
+    val postLoweredSimulator = fpgaBackendCompiler.execute(hostTransformedSimulator)
 
     // Workaround under-constrained transform dependencies by forcing the
     // emitter to run last in a separate compiler.
     val semanticMap = postLoweredSimulator.annotations.contains(midas.checkpoint.SemanticFAMEStateMapAnnotation)
-    val verilogEmitter = if (semanticMap) new midas.checkpoint.SemanticCleanEmitter else new firrtl.SystemVerilogEmitter
+    val simulatorInventory = postLoweredSimulator.annotations.exists(
+      _.isInstanceOf[midas.checkpoint.SimulatorCheckpointInventoryAnnotation])
+    // The observer captures the emitter's own VerilogPrep/rename result. Never
+    // rerun those transforms on its returned (pre-emission) CircuitState.
+    val observeEmission = semanticMap || simulatorInventory
+    val verilogEmitter = if (observeEmission) new midas.checkpoint.SemanticCleanEmitter else new firrtl.SystemVerilogEmitter
     val emitter = new Compiler(Seq(Dependency(midas.passes.WriteXDCFile), Dependency.fromTransform(verilogEmitter)),
       Forms.LowForm, Set(verilogEmitter))
     logger.info("Final Emission Transformation Ordering\n")
     logger.info(emitter.prettyPrint("  "))
 
     val emissionInput = if (semanticMap) midas.checkpoint.SemanticFAMEStateMap.prepareEmission(postLoweredSimulator) else postLoweredSimulator
-    val emitted = emitter.execute(if (semanticMap) emissionInput.copy(annotations =
+    val emitted = emitter.execute(if (observeEmission) emissionInput.copy(annotations =
       emissionInput.annotations.filterNot(_.isInstanceOf[firrtl.EmitCircuitAnnotation]) :+
         firrtl.EmitCircuitAnnotation(verilogEmitter.getClass)) else emissionInput)
     val semanticMapFiles = if (!semanticMap) Seq.empty else {
@@ -106,15 +120,26 @@ class GoldenGateCompilerPhase extends Phase {
       Seq(midas.checkpoint.SemanticFAMEStateMap.emit(actual, emitted.getEmittedCircuit.value),
         GoldenGateOutputFileAnnotation(emitted.getEmittedCircuit.value, ".semantic-fame-emitted.sv"))
     }
-    // The emitter returns its input circuit; reproduce its private lowering
-    // on that input solely for read-only inventory, keeping emitted RTL and
-    // compiler behavior unchanged. Do not rerun user HostTransforms here.
-    if (emitted.annotations.exists(_.isInstanceOf[midas.checkpoint.SimulatorCheckpointInventoryAnnotation])) {
-      val emissionIR = new firrtl.SystemVerilogEmitter().transforms.foldLeft(emitted) {
-        case (s, transform) => transform.runTransform(s)
-      }
+    if (simulatorInventory) {
+      val emissionIR = verilogEmitter.asInstanceOf[midas.checkpoint.SemanticCleanEmitter].preparedState
+        .getOrElse(throw new IllegalStateException("checkpoint inventory: emitter did not expose its actual state"))
       val inventoried = midas.checkpoint.SimulatorStateInventory(emissionIR)
-      emitted.annotations ++ inventoried.annotations.drop(emissionIR.annotations.size) ++ semanticMapFiles
+      val files = inventoried.annotations.drop(emissionIR.annotations.size)
+      val manifest = files.collectFirst {
+        case GoldenGateOutputFileAnnotation(body, ".simulator-state.json") => body
+      }.get
+      import org.json4s._
+      import midas.checkpoint.SemanticStateInventory.{canonical, sha256}
+      val binding = canonical(JObject(List(
+        "binding_version" -> JInt(1), "host_pipeline_version" -> JInt(2),
+        "scope" -> JString("generated_rtl_only"), "external_runtime_required" -> JBool(true),
+        "host_transformed_circuit_sha256" -> JString(sha256(hostTransformedSimulator.circuit.serialize)),
+        "fpga_backend_circuit_sha256" -> JString(sha256(postLoweredSimulator.circuit.serialize)),
+        "emission_reference_sha256" -> JString(sha256(emissionIR.circuit.serialize)),
+        "simulator_manifest_sha256" -> JString(sha256(manifest)),
+        "emitted_verilog_sha256" -> JString(sha256(emitted.getEmittedCircuit.value)))))
+      emitted.annotations ++ files ++ semanticMapFiles :+
+        GoldenGateOutputFileAnnotation(binding, ".simulator-emission.json")
     } else emitted.annotations ++ semanticMapFiles
   }
 }
