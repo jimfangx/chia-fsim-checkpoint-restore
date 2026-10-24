@@ -66,6 +66,8 @@ class GoldenGateCompilerPhase extends Phase {
     */
   private[stage] def compileSimulator(simulator: CircuitState)(
       implicit p: org.chipsalliance.cde.config.Parameters): AnnotationSeq = {
+    // Validate cardinality before Compiler canonicalizes annotation sequences.
+    midas.checkpoint.SimulatorBankProbe.validateRequest(simulator)
     // Note: the final lowering to Verilog is broken up into multiple firrtl.Compiler steps
     // to avoid breakages that can emerge from "legal" but unsound pass orderings
     // due to underspecified pass constraints + invalidations
@@ -95,7 +97,12 @@ class GoldenGateCompilerPhase extends Phase {
     )
     logger.info("FPGA Backend Transformation Ordering\n")
     logger.info(fpgaBackendCompiler.prettyPrint("  "))
-    val postLoweredSimulator = fpgaBackendCompiler.execute(hostTransformedSimulator)
+    val backendSimulator = fpgaBackendCompiler.execute(hostTransformedSimulator)
+    if (backendSimulator.annotations.contains(midas.checkpoint.SimulatorBankProbeAnnotation)) {
+      require(p(midas.core.CheckpointCaptureTopKey).isEmpty,
+        "Simulator bank probe cannot surround its own live capture transport")
+    }
+    val postLoweredSimulator = midas.checkpoint.SimulatorBankProbe(backendSimulator.copy(form = firrtl.LowForm))
 
     // Workaround under-constrained transform dependencies by forcing the
     // emitter to run last in a separate compiler.
@@ -115,6 +122,8 @@ class GoldenGateCompilerPhase extends Phase {
     val emitted = emitter.execute(if (observeEmission) emissionInput.copy(annotations =
       emissionInput.annotations.filterNot(_.isInstanceOf[firrtl.EmitCircuitAnnotation]) :+
         firrtl.EmitCircuitAnnotation(verilogEmitter.getClass)) else emissionInput)
+    val bankProbeFiles = midas.checkpoint.SimulatorBankProbe.emissionBinding(
+      postLoweredSimulator, emitted.getEmittedCircuit.value)
     val semanticMapFiles = if (!semanticMap) Seq.empty else {
       val actual = verilogEmitter.asInstanceOf[midas.checkpoint.SemanticCleanEmitter].preparedState.get
       Seq(midas.checkpoint.SemanticFAMEStateMap.emit(actual, emitted.getEmittedCircuit.value),
@@ -138,8 +147,8 @@ class GoldenGateCompilerPhase extends Phase {
         "emission_reference_sha256" -> JString(sha256(emissionIR.circuit.serialize)),
         "simulator_manifest_sha256" -> JString(sha256(manifest)),
         "emitted_verilog_sha256" -> JString(sha256(emitted.getEmittedCircuit.value)))))
-      emitted.annotations ++ files ++ semanticMapFiles :+
+      emitted.annotations ++ files ++ semanticMapFiles ++ bankProbeFiles :+
         GoldenGateOutputFileAnnotation(binding, ".simulator-emission.json")
-    } else emitted.annotations ++ semanticMapFiles
+    } else emitted.annotations ++ semanticMapFiles ++ bankProbeFiles
   }
 }

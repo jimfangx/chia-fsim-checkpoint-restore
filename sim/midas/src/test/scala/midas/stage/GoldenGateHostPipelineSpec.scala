@@ -56,6 +56,13 @@ private class RejectHostState extends InjectHostState {
     throw new IllegalArgumentException("host owner binding rejected")
 }
 
+private class InjectBankHostState extends InjectHostState {
+  override def execute(state: CircuitState): CircuitState = {
+    val changed = super.execute(state)
+    changed.copy(annotations = changed.annotations.filterNot(_ == HostPipelineMarker))
+  }
+}
+
 class GoldenGateHostPipelineSpec extends AnyFlatSpec {
   private val source = """circuit HostPipeline :
   module HostConsumer :
@@ -81,7 +88,8 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
   private def lower = new Compiler(Forms.LowForm).execute(
     CircuitState(Parser.parse(source), ChirrtlForm)).copy(form = LowForm)
 
-  private def compile(inventory: Boolean, transforms: Seq[Transform] = Nil): firrtl.AnnotationSeq = {
+  private def compile(inventory: Boolean, transforms: Seq[Transform] = Nil,
+                      extra: firrtl.AnnotationSeq = Nil): firrtl.AnnotationSeq = {
     implicit val p: Parameters = Parameters.empty.alterPartial {
       case HostTransforms => transforms.map(Dependency.fromTransform(_))
     }
@@ -90,7 +98,7 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
       HostClockSink(ReferenceTarget("HostPipeline", "HostPipeline", Nil, "consumer", Nil).field("clock")),
       XDCPathToCircuitAnnotation(None, None),
       firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter])) ++
-      (if (inventory) Seq(SimulatorCheckpointInventoryAnnotation("HostPipeline")) else Nil)
+      (if (inventory) Seq(SimulatorCheckpointInventoryAnnotation("HostPipeline")) else Nil) ++ extra
     new GoldenGateCompilerPhase().compileSimulator(lower.copy(annotations = annos))
   }
   private def verilog(a: firrtl.AnnotationSeq): String = a.collectFirst {
@@ -105,6 +113,45 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
   }
 
   behavior.of("Golden Gate production host-to-FPGA pipeline")
+
+  it should "emit functional generated banks through the real backend and bind every probe input" in {
+    val injection = new InjectBankHostState
+    val a = compile(inventory = true, Seq(injection), Seq(midas.checkpoint.SimulatorBankProbeAnnotation))
+    val sv = verilog(a)
+    assert(sv.contains("ckpt_freeze") && sv.contains("ckpt_clock") && sv.contains("ckpt_saved_data"))
+    val names = Seq(".bank-probe-reference.fir", ".bank-probe-state.json", ".bank-probe-instrumented.fir",
+      ".bank-probe-binding.json", ".bank-probe-descriptors.json", ".bank-probe-emission.json")
+    val binding = parse(file(a, names.last))
+    assert((binding \ "deployable_capture_image") == JBool(false))
+    assert((binding \ "emitted_verilog_sha256") == JString(SemanticStateInventory.sha256(sv)))
+    names.dropRight(1).foreach { n =>
+      assert((binding \ "inputs" \ n) == JString(SemanticStateInventory.sha256(file(a, n))))
+    }
+    val rows = (parse(file(a, ".bank-probe-state.json")) \ "state").asInstanceOf[JArray].arr
+    assert(rows.size == 2 && rows.exists(r => (r \ "hierarchy") == JString("HostPipeline.host_owner")))
+    assert(rows.exists(r => (r \ "hierarchy") == JString("HostPipeline.consumer.always")))
+    // Final emitted-state inventory additionally owns the bank response latch.
+    assert((parse(file(a, ".simulator-state.json")) \ "state").asInstanceOf[JArray].arr.size == 5)
+    save("bank-probe.sv", sv)
+    names.foreach(n => save(n.drop(1), file(a, n)))
+  }
+
+  it should "reject unknown annotation ownership before bank specialization" in {
+    val e = intercept[IllegalArgumentException] {
+      compile(inventory = true, Seq(new InjectHostState), Seq(midas.checkpoint.SimulatorBankProbeAnnotation))
+    }
+    assert(e.getMessage.contains("HostPipelineMarker"))
+  }
+
+  it should "reject duplicate bank probes and a partial inventory root" in {
+    val probe = midas.checkpoint.SimulatorBankProbeAnnotation
+    val duplicate = intercept[IllegalArgumentException] { compile(inventory = false, extra = Seq(probe, probe)) }
+    assert(duplicate.getMessage.contains("exactly one"))
+    val partial = intercept[IllegalArgumentException] {
+      compile(inventory = false, extra = Seq(probe, SimulatorCheckpointInventoryAnnotation("HostConsumer")))
+    }
+    assert(partial.getMessage.contains("complete circuit root"))
+  }
 
   it should "retain actual host-injected storage, behavior and annotations through final emission" in {
     val injection = new InjectHostState
