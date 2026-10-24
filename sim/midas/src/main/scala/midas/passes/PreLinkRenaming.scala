@@ -12,6 +12,18 @@ import firrtl.Mappers._
 // We want to preserve the module names of the circuit we are wrapping (the child),
 // so we reference its namespace to generate new names.
 private[passes] case class PreLinkRenamingAnnotation(ns: Namespace) extends NoTargetAnnotation
+
+/** Immutable history of an already executed linker pass. Module names refer
+  * to the historical input/output circuits, never the current hierarchy. Do
+  * not retain the consumed mutable Namespace as a live compiler request.
+  */
+case class PreLinkRenamingResultAnnotation(
+  circuit: String,
+  inputSHA256: String,
+  outputSHA256: String,
+  moduleRenames: Seq[(String, String)],
+) extends NoTargetAnnotation
+
 private[passes] object PreLinkRenaming extends firrtl.Transform {
 
   override def name = "[Golden Gate] Pre-link Module Renaming"
@@ -30,7 +42,9 @@ private[passes] object PreLinkRenaming extends firrtl.Transform {
   }).map(updateInsts(nameMap))
 
   def execute(state: CircuitState): CircuitState = {
-    val childNamespace = state.annotations.collectFirst({ case PreLinkRenamingAnnotation(ns) => ns }).get
+    val requests = state.annotations.collect { case a: PreLinkRenamingAnnotation => a }
+    require(requests.size == 1, "PreLinkRenaming requires exactly one namespace request")
+    val childNamespace = requests.head.ns
     val circuit        = state.circuit
     require(!childNamespace.contains(circuit.main), "Submodule in child has same name as parent's top")
 
@@ -50,8 +64,13 @@ private[passes] object PreLinkRenaming extends firrtl.Transform {
 
     renameMap.setCircuit(circuit.main)
 
+    val renamed = circuit.copy(modules = circuit.modules.map(updateModNames(namePairs.toMap)))
+    val history = PreLinkRenamingResultAnnotation(circuit.main,
+      midas.checkpoint.SemanticStateInventory.sha256(circuit.serialize),
+      midas.checkpoint.SemanticStateInventory.sha256(renamed.serialize), namePairs)
     state.copy(
-      circuit = circuit.copy(modules = circuit.modules.map(updateModNames(namePairs.toMap))),
+      circuit = renamed,
+      annotations = state.annotations.filterNot(_.isInstanceOf[PreLinkRenamingAnnotation]) :+ history,
       renames = Some(renameMap),
     )
   }

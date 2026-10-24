@@ -120,6 +120,7 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
       firrtl.passes.memlib.DefaultReadFirstAnnotation,
       firrtl.passes.memlib.PassthroughSimpleSyncReadMemsAnnotation)
     val context = Seq(
+      midas.passes.PreLinkRenamingTestFixture.history,
       firrtl.stage.InfoModeAnnotation("use"),
       firrtl.stage.OutputFileAnnotation("fixture.fir"),
       firrtl.options.TargetDirAnnotation("checkpoint-fixture"),
@@ -149,6 +150,9 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
         firrtl.transforms.DedupedResult(firrtl.annotations.ModuleTarget("Historical", "Deleted"), None, -1)) ++
         constraints ++ context ++ policies)
     context.foreach(c => assert(a.contains(c)))
+    val historicalLink = midas.passes.PreLinkRenamingTestFixture.run()
+    save("pre-link-input.fir", midas.passes.PreLinkRenamingTestFixture.input.serialize)
+    save("pre-link-output.fir", historicalLink.circuit.serialize)
     policies.foreach(c => assert(a.contains(c)))
     val sv = verilog(a)
     assert(sv.contains("ckpt_freeze") && sv.contains("ckpt_clock") && sv.contains("ckpt_saved_data"))

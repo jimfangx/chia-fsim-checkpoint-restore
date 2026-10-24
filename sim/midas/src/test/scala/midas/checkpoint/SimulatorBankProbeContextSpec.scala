@@ -146,6 +146,48 @@ class SimulatorBankProbeContextSpec extends AnyFlatSpec {
     }
   }
 
+  it should "preserve consumed pre-link history independently of the current hierarchy" in {
+    val h = midas.passes.PreLinkRenamingTestFixture.history
+    val result = probe(Seq(h))
+    assert(result.annotations.contains(h) && result.circuit == probe(Nil).circuit)
+    val row = (context(Seq(h)) \ "annotations").asInstanceOf[JArray].arr.head
+    assert((row \ "kind") == JString("pre_link_renaming"))
+    assert((row \ "value" \ "circuit") == JString("HistoricalWrapper"))
+    assert((row \ "value" \ "input_sha256") == JString(h.inputSHA256))
+    assert((row \ "value" \ "output_sha256") == JString(h.outputSHA256))
+    assert((row \ "value" \ "module_renames").asInstanceOf[JArray].arr.size == 3)
+    assert(intercept[IllegalArgumentException](probe(Seq(h, h))).getMessage.contains("duplicate consumed pre-link"))
+  }
+
+  it should "reject malformed consumed pre-link identities hashes and nonbijective mappings" in {
+    val h = midas.passes.PreLinkRenamingTestFixture.history
+    Seq(h.copy(circuit = ""), h.copy(inputSHA256 = "bad"), h.copy(outputSHA256 = "A" * 64),
+      h.copy(moduleRenames = Nil), h.copy(moduleRenames = h.moduleRenames.dropRight(1)),
+      h.copy(moduleRenames = h.moduleRenames :+ h.moduleRenames.head),
+      h.copy(moduleRenames = h.moduleRenames.updated(0, "" -> "Shared_0")),
+      h.copy(moduleRenames = h.moduleRenames.updated(0, "Shared" -> "External_0"))).foreach { a =>
+      assert(intercept[IllegalArgumentException](probe(Seq(a))).getMessage.contains("invalid consumed pre-link"))
+    }
+  }
+
+  it should "reject dropped or altered pre-link history at both final-emission boundaries" in {
+    val h = midas.passes.PreLinkRenamingTestFixture.history
+    val original = probe(Seq(h))
+    val xdc = midas.targetutils.xdc.XDCFiles.allFiles.map(f => midas.passes.XDCOutputAnnotation("", Some(f.fileSuffix)))
+    SimulatorBankProbe.emissionBinding(original, "fixture RTL", original.annotations ++ xdc)
+    val changes = Seq(None, Some(h.copy(inputSHA256 = "0" * 64)), Some(h.copy(outputSHA256 = "1" * 64)),
+      Some(h.copy(moduleRenames = h.moduleRenames.updated(0, "Shared" -> "OtherShared"))))
+    changes.foreach { change =>
+      val annotations = original.annotations.filterNot(_ == h) ++ change.toSeq
+      Seq((original.copy(annotations = annotations), original.annotations ++ xdc),
+        (original, annotations ++ xdc), (original.copy(annotations = annotations), annotations ++ xdc)).foreach {
+        case (state, emitted) => assert(intercept[IllegalArgumentException] {
+          SimulatorBankProbe.emissionBinding(state, "fixture RTL", emitted)
+        }.getMessage.contains("compiler context changed"))
+      }
+    }
+  }
+
   it should "reject duplicate compiler options and conflicting enum definitions" in {
     Seq(Seq(InfoModeAnnotation("use"), InfoModeAnnotation("ignore")),
       Seq(ConfigStringAnnotation("A"), ConfigStringAnnotation("A")),
