@@ -1,0 +1,191 @@
+// See LICENSE for license details.
+package midas.checkpoint
+
+import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.{Files, Paths}
+import firrtl.{ChirrtlForm, CircuitState, LowForm, Parser}
+import firrtl.ir.{ExtModule, Module}
+import firrtl.stage.Forms
+import firrtl.stage.transforms.Compiler
+import org.json4s._
+import org.json4s.native.JsonMethods.parse
+import org.scalatest.flatspec.AnyFlatSpec
+
+class NativeFunctionalBankSpec extends AnyFlatSpec {
+  private val source = """circuit NativeStorage :
+  extmodule Native :
+    input I : Clock
+    input CE : UInt<1>
+    output O : Clock
+    defname = BUFGCE
+  module Leaf :
+    input clock : Clock
+    input reset : UInt<1>
+    input enable : UInt<1>
+    output count : UInt<65>
+    inst gate of Native
+    gate.I <= clock
+    gate.CE <= enable
+    reg value : UInt<65>, gate.O with :
+      reset => (reset, UInt<65>(0))
+    value <= add(value, UInt<1>(1))
+    count <= value
+  module NativeStorage :
+    input clock : Clock
+    input reset : UInt<1>
+    input enable : UInt<2>
+    input address : UInt<3>
+    input data : UInt<130>
+    input write : UInt<1>
+    output left_count : UInt<65>
+    output right_count : UInt<65>
+    output cycle : UInt<64>
+    output read_data : UInt<130>
+    reg cycles : UInt<64>, clock with :
+      reset => (reset, UInt<64>(0))
+    cycles <= add(cycles, UInt<1>(1))
+    cycle <= cycles
+    inst left of Leaf
+    inst right of Leaf
+    left.clock <= clock
+    right.clock <= clock
+    left.reset <= reset
+    right.reset <= reset
+    left.enable <= bits(enable, 0, 0)
+    right.enable <= bits(enable, 1, 1)
+    left_count <= left.count
+    right_count <= right.count
+    mem ram :
+      data-type => UInt<130>
+      depth => 8
+      reader => r
+      writer => w
+      read-latency => 1
+      write-latency => 1
+      read-under-write => old
+    ram.r.clk <= clock
+    ram.r.en <= UInt<1>(1)
+    ram.r.addr <= address
+    ram.w.clk <= clock
+    ram.w.en <= write
+    ram.w.addr <= address
+    ram.w.data <= data
+    ram.w.mask <= UInt<1>(1)
+    read_data <= ram.r.data
+"""
+  private def input = new Compiler(Forms.LowForm).execute(CircuitState(Parser.parse(source),
+    ChirrtlForm, Seq(firrtl.transforms.NoCircuitDedupAnnotation))).copy(form = LowForm)
+  private val out = sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").map(Paths.get(_).resolve("native-functional"))
+    .getOrElse(Files.createTempDirectory("native-functional-"))
+  Files.createDirectories(out)
+  private def save(name: String, body: String): Unit = Files.write(out.resolve(name), body.getBytes(UTF_8))
+  private def emit(s: CircuitState): String = {
+    val emitter = new SemanticCleanEmitter
+    new Compiler(Seq(firrtl.options.Dependency.fromTransform(emitter)), Forms.LowForm, Set(emitter))
+      .execute(s.copy(annotations = s.annotations :+ firrtl.EmitCircuitAnnotation(emitter.getClass)))
+      .getEmittedCircuit.value
+  }
+
+  behavior.of("Native functional storage readout companion")
+  it should "retain exact native leaves and every concrete storage word with an independent endpoint clock" in {
+    val s = input
+    val manifest = SimulatorStateInventory.discover(s)
+    val plan = PhysicalClockCutPlan.discover(s, manifest)
+    val deps = PhysicalClockCutDependencies.discover(s, manifest, plan)
+    val inventory = GeneratedStateBankAccess.physicalFunctionalInventory(s, manifest, plan, deps)
+    val result = GeneratedStateBankAccess.generatePhysicalCompanion(s, manifest, plan, deps)
+    GeneratedStateBankAccess.validateAnnotationBinding(result)
+    val rows = (parse(inventory) \ "state").asInstanceOf[JArray].arr
+    assert(rows.size == 5 && result.entries.size == 5)
+    assert(rows.forall(r => (r \ "adapter") != JString("metasim-bufgce-v1")))
+    assert(result.state.circuit.modules.collect { case m: ExtModule => m } ==
+      s.circuit.modules.collect { case m: ExtModule => m })
+    assert((parse(result.binding) \ "scope") == JString("native_functional_readout_companion_only"))
+    Seq("complete_fpga_capture", "deployable_capture_image", "production_freeze_owners_bound",
+      "metasim_restore_supported").foreach(k => assert((parse(result.binding) \ k) == JBool(false)))
+    // Neither legacy descriptor admission nor the ordinary bank path is widened.
+    intercept[IllegalArgumentException] { midas.widgets.CheckpointCaptureDescriptors.fromGenerated(result, inventory) }
+    assert(intercept[IllegalArgumentException] {
+      GeneratedStateBankAccess.generate(s, manifest, separateAccessClock = true)
+    }.getMessage.contains("requires a synthesized capture owner"))
+    save("reference.fir", s.circuit.serialize); save("manifest.json", manifest)
+    save("physical-clock-plan.json", plan); save("physical-clock-dependencies.json", deps)
+    save("functional-inventory.json", inventory); save("binding.json", result.binding)
+    save("instrumented.fir", result.state.circuit.serialize); save("instrumented.sv", emit(result.state))
+    val reference = s.copy(circuit = s.circuit.copy(main = "NativeReference", modules = s.circuit.modules.map {
+      case m: Module if m.name == s.circuit.main => m.copy(name = "NativeReference")
+      case m => m
+    }), annotations = Nil)
+    save("reference.sv", emit(reference))
+    println(s"NATIVE_FUNCTIONAL_BANK_ELABORATED out=$out entries=${rows.size}")
+  }
+
+  it should "reject stale inventories, CE dependencies, topology, and coherently changed native definitions" in {
+    val s = input
+    val m = SimulatorStateInventory.discover(s); val p = PhysicalClockCutPlan.discover(s, m)
+    val d = PhysicalClockCutDependencies.discover(s, m, p)
+    Seq((m + " ", p, d), (m, p + " ", d), (m, p, d + " ")).foreach { case (mm, pp, dd) =>
+      intercept[IllegalArgumentException] { GeneratedStateBankAccess.generatePhysicalCompanion(s, mm, pp, dd) }
+    }
+    val altered = s.copy(circuit = s.circuit.copy(modules = s.circuit.modules.map {
+      case e: ExtModule => e.copy(params = Seq(firrtl.ir.IntParam("IS_I_INVERTED", 1)))
+      case x => x
+    }))
+    intercept[IllegalArgumentException] {
+      GeneratedStateBankAccess.generatePhysicalCompanion(altered, m, p, d)
+    }
+    val good = GeneratedStateBankAccess.generatePhysicalCompanion(s, m, p, d)
+    val bad = good.copy(binding = good.binding.replace("NativeStorage.left_.gate", "NativeStorage.missing.gate"))
+    intercept[IllegalArgumentException] { GeneratedStateBankAccess.validateAnnotationBinding(bad) }
+    val fake = good.copy(binding = good.binding.replace("\"complete_fpga_capture\":false", "\"complete_fpga_capture\":true"))
+    intercept[IllegalArgumentException] { GeneratedStateBankAccess.validateAnnotationBinding(fake) }
+  }
+  it should "emit a separate sibling only under an explicit whole-root native probe request" in {
+    val original = input
+    val requested = original.copy(annotations = original.annotations ++ Seq(
+      NativeFunctionalBankProbeAnnotation, PhysicalClockCutPlanAnnotation,
+      SimulatorCheckpointInventoryAnnotation(original.circuit.main),
+      midas.targetutils.xdc.XDCPathToCircuitAnnotation(None, None),
+      midas.InternalXDCAnnotation(midas.targetutils.xdc.XDCFiles.Synthesis,
+        "set_property DONT_TOUCH true [get_cells {}]",
+        firrtl.annotations.ModuleTarget("NativeStorage", "Leaf").ref("gate"))))
+    val result = NativeFunctionalBankProbe(requested)
+    assert(result.circuit == original.circuit)
+    val files = result.annotations.collect { case a: midas.stage.GoldenGateOutputFileAnnotation => a }
+    assert(files.size == 11 && files.map(_.fileSuffix).distinct.size == 11)
+    val receipt = parse(files.find(_.fileSuffix == ".native-functional-emission.json").get.body)
+    assert((receipt \ "deployable_capture_image") == JBool(false))
+    files.filterNot(_.fileSuffix == ".native-functional-emission.json").foreach { f =>
+      assert((receipt \ "inputs" \ f.fileSuffix) == JString(SemanticStateInventory.sha256(f.body)))
+    }
+    intercept[IllegalArgumentException] { NativeFunctionalBankProbe(result) }
+    Seq(PhysicalClockCutPlanAnnotation, SimulatorCheckpointInventoryAnnotation(original.circuit.main)).foreach { missing =>
+      intercept[IllegalArgumentException] { NativeFunctionalBankProbe(requested.copy(
+        annotations = requested.annotations.filterNot(_ == missing))) }
+    }
+    intercept[IllegalArgumentException] { NativeFunctionalBankProbe(requested.copy(
+      annotations = requested.annotations :+ SimulatorBankProbeAnnotation)) }
+  }
+
+  it should "preserve correlated native pin constraints through real storage specialization" in {
+    import firrtl.annotations.ModuleTarget
+    import midas.InternalXDCAnnotation
+    import midas.targetutils.xdc.{XDCFiles, XDCPathToCircuitAnnotation}
+    val original = input
+    val pin = ModuleTarget("NativeStorage", "Leaf").instOf("gate", "Native").ref("O")
+    val constraint = InternalXDCAnnotation(XDCFiles.Implementation,
+      "set_max_delay 7.0 -from [get_pins {}]", pin)
+    val s = original.copy(annotations = original.annotations :+ constraint)
+    val m = SimulatorStateInventory.discover(s); val p = PhysicalClockCutPlan.discover(s, m)
+    val d = PhysicalClockCutDependencies.discover(s, m, p)
+    val generated = GeneratedStateBankAccess.generatePhysicalCompanion(s, m, p, d)
+    val constraints = generated.state.annotations.collect { case a: InternalXDCAnnotation => a }
+    assert(constraints.size == 2 && constraints.map(_.argumentList.head.module).distinct.size == 2)
+    val emitted = midas.passes.WriteXDCFile.execute(generated.state.copy(annotations =
+      generated.state.annotations :+ XDCPathToCircuitAnnotation(None, None)))
+    val xdc = emitted.annotations.collect { case a: midas.passes.XDCOutputAnnotation => a.fileBody }.mkString
+    assert(xdc.contains("left_/gate/O") && xdc.contains("right_/gate/O"))
+    GeneratedStateBankAccess.validateAnnotationBinding(generated)
+  }
+
+}

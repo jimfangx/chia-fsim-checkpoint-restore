@@ -59,8 +59,30 @@ object GeneratedStateBankAccess {
     }
     if (gates.nonEmpty) require((doc \ "clock_gate_adapters") == GeneratedClockGateAdapter.binding(gates),
       "checkpoint descriptors: altered clock-gate adapter binding")
+    val nativePaths = (doc \ "native_clock_gate_paths") match {
+      case JNothing => Set.empty[String]
+      case JArray(rows) =>
+        val paths = rows.map { case JString(p) => p; case _ => fail("malformed native gate paths") }
+        require(paths.nonEmpty && paths == paths.distinct.sorted, "checkpoint descriptors: unordered native gate paths")
+        paths.toSet
+      case _ => fail("malformed native gate paths")
+    }
+    if (nativePaths.nonEmpty) {
+      require((doc \ "scope") == JString("native_functional_readout_companion_only") &&
+        (doc \ "complete_fpga_capture") == JBool(false) &&
+        (doc \ "deployable_capture_image") == JBool(false) &&
+        (doc \ "production_freeze_owners_bound") == JBool(false) &&
+        (doc \ "metasim_restore_supported") == JBool(false) &&
+        (doc \ "instrumented_sha256") == JString(SemanticStateInventory.sha256(result.state.circuit.serialize)),
+        "native banks cannot admit capture or altered instrumentation")
+      val actual = GeneratedExternalOwners.instances(result.state, result.state.circuit.main).collect {
+        case (path, m: ExtModule) if m.defname == "BUFGCE" =>
+          PhysicalClockGateContract.validate(result.state, m); path
+      }.toSet
+      require(actual == nativePaths, "checkpoint descriptors: native gate ownership changed")
+    }
     require((doc \ "functional_clock_domains") == clockDomains(result.state.circuit,
-      accessClock == JString("ckpt_clock"), gates, instrumented = true),
+      accessClock == JString("ckpt_clock"), gates ++ nativePaths, instrumented = true, physicalPaths = nativePaths),
       "checkpoint descriptors: missing or altered functional clock domains")
   }
   private def fail(message: String): Nothing =
@@ -103,6 +125,9 @@ object GeneratedStateBankAccess {
     private val modules = circuit.modules.map(m => m.name -> m).toMap
     private def concrete(name: String, path: String): Module = modules(name) match {
       case m: Module => m
+      // Analysis scope only: no synthetic body enters generated/emitted IR.
+      // The clock() rule below resolves exact native O to gated I provenance.
+      case m: ExtModule if physicalPaths(path) => Module(m.info, m.name, m.ports, EmptyStmt)
       case _ => fail(s"opaque functional clock owner at $path")
     }
     private def carrier(t: Type): Boolean = t == ClockType || t == UIntType(IntWidth(1))
@@ -326,8 +351,9 @@ object GeneratedStateBankAccess {
     * input bindings. This proves wiring only, not CDC or atomic-cut ownership.
     */
   private def clockDomains(circuit: Circuit, hasAccessClock: Boolean,
-                           gates: Set[String], instrumented: Boolean): JArray =
-    new ClockProvenance(circuit, hasAccessClock, gates, instrumented).domains
+                           gates: Set[String], instrumented: Boolean,
+                           physicalPaths: Set[String]): JArray =
+    new ClockProvenance(circuit, hasAccessClock, gates, instrumented, physicalPaths).domains
   private def snippet(text: String): Seq[Statement] = {
     val m = Parser.parse("circuit Scratch :\n  module Scratch :\n" +
       text.linesIterator.map("    " + _).mkString("\n") + "\n").modules.head.asInstanceOf[Module]
@@ -427,14 +453,54 @@ object GeneratedStateBankAccess {
     */
   def generate(input: CircuitState, manifest: String,
                bindings: Option[Seq[StateAccessEntry]] = None,
-               separateAccessClock: Boolean = false): Result = {
+               separateAccessClock: Boolean = false): Result =
+    generateImpl(input, manifest, bindings, separateAccessClock, native = false)
+
+  /** Native leaves stay native. This path proves readout of concrete FIRRTL
+    * storage only; no gate latch, cut owner or production image is admitted.
+    * The independently regenerated plan/dependency closure is mandatory.
+    */
+  def generatePhysicalCompanion(input: CircuitState, manifest: String,
+      plan: String, dependencies: String): Result = {
+    val functional = physicalFunctionalInventory(input, manifest, plan, dependencies)
+    generateImpl(input, functional, None, separateAccessClock = true, native = true)
+  }
+
+  def physicalFunctionalInventory(input: CircuitState, manifest: String,
+      plan: String, dependencies: String): String = {
+    if (plan != PhysicalClockCutPlan.discover(input, manifest) ||
+        dependencies != PhysicalClockCutDependencies.discover(input, manifest, plan))
+      fail("stale native topology, inventory or CE dependencies")
+    nativeInventory(input)
+  }
+
+  private def nativeInventory(input: CircuitState): String = {
+    val doc = parse(SimulatorStateInventory.discover(input))
+    val rows = (doc \ "state").asInstanceOf[JArray].arr.filterNot(r =>
+      (r \ "adapter") == JString("metasim-bufgce-v1"))
+    SemanticStateInventory.canonical(JObject(doc.asInstanceOf[JObject].obj.filterNot {
+      case (key, _) => Set("manifest_type", "state")(key)
+    } ++ List("manifest_type" -> JString("fsckpt-native-functional-companion"),
+      "state" -> JArray(rows), "complete_fpga_capture" -> JBool(false),
+      "deployable_capture_image" -> JBool(false))))
+  }
+
+  private def generateImpl(input: CircuitState, manifest: String,
+      bindings: Option[Seq[StateAccessEntry]], separateAccessClock: Boolean, native: Boolean): Result = {
     if (input.form != LowForm) fail("resolved LowForm required")
     val (prepared, gateModules) = GeneratedClockGateAdapter.prepare(input)
     GeneratedStateBankAnnotations.preflight(prepared)
-    PhysicalClockGateContract.requireCaptureOwner(prepared)
+    val nativePaths = if (!native) {
+      PhysicalClockGateContract.requireCaptureOwner(prepared)
+      Set.empty[String]
+    } else GeneratedExternalOwners.instances(prepared, prepared.circuit.main).collect {
+      case (path, m: ExtModule) if m.defname == "BUFGCE" =>
+        PhysicalClockGateContract.validate(prepared, m); path
+    }.toSet
+    if (native && nativePaths.isEmpty) fail("native companion requires physical clock owners")
     val doc = parse(manifest)
     val root = input.circuit.main
-    val actual = (doc \ "manifest_type") match {
+    val actual = if (native) nativeInventory(input) else (doc \ "manifest_type") match {
       case JString("fsckpt-generated") => SimulatorStateInventory.discover(input)
       case _ => SemanticStateInventory.discover(input, root)
     }
@@ -490,9 +556,9 @@ object GeneratedStateBankAccess {
       CircuitState(Parser.parse(resolutionCircuit.serialize), firrtl.ChirrtlForm,
         (prepared.annotations :+ firrtl.transforms.NoCircuitDedupAnnotation).distinct)).copy(form = LowForm)
     val concreteModules = resolvedPrepared.circuit.modules.map(m => m.name -> m).toMap
-    val clockProvenance = new ClockProvenance(resolvedPrepared.circuit, false, gatePaths.toSet)
+    val clockProvenance = new ClockProvenance(resolvedPrepared.circuit, false, gatePaths.toSet ++ nativePaths, physicalPaths = nativePaths)
     val originalDomains = clockProvenance.domains
-    val generated = mutable.ArrayBuffer.empty[Module]
+    val generated = mutable.ArrayBuffer.empty[DefModule]
     val clones = mutable.ArrayBuffer.empty[GeneratedStateBankAnnotations.Clone]
     val storage = mutable.ArrayBuffer.empty[JValue]
     val covered = mutable.Set.empty[String]
@@ -504,6 +570,7 @@ object GeneratedStateBankAccess {
       if (seenNames(n)) fresh() else { seenNames += n; n }
     }
     def build(moduleName: String, path: String, emittedPath: String, isRoot: Boolean): String = {
+      if (nativePaths(path)) return moduleName
       val (m, pipelineNames, pipelineClocks) = concreteModules(moduleName) match {
         case x: Module => materializePipelines(x, path)
         case _ => fail(s"opaque module at $path")
@@ -646,7 +713,7 @@ object GeneratedStateBankAccess {
               else s"div(ckpt_address, UInt<32>(${(num(logicalByPath(logicalPath(name)), "width").toLong + 63) / 64}))"}, ${bits - 1}, 0)")
         }
       }
-      childInstances.foreach { i =>
+      childInstances.filterNot(i => nativePaths(s"$path.${i.name}")).foreach { i =>
         Seq("freeze", "bank", "slot", "address").foreach(n => readStatements += s"${i.name}.ckpt_$n <= ckpt_$n")
         readers += s"${i.name}.ckpt_match" -> s"${i.name}.ckpt_data"
       }
@@ -706,12 +773,15 @@ ckpt_resp_error <= ckpt_saved_error""")
     if (covered.toSet != byPath.keySet) fail("inventory contains unsupported/hidden/unreachable state")
     // Re-resolve instance signatures and types after adding ports; compilation
     // preserves the specialized module boundaries and lowers synchronous reset.
-    val circuit = input.circuit.copy(modules = generated.toSeq)
+    val nativeModules = GeneratedExternalOwners.instances(prepared, root).collect {
+      case (path, m: ExtModule) if nativePaths(path) => m
+    }.distinct
+    val circuit = input.circuit.copy(modules = generated.toSeq ++ nativeModules)
     val (translated, annotationBinding) = GeneratedStateBankAnnotations.translate(resolvedPrepared, clones.toSeq)
     val resolved = new Compiler(Forms.LowForm).execute(
       CircuitState(Parser.parse(circuit.serialize), firrtl.ChirrtlForm, translated)).copy(form = LowForm)
     val domains = originalDomains
-    require(domains == clockDomains(resolved.circuit, separateAccessClock, gatePaths.toSet, instrumented = true),
+    require(domains == clockDomains(resolved.circuit, separateAccessClock, gatePaths.toSet ++ nativePaths, instrumented = true, physicalPaths = nativePaths),
       "checkpoint bank changed functional clock provenance")
     val binding = SemanticStateInventory.canonical(JObject(List(
       "access_version" -> JInt(if (chunked) 2 else 1),
@@ -719,14 +789,17 @@ ckpt_resp_error <= ckpt_saved_error""")
       "manifest_sha256" -> JString(SemanticStateInventory.sha256(actual)),
       "reference_sha256" -> JString(SemanticStateInventory.sha256(input.circuit.serialize)),
       "instrumented_sha256" -> JString(SemanticStateInventory.sha256(resolved.circuit.serialize)),
-      "scope" -> JString("all_reachable_firrtl_state_only"),
+      "scope" -> JString(if (native) "native_functional_readout_companion_only" else "all_reachable_firrtl_state_only"),
       "access_clock" -> JString(if (separateAccessClock) "ckpt_clock" else
         input.circuit.modules.find(_.name == root).get.ports.find(_.tpe == ClockType).get.name),
       "freeze_contract" -> JString("externally_held_all_functional_owners_before_access_until_drain"),
       "functional_clock_domains" -> domains,
       "annotation_translation" -> annotationBinding,
       "state" -> JArray(storage.sortBy(e => (e \ "state_id").values.toString).toList)) ++
-      (if (gatePaths.isEmpty) Nil else List("clock_gate_adapters" -> GeneratedClockGateAdapter.binding(gatePaths.toSet)))))
+      (if (gatePaths.isEmpty) Nil else List("clock_gate_adapters" -> GeneratedClockGateAdapter.binding(gatePaths.toSet))) ++
+      (if (!native) Nil else List("native_clock_gate_paths" -> JArray(nativePaths.toList.sorted.map(JString(_))),
+        "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
+        "production_freeze_owners_bound" -> JBool(false), "metasim_restore_supported" -> JBool(false)))))
     Result(resolved, entries, binding)
   }
 }

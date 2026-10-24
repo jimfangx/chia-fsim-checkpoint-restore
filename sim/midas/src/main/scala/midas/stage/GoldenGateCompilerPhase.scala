@@ -139,7 +139,8 @@ class GoldenGateCompilerPhase extends Phase {
     val dedupRetiredSimulator = midas.passes.GoldenGateDedupGroups.retire(backendSimulator.copy(form = firrtl.LowForm))
     val inlinedSimulator = midas.passes.ResolveSimulationInline(dedupRetiredSimulator)
     val fpgaConstants = midas.checkpoint.SimulatorFPGASynthesisConstants(inlinedSimulator)
-    val postLoweredSimulator = midas.checkpoint.SimulatorBankProbe(fpgaConstants)
+    val nativeBankCompanion = midas.checkpoint.NativeFunctionalBankProbe(fpgaConstants)
+    val postLoweredSimulator = midas.checkpoint.SimulatorBankProbe(nativeBankCompanion)
 
     // Workaround under-constrained transform dependencies by forcing the
     // emitter to run last in a separate compiler.
