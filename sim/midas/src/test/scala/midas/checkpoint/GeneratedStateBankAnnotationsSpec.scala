@@ -56,6 +56,90 @@ class GeneratedStateBankAnnotationsSpec extends AnyFlatSpec {
 
   behavior.of("Generated bank hierarchy annotation contracts")
 
+  it should "specialize deduplication destinations while preserving historical origins and indices" in {
+    val original = ModuleTarget("HistoricalCircuit", "RemovedOriginal")
+    val a = firrtl.transforms.DedupedResult(original,
+      Some(ModuleTarget("Top", "Parent").instOf("child", "Leaf")), 0.25)
+    val result = generate(Seq(a))
+    val copies = result.state.annotations.collect { case d: firrtl.transforms.DedupedResult => d }
+    assert(copies.size == 2)
+    assert(copies.forall(d => d.original == original && d.index == 0.25))
+    val paths = copies.map(_.duplicate.get.asInstanceOf[InstanceTarget])
+    assert(paths.map(_.module).distinct.size == 2)
+    assert(paths.forall(p => p.instance == "child" && p.ofModule != "Leaf" && p.path.isEmpty))
+    assert(paths.forall(p => moduleNames(result)(p.module) && moduleNames(result)(p.ofModule)))
+    assert(result.state.circuit == generate(Nil).state.circuit)
+    CheckpointCaptureDescriptors.fromGenerated(result, manifest)
+    // A self-consistent old binding must not conceal any changed annotation.
+    Seq(result.state.annotations.filterNot(_.isInstanceOf[firrtl.transforms.DedupedResult]),
+      result.state.annotations.map {
+        case d: firrtl.transforms.DedupedResult => d.copy(index = 0.5)
+        case other => other
+      }, result.state.annotations.map {
+        case d: firrtl.transforms.DedupedResult => d.copy(original = ModuleTarget("Other", "Origin"))
+        case other => other
+      }, result.state.annotations.map {
+        case d: firrtl.transforms.DedupedResult => d.copy(duplicate = Some(ModuleTarget("Top", "Top")))
+        case other => other
+      }).foreach { changed =>
+      intercept[IllegalArgumentException] {
+        CheckpointCaptureDescriptors.fromGenerated(result.copy(state = result.state.copy(annotations = changed)), manifest)
+      }
+    }
+  }
+
+  it should "retain removed deduplication history and full nonlocal paths through real emission" in {
+    val removed = firrtl.transforms.DedupedResult(ModuleTarget("Old", "Deleted"), None, -1)
+    val active = firrtl.transforms.DedupedResult(ModuleTarget("Old", "Original"),
+      Some(ModuleTarget("Top", "Top").instOf("left", "Parent").instOf("child", "Leaf")), 0.75)
+    val result = generate(Seq(removed, active))
+    assert(result.state.annotations.contains(removed))
+    val translated = result.state.annotations.collect {
+      case d: firrtl.transforms.DedupedResult if d.duplicate.nonEmpty => d
+    }.head
+    val target = translated.duplicate.get.asInstanceOf[InstanceTarget]
+    assert(target.module == "Top" && target.path.head._1.value == "left" && target.instance == "child")
+    assert(target.path.head._2.value != "Parent" && target.ofModule != "Leaf")
+    val emitted = new Compiler(Seq(firrtl.options.Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm)
+      .execute(result.state.copy(annotations = result.state.annotations :+
+        firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter])))
+    assert(emitted.annotations.contains(removed) && emitted.annotations.contains(translated))
+    CheckpointCaptureDescriptors.fromGenerated(result, manifest)
+  }
+
+  it should "reject stale foreign opaque unreachable and mismatched deduplication destinations" in {
+    val origin = ModuleTarget("Historical", "Original")
+    Seq[IsModule](ModuleTarget("Other", "Top"), ModuleTarget("Top", "Missing"),
+      ModuleTarget("Top", "Parent").instOf("missing", "Leaf"),
+      ModuleTarget("Top", "Top").instOf("left", "Leaf")).foreach { target =>
+      assert(intercept[IllegalArgumentException] {
+        generate(Seq(firrtl.transforms.DedupedResult(origin, Some(target), 0.25)))
+      }.getMessage.contains("deduplication"))
+    }
+    val extra = state.circuit.copy(modules = state.circuit.modules ++ Seq(
+      firrtl.ir.Module(firrtl.ir.NoInfo, "Dead", Nil, firrtl.ir.EmptyStmt),
+      firrtl.ir.ExtModule(firrtl.ir.NoInfo, "Opaque", Nil, "Opaque", Nil)))
+    Seq("Dead", "Opaque").foreach { name =>
+      intercept[IllegalArgumentException] {
+        GeneratedStateBankAnnotations.preflight(state.copy(circuit = extra, annotations = Seq(
+          firrtl.transforms.DedupedResult(origin, Some(ModuleTarget("Top", name)), 0.25))))
+      }
+    }
+  }
+
+  it should "reject invalid deduplication positions and invalid historical identities" in {
+    val origin = ModuleTarget("Old", "Original")
+    val destination = Some(ModuleTarget("Top", "Top"))
+    val invalid = Seq(Double.NaN, Double.PositiveInfinity, Double.NegativeInfinity, -1.0, 1.01).map { index =>
+      firrtl.transforms.DedupedResult(origin, destination, index)
+    } ++ Seq(firrtl.transforms.DedupedResult(origin, None, 0),
+      firrtl.transforms.DedupedResult(ModuleTarget("", "Original"), destination, 0),
+      firrtl.transforms.DedupedResult(ModuleTarget("Old", ""), destination, 0))
+    invalid.foreach { a =>
+      assert(intercept[IllegalArgumentException](generate(Seq(a))).getMessage.contains("deduplication history"))
+    }
+  }
+
   it should "retain correlated target-box instance paths and hash each specialized marker" in {
     val original = midas.core.TargetBoxAnnotation(ModuleTarget("Top", "Parent").instOf("child", "Leaf"))
     val result = generate(Seq(original))

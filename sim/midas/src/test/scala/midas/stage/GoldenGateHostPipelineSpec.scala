@@ -143,7 +143,11 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
     val a = compile(inventory = true, Seq(injection),
       Seq(midas.checkpoint.SimulatorBankProbeAnnotation,
         midas.core.TargetBoxAnnotation(firrtl.annotations.ModuleTarget("HostPipeline", "HostPipeline")
-          .instOf("consumer", "HostConsumer"))) ++ constraints ++ context ++ policies)
+          .instOf("consumer", "HostConsumer")),
+        firrtl.transforms.DedupedResult(firrtl.annotations.ModuleTarget("Historical", "OriginalConsumer"),
+          Some(firrtl.annotations.ModuleTarget("HostPipeline", "HostPipeline").instOf("consumer", "HostConsumer")), 0.25),
+        firrtl.transforms.DedupedResult(firrtl.annotations.ModuleTarget("Historical", "Deleted"), None, -1)) ++
+        constraints ++ context ++ policies)
     context.foreach(c => assert(a.contains(c)))
     policies.foreach(c => assert(a.contains(c)))
     val sv = verilog(a)

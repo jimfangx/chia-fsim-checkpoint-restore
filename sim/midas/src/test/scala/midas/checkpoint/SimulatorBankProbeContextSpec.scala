@@ -156,6 +156,28 @@ class SimulatorBankProbeContextSpec extends AnyFlatSpec {
     }
   }
 
+  it should "reject changed or dropped deduplication history at either final-emission boundary" in {
+    val history = firrtl.transforms.DedupedResult(ModuleTarget("Historical", "Original"),
+      Some(ModuleTarget("Top", "Top")), 0.25)
+    val original = probe(Seq(history))
+    val xdc = midas.targetutils.xdc.XDCFiles.allFiles.map(f => midas.passes.XDCOutputAnnotation("", Some(f.fileSuffix)))
+    SimulatorBankProbe.emissionBinding(original, "fixture RTL", original.annotations ++ xdc)
+    val changed = Seq(original.annotations.filterNot(_.isInstanceOf[firrtl.transforms.DedupedResult]),
+      original.annotations.map {
+        case a: firrtl.transforms.DedupedResult => a.copy(index = 0.5)
+        case a => a
+      })
+    changed.foreach { annotations =>
+      Seq((original.copy(annotations = annotations), original.annotations ++ xdc),
+          (original, annotations ++ xdc),
+          (original.copy(annotations = annotations), annotations ++ xdc)).foreach { case (state, emitted) =>
+        assert(intercept[IllegalArgumentException] {
+          SimulatorBankProbe.emissionBinding(state, "fixture RTL", emitted)
+        }.getMessage.contains("deduplication history changed"))
+      }
+    }
+  }
+
   it should "retain input-parser permissiveness without admitting opaque annotations" in {
     val unknown = UnrecognizedAnnotation(JObject(List("class" -> JString("hidden.Owner"),
       "target" -> JString("~Top|Top>stored"))))

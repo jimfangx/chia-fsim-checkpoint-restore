@@ -37,7 +37,8 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: firrtl.transforms.CombinationalPath |
          _: firrtl.transforms.NoDedupAnnotation | _: firrtl.passes.InlineAnnotation |
          _: SynthesisPlusArgConstantAnnotation | _: FirrtlMemModelAnnotation |
-         _: InternalXDCAnnotation | _: XDCAnnotation | _: TargetBoxAnnotation => true
+         _: InternalXDCAnnotation | _: XDCAnnotation | _: TargetBoxAnnotation |
+         _: firrtl.transforms.DedupedResult => true
     case MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation => true
     case _ => false
   }
@@ -54,20 +55,20 @@ private[checkpoint] object GeneratedStateBankAnnotations {
   // Preserve the root and every instance hop; flattening to a leaf module
   // loses the distinction between repeated instances. Only concrete reachable
   // paths can be specialized: a stale pre-link placeholder must fail closed.
-  private def validateTargetBox(state: CircuitState, target: IsModule): Unit = {
-    if (target.circuit != state.circuit.main) fail(s"foreign target-box target: ${target.serialize}")
+  private def validateTargetBox(state: CircuitState, target: IsModule, label: String = "target-box"): Unit = {
+    if (target.circuit != state.circuit.main) fail(s"foreign $label target: ${target.serialize}")
     val modules = state.circuit.modules.map(m => m.name -> m).toMap
     val reachable = GeneratedExternalOwners.instances(state, state.circuit.main).map(_._2.name).toSet
     def concrete(name: String): Module = modules.get(name) match {
       case Some(m: Module) if reachable(name) => m
-      case _ => fail(s"target-box target requires a reachable concrete module: $name")
+      case _ => fail(s"$label target requires a reachable concrete module: $name")
     }
     var owner = concrete(target.module)
     target.asPath.foreach { case (instance, child) =>
       if (!declarations(owner).exists {
         case i: firrtl.WDefInstance => i.name == instance.value && i.module == child.value
         case _ => false
-      }) fail(s"target-box instance path mismatch: ${target.serialize}")
+      }) fail(s"$label instance path mismatch: ${target.serialize}")
       owner = concrete(child.value)
     }
   }
@@ -153,6 +154,15 @@ private[checkpoint] object GeneratedStateBankAnnotations {
         fail(s"opaque annotation target: $serialized")
     }
     state.annotations.foreach {
+      // FIRRTL deliberately keeps `original` unchanged across renames: it is
+      // a historical module identity, possibly in the pre-link circuit. Only
+      // `duplicate` refers to the current hierarchy. Never rewrite the origin
+      // as a present-day module or flatten a duplicate's instance path.
+      case a: firrtl.transforms.DedupedResult =>
+        if (a.original.circuit.isEmpty || a.original.module.isEmpty ||
+            !a.index.isFinite || (a.duplicate.nonEmpty && (a.index < 0 || a.index > 1)) ||
+            (a.duplicate.isEmpty && a.index != -1)) fail("invalid deduplication history")
+        a.duplicate.foreach(validateTargetBox(state, _, "deduplication"))
       case a: TargetBoxAnnotation => validateTargetBox(state, a.target)
       case a: firrtl.transforms.NoDedupAnnotation =>
         moduleTarget(a.target.circuit, a.target.module, a.target.serialize)
@@ -194,7 +204,8 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     case a if memoryPolicy(a) => true
     case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: SynthesisPlusArgConstantAnnotation |
          _: firrtl.transforms.NoDedupAnnotation | _: firrtl.passes.InlineAnnotation |
-         _: FirrtlMemModelAnnotation | _: InternalXDCAnnotation | _: XDCAnnotation | _: TargetBoxAnnotation => true
+         _: FirrtlMemModelAnnotation | _: InternalXDCAnnotation | _: XDCAnnotation | _: TargetBoxAnnotation |
+         _: firrtl.transforms.DedupedResult => true
     case MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation => true
     case _ => false
   }.distinct.sortBy(_.serialize))
@@ -255,7 +266,26 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     def record(source: Annotation, targets: Seq[String]): Unit =
       mappings += JObject(List("source" -> JString(source.serialize),
         "targets" -> JArray(targets.map(JString(_)).toList)))
+    def specialize(target: IsModule): Seq[IsModule] =
+      moduleClones(target.circuit, target.module).map { parent =>
+        var originalPath = parent.originalPath
+        var renamed: IsModule = ModuleTarget(state.circuit.main, parent.module)
+        target.asPath.foreach { case (instance, _) =>
+          originalPath = s"$originalPath.${instance.value}"
+          val child = clones.find(_.originalPath == originalPath).getOrElse(
+            fail(s"missing hierarchy clone: $originalPath"))
+          renamed = renamed.instOf(instance.value, child.module)
+        }
+        renamed
+      }
     val requested = state.annotations.flatMap {
+      case a: firrtl.transforms.DedupedResult =>
+        val copies = a.duplicate match {
+          case Some(target) => specialize(target).map(t => a.copy(duplicate = Some(t)))
+          case None => Seq(a)
+        }
+        record(a, copies.map(_.serialize))
+        copies
       case a: TargetBoxAnnotation =>
         val copies = moduleClones(a.target.circuit, a.target.module).map { parent =>
           var originalPath = parent.originalPath

@@ -6,6 +6,7 @@ import firrtl.annotations.NoTargetAnnotation
 import firrtl.options.{HasShellOptions, ShellOption, Unserializable}
 import midas.stage.GoldenGateOutputFileAnnotation
 import org.json4s._
+import org.json4s.native.JsonMethods.parse
 
 /** Diagnostic whole-root emission only. The external bank controls are NOT a
   * production MMIO binding or an all-owner cut. In particular, applying this
@@ -101,6 +102,20 @@ object SimulatorBankProbe {
       val actual = SimulatorBankProbeContext.snapshot(annotations.filter(SimulatorBankProbeContext.accepts),
         files(".bank-probe-reference.fir"), files(".bank-probe-instrumented.fir"))
       if (actual != files(".bank-probe-context.json")) fail("compiler context changed after bank specialization")
+    }
+    // DedupedResult carries an immutable historical origin and a live renamed
+    // destination. Bind the complete translated values at final emission too;
+    // an old descriptor sidecar cannot excuse dropped or retargeted history.
+    val mappings = (parse(files(".bank-probe-binding.json")) \ "annotation_translation" \ "mappings")
+      .asInstanceOf[JArray].arr
+    val expectedDedup = mappings.filter(r => (r \ "source") match {
+      case JString(s) => s.startsWith("DedupedResult(")
+      case _ => false
+    }).flatMap(r => (r \ "targets").asInstanceOf[JArray].arr).distinct.sortBy(canonical)
+    Seq(state.annotations, emittedAnnotations).foreach { annotations =>
+      val actual = annotations.collect { case a: firrtl.transforms.DedupedResult => JString(a.serialize) }
+        .distinct.sortBy(canonical)
+      if (actual != expectedDedup) fail("deduplication history changed after bank specialization")
     }
     val binding = canonical(JObject(List(
       "binding_version" -> JInt(1), "scope" -> JString("generated_rtl_probe_only"),
