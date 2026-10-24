@@ -56,6 +56,71 @@ class GeneratedStateBankAnnotationsSpec extends AnyFlatSpec {
 
   behavior.of("Generated bank hierarchy annotation contracts")
 
+  it should "retain correlated target-box instance paths and hash each specialized marker" in {
+    val original = midas.core.TargetBoxAnnotation(ModuleTarget("Top", "Parent").instOf("child", "Leaf"))
+    val result = generate(Seq(original))
+    val copies = result.state.annotations.collect { case a: midas.core.TargetBoxAnnotation => a }
+    assert(copies.size == 2 && copies.map(_.target.module).distinct.size == 2)
+    copies.foreach { a =>
+      val it = a.target.asInstanceOf[InstanceTarget]
+      assert(it.circuit == "Top" && it.path.isEmpty && it.instance == "child")
+      assert(it.ofModule != "Leaf" && moduleNames(result)(it.ofModule))
+      val owner = result.state.circuit.modules.collectFirst {
+        case m: firrtl.ir.Module if m.name == it.module => m
+      }.get
+      assert(owner.serialize.contains(s"inst child of ${it.ofModule}"))
+    }
+    CheckpointCaptureDescriptors.fromGenerated(result, manifest)
+    copies.foreach { removed =>
+      intercept[IllegalArgumentException] {
+        CheckpointCaptureDescriptors.fromGenerated(result.copy(state = result.state.copy(
+          annotations = result.state.annotations.filterNot(_ == removed))), manifest)
+      }
+    }
+    val changed = result.state.copy(annotations = result.state.annotations.map {
+      case a: midas.core.TargetBoxAnnotation => a.copy(target = ModuleTarget("Top", "Top"))
+      case a => a
+    })
+    intercept[IllegalArgumentException] {
+      CheckpointCaptureDescriptors.fromGenerated(result.copy(state = changed), manifest)
+    }
+  }
+
+  it should "preserve a full nonlocal target-box path and specialize local module markers" in {
+    val path = ModuleTarget("Top", "Top").instOf("left", "Parent").instOf("child", "Leaf")
+    val result = generate(Seq(midas.core.TargetBoxAnnotation(path)))
+    val target = result.state.annotations.collectFirst {
+      case a: midas.core.TargetBoxAnnotation => a.target.asInstanceOf[InstanceTarget]
+    }.get
+    assert(target.module == "Top" && target.path.head._1.value == "left" && target.instance == "child")
+    assert(target.path.head._2.value != "Parent" && target.ofModule != "Leaf")
+    val modules = generate(Seq(midas.core.TargetBoxAnnotation(ModuleTarget("Top", "Leaf"))))
+      .state.annotations.collect { case a: midas.core.TargetBoxAnnotation => a.target }
+    assert(modules.size == 2 && modules.forall(_.isInstanceOf[ModuleTarget]))
+    assert(modules.map(_.module).distinct.size == 2)
+    // Annotation translation must not add/remove storage or alter behavior.
+    assert(result.state.circuit == generate(Nil).state.circuit)
+  }
+
+  it should "reject foreign stale unreachable opaque and mismatched target-box paths before cloning" in {
+    Seq[IsModule](ModuleTarget("Other", "Top"), ModuleTarget("Top", "Missing"),
+      ModuleTarget("Top", "Parent").instOf("missing", "Leaf"),
+      ModuleTarget("Top", "Top").instOf("left", "Leaf"),
+      ModuleTarget("Top", "Top").instOf("left", "Parent").instOf("child", "Parent")).foreach { target =>
+      val e = intercept[IllegalArgumentException] { generate(Seq(midas.core.TargetBoxAnnotation(target))) }
+      assert(e.getMessage.contains("target-box"))
+    }
+    val deadAndOpaque = state.circuit.copy(modules = state.circuit.modules ++ Seq(
+      firrtl.ir.Module(firrtl.ir.NoInfo, "Dead", Nil, firrtl.ir.EmptyStmt),
+      firrtl.ir.ExtModule(firrtl.ir.NoInfo, "Opaque", Nil, "Opaque", Nil)))
+    Seq("Dead", "Opaque").foreach { name =>
+      val input = state.copy(circuit = deadAndOpaque, annotations = Seq(
+        midas.core.TargetBoxAnnotation(ModuleTarget("Top", name))))
+      val e = intercept[IllegalArgumentException] { GeneratedStateBankAnnotations.preflight(input) }
+      assert(e.getMessage.contains("reachable concrete"))
+    }
+  }
+
   it should "preserve and hash exact global memory policies without treating them as targeted owners" in {
     val policies = Seq(firrtl.passes.memlib.InferReadWriteAnnotation,
       firrtl.passes.memlib.DefaultReadFirstAnnotation,

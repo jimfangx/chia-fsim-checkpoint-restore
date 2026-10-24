@@ -3,11 +3,12 @@ package midas.checkpoint
 
 import scala.collection.mutable
 import firrtl.CircuitState
-import firrtl.annotations.{Annotation, CircuitName, ComponentName, JsonProtocol, MemoryFileInlineAnnotation, MemorySynthInit, MemoryNoSynthInit, ModuleName, ModuleTarget, ReferenceTarget, TargetToken}
+import firrtl.annotations.{Annotation, CircuitName, ComponentName, IsModule, JsonProtocol, MemoryFileInlineAnnotation, MemorySynthInit, MemoryNoSynthInit, ModuleName, ModuleTarget, ReferenceTarget, TargetToken}
 import firrtl.ir._
 import firrtl.transforms.DontTouchAnnotation
 import org.json4s._
 import midas.InternalXDCAnnotation
+import midas.core.TargetBoxAnnotation
 import midas.targetutils.FirrtlMemModelAnnotation
 import midas.targetutils.xdc.XDCAnnotation
 
@@ -36,7 +37,7 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: firrtl.transforms.CombinationalPath |
          _: firrtl.transforms.NoDedupAnnotation | _: firrtl.passes.InlineAnnotation |
          _: SynthesisPlusArgConstantAnnotation | _: FirrtlMemModelAnnotation |
-         _: InternalXDCAnnotation | _: XDCAnnotation => true
+         _: InternalXDCAnnotation | _: XDCAnnotation | _: TargetBoxAnnotation => true
     case MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation => true
     case _ => false
   }
@@ -47,6 +48,28 @@ private[checkpoint] object GeneratedStateBankAnnotations {
       s.foreachStmt(visit)
     }
     visit(m.body); all.toSeq
+  }
+
+  // TargetBox identifies the linked target hierarchy, not a storage word.
+  // Preserve the root and every instance hop; flattening to a leaf module
+  // loses the distinction between repeated instances. Only concrete reachable
+  // paths can be specialized: a stale pre-link placeholder must fail closed.
+  private def validateTargetBox(state: CircuitState, target: IsModule): Unit = {
+    if (target.circuit != state.circuit.main) fail(s"foreign target-box target: ${target.serialize}")
+    val modules = state.circuit.modules.map(m => m.name -> m).toMap
+    val reachable = GeneratedExternalOwners.instances(state, state.circuit.main).map(_._2.name).toSet
+    def concrete(name: String): Module = modules.get(name) match {
+      case Some(m: Module) if reachable(name) => m
+      case _ => fail(s"target-box target requires a reachable concrete module: $name")
+    }
+    var owner = concrete(target.module)
+    target.asPath.foreach { case (instance, child) =>
+      if (!declarations(owner).exists {
+        case i: firrtl.WDefInstance => i.name == instance.value && i.module == child.value
+        case _ => false
+      }) fail(s"target-box instance path mismatch: ${target.serialize}")
+      owner = concrete(child.value)
+    }
   }
 
   /** XDC arguments are correlated under one explicit root. Never expand them
@@ -130,6 +153,7 @@ private[checkpoint] object GeneratedStateBankAnnotations {
         fail(s"opaque annotation target: $serialized")
     }
     state.annotations.foreach {
+      case a: TargetBoxAnnotation => validateTargetBox(state, a.target)
       case a: firrtl.transforms.NoDedupAnnotation =>
         moduleTarget(a.target.circuit, a.target.module, a.target.serialize)
       case a: firrtl.passes.InlineAnnotation => a.target match {
@@ -170,7 +194,7 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     case a if memoryPolicy(a) => true
     case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: SynthesisPlusArgConstantAnnotation |
          _: firrtl.transforms.NoDedupAnnotation | _: firrtl.passes.InlineAnnotation |
-         _: FirrtlMemModelAnnotation | _: InternalXDCAnnotation | _: XDCAnnotation => true
+         _: FirrtlMemModelAnnotation | _: InternalXDCAnnotation | _: XDCAnnotation | _: TargetBoxAnnotation => true
     case MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation => true
     case _ => false
   }.distinct.sortBy(_.serialize))
@@ -232,6 +256,20 @@ private[checkpoint] object GeneratedStateBankAnnotations {
       mappings += JObject(List("source" -> JString(source.serialize),
         "targets" -> JArray(targets.map(JString(_)).toList)))
     val requested = state.annotations.flatMap {
+      case a: TargetBoxAnnotation =>
+        val copies = moduleClones(a.target.circuit, a.target.module).map { parent =>
+          var originalPath = parent.originalPath
+          var target: IsModule = ModuleTarget(state.circuit.main, parent.module)
+          a.target.asPath.foreach { case (instance, _) =>
+            originalPath = s"$originalPath.${instance.value}"
+            val child = clones.find(_.originalPath == originalPath).getOrElse(
+              fail(s"missing target-box clone: $originalPath"))
+            target = target.instOf(instance.value, child.module)
+          }
+          a.copy(target = target)
+        }
+        record(a, copies.map(_.target.serialize))
+        copies
       case a if memoryPolicy(a) =>
         record(a, Seq(a.serialize))
         Seq(a)
