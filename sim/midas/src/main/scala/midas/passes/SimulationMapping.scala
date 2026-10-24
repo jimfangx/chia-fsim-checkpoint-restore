@@ -63,33 +63,6 @@ private[passes] class SimulationMapping(targetName: String) extends firrtl.Trans
     Seq(csb.toAnnotation, vsb.toAnnotation, psb.toAnnotation, p2psb.toAnnotation)
   }
 
-  // Note: this only runs on the SimulationWrapper Module
-  private def initStmt(targetModuleName: String, targetInstName: String)(s: Statement): Statement =
-    s match {
-      case s @ WDefInstance(_, name, _, _) if name == targetInstName =>
-        Block(
-          Seq(
-            s.copy(module = targetModuleName), // replace TargetBox with the actual target module
-            IsInvalid(NoInfo, WRef(name)),
-          )
-        )
-      case s                                                         => s.map(initStmt(targetModuleName, targetInstName))
-    }
-
-  private def init(
-    info:            Info,
-    target:          String,
-    tpe:             Type,
-    targetBoxParent: String,
-    targetBoxInst:   String,
-  )(m:               DefModule
-  ) = m match {
-    case m: Module if m.name == targetBoxParent =>
-      val body = initStmt(target, targetBoxInst)(m.body)
-      Some(m.copy(info = info, body = body))
-    case o                                      => Some(o)
-  }
-
   def execute(innerState: CircuitState) = {
     // Generate a port map to look up the types of the IO of the channels
     implicit val p  =
@@ -116,34 +89,90 @@ private[passes] class SimulationMapping(targetName: String) extends firrtl.Trans
     val outerState = new Compiler(Forms.LowForm ++ Seq(Dependency(PreLinkRenaming)))
       .execute(CircuitState(chirrtl, ChirrtlForm, outerAnnos))
 
-    val outerCircuit        = outerState.circuit
-    val targetType          = module_type((innerCircuit.modules.find(_.name == innerCircuit.main)).get)
-    val targetBoxInstTarget = outerState.annotations
-      .collectFirst({ case TargetBoxAnnotation(it: InstanceTarget) =>
-        it
-      })
-      .getOrElse(throw new Exception("TargetBoxAnnotation not found or annotated top module!"))
-    val targetBoxParent     = targetBoxInstTarget.encapsulatingModule
-    val targetBoxInst       = targetBoxInstTarget.instance
-    val modules             = (outerCircuit.modules.flatMap(
-      init(innerCircuit.info, innerCircuit.main, targetType, targetBoxParent, targetBoxInst)
-    )) ++
-      innerCircuit.modules
-    // Rename the annotations from the inner module, which are using an obsolete CircuitName
-    val renameMap           = RenameMap(Map(CircuitName(innerCircuit.main) -> Seq(CircuitName(outerCircuit.main))))
-
-    val innerAnnos = loweredInnerState.annotations.filter(_ match {
-      case _: midas.targetutils.FAMEAnnotation => false
-      case _                                   => true
-    })
-
-    val linkedState = CircuitState(
-      circuit     = Circuit(outerCircuit.info, modules, outerCircuit.main),
-      form        = HighForm,
-      annotations = innerAnnos ++ outerState.annotations,
-      renames     = Some(renameMap),
-    )
+    val linkedState = SimulationMapping.link(loweredInnerState, outerState)
     writeState(linkedState, "post-sim-mapping.fir")
     linkedState.copy(annotations = linkedState.annotations ++ generateHeaderAnnos(shim))
   }
+}
+
+private[midas] object SimulationMapping {
+  // Link the exact annotated placeholder, never a guessed instance/module name.
+  // Return native renames with the circuit so *all* target-bearing annotations
+  // follow the replacement when FIRRTL applies the transform's rename map.
+  private[midas] def link(innerState: CircuitState, outerState: CircuitState): CircuitState = {
+    val inner = innerState.circuit
+    val outer = outerState.circuit
+    def check(ok: Boolean, why: String): Unit = require(ok, s"SimulationMapping: $why")
+    check(inner.modules.map(_.name).distinct.size == inner.modules.size &&
+      outer.modules.map(_.name).distinct.size == outer.modules.size, "duplicate module definitions")
+    check((inner.modules.map(_.name).toSet intersect outer.modules.map(_.name).toSet).isEmpty,
+      "pre-link module namespaces overlap")
+    val boundaries = outerState.annotations.collect { case a: TargetBoxAnnotation => a.target }
+    check(boundaries.size == 1, "requires exactly one TargetBoxAnnotation")
+    val boundary = boundaries.head match {
+      case t: InstanceTarget => t
+      case _ => throw new IllegalArgumentException("SimulationMapping: target boundary must be an instance")
+    }
+    check(boundary.circuit == outer.main && boundary.module == outer.main,
+      "target boundary must be rooted at the outer circuit top")
+    val definitions = outer.modules.map(m => m.name -> m).toMap
+    def instances(m: DefModule): Seq[WDefInstance] = {
+      val found = scala.collection.mutable.ArrayBuffer.empty[WDefInstance]
+      def visit(s: Statement): Unit = {
+        s match { case i: WDefInstance => found += i; case _ => () }
+        s.foreachStmt(visit)
+      }
+      m match { case m: Module => visit(m.body); case _ => () }
+      found.toSeq
+    }
+    var owner = outer.main
+    boundary.asPath.foreach { case (instance, child) =>
+      val matches = definitions.get(owner).toSeq.flatMap(instances).filter(_.name == instance.value)
+      check(matches.size == 1 && matches.head.module == child.value,
+        s"target boundary instance path mismatch: ${boundary.serialize}")
+      owner = child.value
+    }
+    val placeholder = definitions.get(owner) match {
+      case Some(m: ExtModule) => m
+      case _ => throw new IllegalArgumentException("SimulationMapping: target placeholder must be an external module")
+    }
+    check(outer.modules.flatMap(instances).count(_.module == placeholder.name) == 1,
+      "target placeholder must have exactly one instance")
+    def countConcrete(name: String, ancestors: Set[String]): Int = {
+      check(!ancestors(name), "recursive outer hierarchy")
+      check(definitions.contains(name), s"missing outer module: $name")
+      if (name == placeholder.name) 1
+      else instances(definitions(name)).map(i => countConcrete(i.module, ancestors + name)).sum
+    }
+    check(countConcrete(outer.main, Set.empty) == 1,
+      "target placeholder must have exactly one concrete instance")
+    val target = inner.modules.collectFirst { case m: Module if m.name == inner.main => m }
+      .getOrElse(throw new IllegalArgumentException("SimulationMapping: inner top must be a concrete module"))
+    val interface = (m: DefModule) => m.ports.map(p => (p.name, p.direction, p.tpe))
+    check(interface(placeholder).toSet == interface(target).toSet,
+      "target placeholder and inner top interfaces differ")
+    val modules = outer.modules.filterNot(_.name == placeholder.name).map {
+      case m: Module if m.name == boundary.encapsulatingModule =>
+        m.copy(info = inner.info, body = initStmt(inner.main, boundary.instance, module_type(target))(m.body))
+      case m => m
+    } ++ inner.modules
+    val renames = RenameMap(Map(CircuitName(inner.main) -> Seq(CircuitName(outer.main))))
+    renames.record(ModuleTarget(outer.main, placeholder.name), ModuleTarget(outer.main, inner.main))
+    val innerAnnos = innerState.annotations.filterNot(_.isInstanceOf[midas.targetutils.FAMEAnnotation])
+    CircuitState(Circuit(outer.info, modules, outer.main), HighForm,
+      innerAnnos ++ outerState.annotations, Some(renames))
+  }
+
+  // Note: this only runs on the validated SimulationWrapper Module.
+  private def initStmt(targetModuleName: String, targetInstName: String, targetType: Type)(s: Statement): Statement =
+    s match {
+      case s @ WDefInstance(_, name, _, _) if name == targetInstName =>
+        Block(
+          Seq(
+            s.copy(module = targetModuleName, tpe = targetType),
+            IsInvalid(NoInfo, WRef(name)),
+          )
+        )
+      case s                                                         => s.map(initStmt(targetModuleName, targetInstName, targetType))
+    }
 }
