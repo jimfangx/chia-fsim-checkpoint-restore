@@ -33,6 +33,26 @@ class SimulatorBankProbeContextSpec extends AnyFlatSpec {
 
   behavior.of("Explicit post-lowering compiler context")
 
+  it should "bind consumed Xilinx gate retirement unchanged at both emission boundaries" in {
+    val receipt = midas.passes.xilinx.ClockGateRetirementTestFixture.receipt
+    assert(SimulatorBankProbeContext.accepts(receipt))
+    val original = probe(Seq(receipt))
+    val changes = Seq(original.annotations.filterNot(_ == receipt), original.annotations.map {
+      case `receipt` => receipt.copy(inputSHA256 = "a" * 64)
+      case a => a
+    })
+    changes.foreach { annotations =>
+      Seq((original.copy(annotations = annotations), original.annotations ++ emittedXDC),
+        (original, annotations ++ emittedXDC),
+        (original.copy(annotations = annotations), annotations ++ emittedXDC)).foreach { case (state, emitted) =>
+        assert(intercept[IllegalArgumentException] {
+          SimulatorBankProbe.emissionBinding(state, "fixture RTL", emitted)
+        }.getMessage.contains("compiler context changed"))
+      }
+    }
+    intercept[IllegalArgumentException] { probe(Seq(receipt, receipt)) }
+  }
+
   private val passiveOutputs = Seq(
     GoldenGateOutputFileAnnotation("// driver metadata\n#define BASE 64\n", ".const.h"),
     GoldenGateOutputFileAnnotation("// widths: λ\n`define WIDTH 8\n", ".const.vh"),

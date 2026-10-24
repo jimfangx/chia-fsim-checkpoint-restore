@@ -47,7 +47,8 @@ class GoldenGateCompilerPhase extends Phase {
   )
 
   def transform(annotations: AnnotationSeq): AnnotationSeq = {
-    val (inputCircuit, consumedAnnotations) = GoldenGateCompilerPhase.consumeInputCircuit(annotations)
+    val emitterAnnotations = GoldenGateEmitterPolicy.consumeEmitterRequest(annotations)
+    val (inputCircuit, consumedAnnotations) = GoldenGateCompilerPhase.consumeInputCircuit(emitterAnnotations)
     midas.checkpoint.SimulatorFPGASynthesisConstants.validateCardinality(annotations)
 
     implicit val p = annotations.collectFirst({ case ConfigParametersAnnotation(p) => p }).get
@@ -83,6 +84,7 @@ class GoldenGateCompilerPhase extends Phase {
       new Compiler(Forms.LowForm ++ Seq(Dependency[InferReadWrite], Dependency[MidasTransforms]), Forms.LowForm)
         .execute(loweredTarget)
 
+    GoldenGateEmitterPolicy.validatePreserved(consumedAnnotations, simulator.annotations)
     compileSimulator(simulator)
   }
 
@@ -93,6 +95,7 @@ class GoldenGateCompilerPhase extends Phase {
   private[stage] def compileSimulator(simulator: CircuitState)(
       implicit p: org.chipsalliance.cde.config.Parameters): AnnotationSeq = {
     // Validate cardinality before Compiler canonicalizes annotation sequences.
+    GoldenGateEmitterPolicy.validatePreserved(simulator.annotations, simulator.annotations)
     midas.checkpoint.SimulatorBankProbe.validateRequest(simulator)
     midas.checkpoint.SimulatorFPGASynthesisConstants.validateRequest(simulator)
     // Note: the final lowering to Verilog is broken up into multiple firrtl.Compiler steps
@@ -150,6 +153,9 @@ class GoldenGateCompilerPhase extends Phase {
     val emitted = emitter.execute(if (observeEmission) emissionInput.copy(annotations =
       emissionInput.annotations.filterNot(_.isInstanceOf[firrtl.EmitCircuitAnnotation]) :+
         firrtl.EmitCircuitAnnotation(verilogEmitter.getClass)) else emissionInput)
+    GoldenGateEmitterPolicy.validatePreserved(simulator.annotations, postLoweredSimulator.annotations)
+    val emitterPolicyFiles = GoldenGateEmitterPolicy.emissionBinding(
+      simulator.annotations, emitted, verilogEmitter, observeEmission)
     val bankProbeFiles = midas.checkpoint.SimulatorBankProbe.emissionBinding(
       postLoweredSimulator, emitted.getEmittedCircuit.value, emitted.annotations)
     val fpgaConstantFiles = midas.checkpoint.SimulatorFPGASynthesisConstants.emissionBinding(
@@ -181,8 +187,8 @@ class GoldenGateCompilerPhase extends Phase {
         "simulator_manifest_sha256" -> JString(sha256(manifest)),
         "external_owners_sha256" -> JString(sha256(externalOwners)),
         "emitted_verilog_sha256" -> JString(sha256(emitted.getEmittedCircuit.value)))))
-      emitted.annotations ++ files ++ semanticMapFiles ++ bankProbeFiles ++ fpgaConstantFiles :+
+      emitted.annotations ++ files ++ semanticMapFiles ++ bankProbeFiles ++ fpgaConstantFiles ++ emitterPolicyFiles :+
         GoldenGateOutputFileAnnotation(binding, ".simulator-emission.json")
-    } else emitted.annotations ++ semanticMapFiles ++ bankProbeFiles ++ fpgaConstantFiles
+    } else emitted.annotations ++ semanticMapFiles ++ bankProbeFiles ++ fpgaConstantFiles ++ emitterPolicyFiles
   }
 }

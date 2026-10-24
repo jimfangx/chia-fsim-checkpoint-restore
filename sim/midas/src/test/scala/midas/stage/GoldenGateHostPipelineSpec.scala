@@ -158,9 +158,12 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
       GoldenGateOutputFileAnnotation("// fixture partition metadata\n#define FIXTURE_PARTITIONS 1\n", ".partition.const.h"),
       GoldenGateOutputFileAnnotation("", ".peer2peer.const.yaml"),
       GoldenGateOutputFileAnnotation("// fixture platform defines\n`define USE_DDR_CHANNEL_A 0\n", ".defines.vh"))
-    val context = consumedInput ++ passiveOutputs ++ Seq(
+    val emitterRequest = firrtl.stage.RunFirrtlTransformAnnotation(new firrtl.VerilogEmitter)
+    val consumedEmitter = GoldenGateEmitterPolicy.consumeEmitterRequest(Seq(emitterRequest))
+    val context = consumedInput ++ consumedEmitter ++ passiveOutputs ++ Seq(
       midas.passes.PreLinkRenamingTestFixture.history,
       midas.passes.BridgeExtractionTestFixture.history,
+      midas.passes.xilinx.ClockGateRetirementTestFixture.receipt,
       firrtl.stage.InfoModeAnnotation("use"),
       firrtl.stage.OutputFileAnnotation("fixture.fir"),
       firrtl.options.TargetDirAnnotation("checkpoint-fixture"),
@@ -195,6 +198,17 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
       save("passive-output" + output.fileSuffix, output.body)
     }
     save("compiler-input.fir", historicalInput.serialize)
+    val retiredGates = midas.passes.xilinx.ClockGateRetirementTestFixture
+    save("clock-gate-input.fir", retiredGates.input.circuit.serialize)
+    save("clock-gate-rewritten.fir", retiredGates.rewritten.serialize)
+    save("clock-gate-output.fir", retiredGates.result.circuit.serialize)
+    save("clock-gate-source.v", retiredGates.source.text)
+    save("compiler-emitter-request.json", firrtl.annotations.JsonProtocol.serialize(Seq(emitterRequest)))
+    save("golden-gate-emitter.json", file(a, ".golden-gate-emitter.json"))
+    val emitterPolicy = parse(file(a, ".golden-gate-emitter.json"))
+    assert((emitterPolicy \ "actual_emitter") == JString("midas.checkpoint.SemanticCleanEmitter"))
+    assert((emitterPolicy \ "output_suffix") == JString(".sv"))
+    assert((emitterPolicy \ "emitted_verilog_sha256") == JString(SemanticStateInventory.sha256(verilog(a))))
     val historicalLink = midas.passes.PreLinkRenamingTestFixture.run()
     save("pre-link-input.fir", midas.passes.PreLinkRenamingTestFixture.input.serialize)
     save("pre-link-output.fir", historicalLink.circuit.serialize)

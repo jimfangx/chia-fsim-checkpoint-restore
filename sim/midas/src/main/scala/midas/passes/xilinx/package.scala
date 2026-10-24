@@ -16,21 +16,7 @@ package object xilinx {
     override def name = "[Golden Gate] Xilinx ReplaceAbstractClockGates"
 
     def execute(state: CircuitState): CircuitState = {
-      val clockModules = state.circuit.modules
-        .collect({
-          case m: ExtModule if m.defname == DefineAbstractClockGate.blackboxName => m.name
-        })
-        .toSet
-
-      state.copy(circuit = state.circuit.mapModule(OrElseIdentity({
-        case m: Module => {
-          val onStmt: Function[Statement, Statement] = OrElseIdentity({
-            case wi: WDefInstance if clockModules.contains(wi.module) =>
-              wi.copy(module = DefineBUFGCE.blackboxName)
-          })
-          m.mapStmt { s => onStmt(s.mapStmt(onStmt)) }
-        }
-      })))
+      ClockGateRetirement(state)
     }
   }
 

@@ -109,6 +109,7 @@ class FPGASynthesisConstantsSpec extends AnyFlatSpec {
     SimulatorFPGASynthesisConstants.validateRequest(state)
     val duplicate = intercept[IllegalArgumentException] {
       new GoldenGateCompilerPhase().transform(Seq(firrtl.stage.FirrtlCircuitAnnotation(state.circuit),
+        firrtl.stage.RunFirrtlTransformAnnotation(new firrtl.VerilogEmitter),
         request, request, inventory))
     }
     assert(duplicate.getMessage.contains("exactly one synthesis-constant"))

@@ -6,7 +6,7 @@ import firrtl.options.{InputAnnotationFileAnnotation, TargetDirAnnotation}
 import firrtl.stage.{AllowUnrecognizedAnnotations, FirrtlFileAnnotation, InfoModeAnnotation, OutputFileAnnotation}
 import chisel3.experimental.EnumAnnotations.EnumDefAnnotation
 import midas.passes.{ChannelClockInfoAnnotation, PreLinkRenamingResultAnnotation, BridgeExtractionResultAnnotation}
-import midas.stage.{ConfigPackageAnnotation, ConfigStringAnnotation, OutputBaseFilenameAnnotation, GoldenGateInputCircuitAnnotation, GoldenGateOutputFileAnnotation}
+import midas.stage.{ConfigPackageAnnotation, ConfigStringAnnotation, OutputBaseFilenameAnnotation, GoldenGateInputCircuitAnnotation, GoldenGateOutputFileAnnotation, GoldenGateEmitterPolicy, GoldenGateEmitterPolicyAnnotation}
 import java.nio.charset.StandardCharsets.UTF_8
 import org.json4s._
 
@@ -37,6 +37,11 @@ private[checkpoint] object SimulatorBankProbeContext {
         "annotation_class" -> JString(nestedClass), "file" -> JString(file))))
     }
     a match {
+      // These abstract definitions and their inline implementation were
+      // retired at the actual Xilinx instance rewrite. Their receipt records
+      // history only; the physical BUFGCE latch still needs its own owner.
+      case a: midas.passes.xilinx.XilinxClockGateRetirementAnnotation =>
+        Some("xilinx_clock_gate_retirement" -> midas.passes.xilinx.ClockGateRetirement.context(a))
       case a: GoldenGateOutputFileAnnotation if isPassiveOutput(a) =>
         // The generic file emitter uses the JVM's default charset. Require its
         // actual bytes to equal the UTF-8 bytes that this context hashes.
@@ -53,6 +58,8 @@ private[checkpoint] object SimulatorBankProbeContext {
       case ConfigStringAnnotation(value) => text("config_string", value)
       case OutputBaseFilenameAnnotation(value) => text("output_base_filename", value)
       case AllowUnrecognizedAnnotations => Some("allow_unrecognized_input_annotations" -> JBool(true))
+      case a: GoldenGateEmitterPolicyAnnotation =>
+        Some("golden_gate_emitter_policy" -> org.json4s.native.JsonMethods.parse(GoldenGateEmitterPolicy.contextJSON(a)))
       // Only the stage's consumed receipt is inert. A live circuit annotation
       // (even one equal to the current IR) still needs a stage consumer and is
       // never admitted by the bank translator. Names retain input order and
