@@ -54,7 +54,8 @@ object GeneratedExternalOwners {
     }
     val rows = live.collect { case (path, m: ExtModule) =>
       val physical = m.defname == "BUFGCE"
-      JObject(List("hierarchy" -> JString(path)) ++ definition(m) ++ List(
+      val physicalContract = if (physical) List("physical_contract" -> PhysicalClockGateContract.binding(state, m)) else Nil
+      JObject(List("hierarchy" -> JString(path)) ++ definition(m) ++ physicalContract ++ List(
         // Existing inventory adapters describe simulator models. In particular
         // metasim's output register is not the physical primitive's CE latch.
         "physical_primitive" -> JBool(physical),

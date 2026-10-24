@@ -374,6 +374,7 @@ object GeneratedStateBankAccess {
     if (input.form != LowForm) fail("resolved LowForm required")
     val (prepared, gateModules) = GeneratedClockGateAdapter.prepare(input)
     GeneratedStateBankAnnotations.preflight(prepared)
+    PhysicalClockGateContract.requireCaptureOwner(prepared)
     val doc = parse(manifest)
     val root = input.circuit.main
     val actual = (doc \ "manifest_type") match {

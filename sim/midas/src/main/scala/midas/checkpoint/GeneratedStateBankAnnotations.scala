@@ -75,8 +75,9 @@ private[checkpoint] object GeneratedStateBankAnnotations {
 
   /** XDC arguments are correlated under one explicit root. Never expand them
     * independently: a Cartesian product would constrain unrelated instances.
-    * Only exact ground declarations and concrete instance ports survive this
-    * contract; RAM implementation pins/aggregates need their own mapping.
+    * Only exact ground declarations, concrete instance ports and the exact
+    * platform BUFGCE's public pins survive this contract. A physical constraint
+    * is not permission to inventory or capture a vendor-owned latch.
     */
   private def validateXDC(state: CircuitState, format: String, args: Seq[ReferenceTarget]): Unit = {
     if ("\\{}".r.findAllIn(format).size != args.size) fail("XDC argument/specifier count mismatch")
@@ -84,9 +85,15 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     if (args.map(_.module).distinct.size != 1) fail("XDC arguments require a common explicit root")
     val modules = state.circuit.modules.map(m => m.name -> m).toMap
     val reachable = GeneratedExternalOwners.instances(state, state.circuit.main).map(_._2.name).toSet
-    def concrete(name: String): Module = modules.get(name) match {
+    def ownerModule(name: String): DefModule = modules.get(name) match {
       case Some(m: Module) if reachable(name) => m
+      case Some(m: ExtModule) if reachable(name) && m.defname == "BUFGCE" =>
+        PhysicalClockGateContract.validate(state, m); m
       case _ => fail(s"XDC target requires a reachable concrete module: $name")
+    }
+    def declared(m: DefModule): Seq[IsDeclaration] = m match {
+      case m: Module => declarations(m)
+      case _: ExtModule => Nil // Never expose vendor implementation internals.
     }
     def ground(t: Type): Boolean = t match {
       case ClockType | ResetType | AsyncResetType | UIntType(IntWidth(_)) | SIntType(IntWidth(_)) => true
@@ -94,25 +101,25 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     }
     args.foreach { a =>
       if (a.circuit != state.circuit.main) fail(s"foreign XDC target: ${a.serialize}")
-      var owner = concrete(a.module)
+      var owner = ownerModule(a.module)
       a.path.foreach { case (instance, child) =>
-        if (!declarations(owner).exists {
+        if (!declared(owner).exists {
           case i: firrtl.WDefInstance => i.name == instance.value && i.module == child.value
           case _ => false
         }) fail(s"XDC instance path mismatch: ${a.serialize}")
-        owner = concrete(child.value)
+        owner = ownerModule(child.value)
       }
-      val declared = declarations(owner).find(_.name == a.ref)
+      val declaration = declared(owner).find(_.name == a.ref)
       val valid = a.component match {
-        case Nil => owner.ports.exists(p => p.name == a.ref && ground(p.tpe)) || declared.exists {
+        case Nil => owner.ports.exists(p => p.name == a.ref && ground(p.tpe)) || declaration.exists {
           case d: DefRegister => ground(d.tpe)
           case d: DefWire => ground(d.tpe)
           case d: DefNode => ground(d.value.tpe)
-          case i: firrtl.WDefInstance => concrete(i.module); true
+          case i: firrtl.WDefInstance => ownerModule(i.module); true
           case _ => false
         }
-        case Seq(TargetToken.Field(port)) => declared.exists {
-          case i: firrtl.WDefInstance => concrete(i.module).ports.exists(p => p.name == port && ground(p.tpe))
+        case Seq(TargetToken.Field(port)) => declaration.exists {
+          case i: firrtl.WDefInstance => ownerModule(i.module).ports.exists(p => p.name == port && ground(p.tpe))
           case _ => false
         }
         case _ => false
@@ -251,13 +258,25 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     }
     def xdcCopies(args: Seq[ReferenceTarget]): Seq[Seq[ReferenceTarget]] = {
       if (args.isEmpty) return Seq(Nil)
+      // Native primitive definitions remain shared leaves, never fabricated
+      // storage clones. WriteXDCFile expands their local pin targets against
+      // the final concrete instance graph.
+      modules(args.head.module) match {
+        case m: ExtModule =>
+          PhysicalClockGateContract.validate(state, m)
+          return Seq(args)
+        case _ => ()
+      }
       moduleClones(args.head.circuit, args.head.module).map { parent =>
         args.map { a =>
           var path = parent.originalPath
-          val renamedPath = a.path.map { case (instance, _) =>
+          val renamedPath = a.path.map { case (instance, childModule) =>
             path = s"$path.${instance.value}"
-            val child = clones.find(_.originalPath == path).getOrElse(fail(s"missing XDC clone: $path"))
-            (instance, TargetToken.OfModule(child.module))
+            val emittedModule = modules(childModule.value) match {
+              case m: ExtModule => PhysicalClockGateContract.validate(state, m); m.name
+              case _ => clones.find(_.originalPath == path).map(_.module).getOrElse(fail(s"missing XDC clone: $path"))
+            }
+            (instance, TargetToken.OfModule(emittedModule))
           }
           a.copy(module = parent.module, path = renamedPath)
         }
