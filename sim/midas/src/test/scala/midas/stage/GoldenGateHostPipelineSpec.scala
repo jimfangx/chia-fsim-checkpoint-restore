@@ -116,6 +116,9 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
 
   it should "emit functional generated banks through the real backend and bind every probe input" in {
     val injection = new InjectBankHostState
+    val policies = Seq(firrtl.passes.memlib.InferReadWriteAnnotation,
+      firrtl.passes.memlib.DefaultReadFirstAnnotation,
+      firrtl.passes.memlib.PassthroughSimpleSyncReadMemsAnnotation)
     val context = Seq(
       firrtl.stage.InfoModeAnnotation("use"),
       firrtl.stage.OutputFileAnnotation("fixture.fir"),
@@ -131,8 +134,9 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
         "set_false_path -from [get_ports {}]",
         ReferenceTarget("HostPipeline", "HostPipeline", Nil, "reset", Nil)))
     val a = compile(inventory = true, Seq(injection),
-      Seq(midas.checkpoint.SimulatorBankProbeAnnotation) ++ constraints ++ context)
+      Seq(midas.checkpoint.SimulatorBankProbeAnnotation) ++ constraints ++ context ++ policies)
     context.foreach(c => assert(a.contains(c)))
+    policies.foreach(c => assert(a.contains(c)))
     val sv = verilog(a)
     assert(sv.contains("ckpt_freeze") && sv.contains("ckpt_clock") && sv.contains("ckpt_saved_data"))
     val names = Seq(".bank-probe-reference.fir", ".bank-probe-state.json", ".bank-probe-instrumented.fir",

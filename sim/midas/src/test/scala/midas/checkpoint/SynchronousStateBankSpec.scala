@@ -34,9 +34,9 @@ class SynchronousStateBankSpec extends AnyFlatSpec {
     CircuitState(Parser.parse(text), ChirrtlForm)).copy(form = LowForm)
   private def emit(state: CircuitState): String = {
     val result = new Compiler(Seq(firrtl.options.Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm)
-      .execute(state.copy(annotations = Seq(
+      .execute(state.copy(annotations = (state.annotations ++ Seq(
         firrtl.passes.memlib.PassthroughSimpleSyncReadMemsAnnotation,
-        firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter]))))
+        firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter]))).distinct))
     result.annotations.collectFirst { case firrtl.EmittedVerilogCircuitAnnotation(v) => v.value }.get
   }
   behavior.of("Synchronous storage checkpoint banks")
@@ -87,5 +87,42 @@ class SynchronousStateBankSpec extends AnyFlatSpec {
     val unsupported = lower(source.replace("read-under-write => old", "read-under-write => new"))
     intercept[IllegalArgumentException] { GeneratedStateBankAccess.generate(unsupported,
       SimulatorStateInventory.discover(unsupported)) }
+  }
+
+  it should "resolve default read-first before inventory and retain its exact bank and emitter policy" in {
+    val policies = Seq(firrtl.passes.memlib.InferReadWriteAnnotation,
+      firrtl.passes.memlib.DefaultReadFirstAnnotation,
+      firrtl.passes.memlib.PassthroughSimpleSyncReadMemsAnnotation)
+    val unresolved = lower(source).copy(annotations = policies)
+    val e = intercept[IllegalArgumentException] {
+      GeneratedStateBankAccess.generate(unresolved, SimulatorStateInventory.discover(unresolved))
+    }
+    assert(e.getMessage.contains("must be applied before inventory"))
+    // The same production backend pass must select the pipeline before IDs and
+    // selectors are assigned. Undefined readers now store data, not addresses.
+    val state = new firrtl.passes.memlib.SetDefaultReadUnderWrite().execute(unresolved)
+    val semantic = SemanticStateInventory.discover(state, state.circuit.main)
+    val simulator = SimulatorStateInventory.discover(state)
+    val result = GeneratedStateBankAccess.generate(state, semantic)
+    val simResult = GeneratedStateBankAccess.generate(state, simulator)
+    policies.foreach(p => assert(result.state.annotations.contains(p)))
+    CheckpointCaptureDescriptors.fromGenerated(result, semantic)
+    CheckpointCaptureDescriptors.fromGenerated(simResult, simulator)
+    val rows = (parse(result.binding) \ "state").asInstanceOf[JArray].arr
+    assert(rows.size == 10)
+    assert(rows.exists(r => (r \ "hierarchy") == JString("SyncStorage.undefMem_r_data") &&
+      (r \ "width") == JInt(9)))
+    assert(!rows.exists(r => (r \ "hierarchy") == JString("SyncStorage.undefMem_r_addr")))
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { dir =>
+      val out = Paths.get(dir).resolve("synchronous-policy"); Files.createDirectories(out)
+      Seq("generated-bank-input.fir" -> state.circuit.serialize,
+        "generated-bank.fir" -> result.state.circuit.serialize,
+        "generated-bank.sv" -> emit(result.state),
+        "reference.sv" -> emit(state).replace("module SyncStorage(", "module ReferenceStorage("),
+        "generated-bank-semantic.json" -> semantic, "generated-bank-binding.json" -> result.binding,
+        "generated-bank-simulator.json" -> simulator, "generated-bank-simulator-binding.json" -> simResult.binding,
+        "generated-bank-simulator.fir" -> simResult.state.circuit.serialize
+      ).foreach { case (name, text) => Files.write(out.resolve(name), text.getBytes(UTF_8)) }
+    }
   }
 }

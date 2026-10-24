@@ -20,7 +20,19 @@ private[checkpoint] object GeneratedStateBankAnnotations {
   case class Clone(originalModule: String, originalPath: String, module: String, body: Module)
   private def fail(why: String): Nothing =
     throw new IllegalArgumentException(s"Generated checkpoint bank unsupported: $why")
+  // These are global memory-lowering choices, not hierarchy targets. Preserve
+  // them for downstream emitters and include them in both annotation hashes.
+  // Default RUW must already be resolved in the inventoried IR: applying it
+  // after banking could silently select a different read-pipeline owner.
+  private def memoryPolicy(a: Annotation): Boolean = a match {
+    case firrtl.passes.memlib.InferReadWriteAnnotation |
+         firrtl.passes.memlib.DefaultReadFirstAnnotation |
+         firrtl.passes.memlib.DefaultWriteFirstAnnotation |
+         firrtl.passes.memlib.PassthroughSimpleSyncReadMemsAnnotation => true
+    case _ => false
+  }
   private def supported(a: Annotation): Boolean = a match {
+    case a if memoryPolicy(a) => true
     case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: firrtl.transforms.CombinationalPath |
          _: firrtl.transforms.NoDedupAnnotation | _: firrtl.passes.InlineAnnotation |
          _: SynthesisPlusArgConstantAnnotation | _: FirrtlMemModelAnnotation |
@@ -92,6 +104,21 @@ private[checkpoint] object GeneratedStateBankAnnotations {
       unsupported.map(_.getClass.getName).distinct.mkString(", "))
     if (state.annotations.contains(MemorySynthInit) && state.annotations.contains(MemoryNoSynthInit))
       fail("conflicting memory synthesis initialization policies")
+    val policies = state.annotations.filter(memoryPolicy)
+    if (policies.distinct.size != policies.size) fail("duplicate memory lowering policy")
+    val defaults = policies.filter {
+      case firrtl.passes.memlib.DefaultReadFirstAnnotation | firrtl.passes.memlib.DefaultWriteFirstAnnotation => true
+      case _ => false
+    }
+    if (defaults.size > 1) fail("conflicting default read-under-write policies")
+    if (defaults.nonEmpty) state.circuit.modules.foreach {
+      case m: Module => declarations(m).foreach {
+        case mem: DefMemory if mem.readLatency > 0 && mem.readUnderWrite == ReadUnderWrite.Undefined =>
+          fail(s"default read-under-write policy must be applied before inventory: ${m.name}.${mem.name}")
+        case _ => ()
+      }
+      case _ => ()
+    }
     // The resolver may omit unreachable definitions before specialization.
     // A preservation/initialization contract on one must fail here, rather
     // than be deleted by a compiler rename or an invalid-target cleanup pass.
@@ -140,6 +167,7 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     }
   }
   def annotationJSON(annotations: Seq[Annotation]): String = JsonProtocol.serialize(annotations.filter {
+    case a if memoryPolicy(a) => true
     case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: SynthesisPlusArgConstantAnnotation |
          _: firrtl.transforms.NoDedupAnnotation | _: firrtl.passes.InlineAnnotation |
          _: FirrtlMemModelAnnotation | _: InternalXDCAnnotation | _: XDCAnnotation => true
@@ -204,6 +232,9 @@ private[checkpoint] object GeneratedStateBankAnnotations {
       mappings += JObject(List("source" -> JString(source.serialize),
         "targets" -> JArray(targets.map(JString(_)).toList)))
     val requested = state.annotations.flatMap {
+      case a if memoryPolicy(a) =>
+        record(a, Seq(a.serialize))
+        Seq(a)
       case _: firrtl.transforms.CombinationalPath => Nil // Invalidated path cache, recomputed by Compiler.
       case a @ (MemorySynthInit | MemoryNoSynthInit | firrtl.transforms.NoCircuitDedupAnnotation) => Seq(a)
       case a: firrtl.transforms.NoDedupAnnotation =>

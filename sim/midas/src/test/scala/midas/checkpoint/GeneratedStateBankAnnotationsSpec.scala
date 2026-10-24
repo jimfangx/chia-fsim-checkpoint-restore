@@ -56,6 +56,39 @@ class GeneratedStateBankAnnotationsSpec extends AnyFlatSpec {
 
   behavior.of("Generated bank hierarchy annotation contracts")
 
+  it should "preserve and hash exact global memory policies without treating them as targeted owners" in {
+    val policies = Seq(firrtl.passes.memlib.InferReadWriteAnnotation,
+      firrtl.passes.memlib.DefaultReadFirstAnnotation,
+      firrtl.passes.memlib.PassthroughSimpleSyncReadMemsAnnotation)
+    val result = generate(policies)
+    policies.foreach { policy =>
+      assert(result.state.annotations.contains(policy))
+      intercept[IllegalArgumentException] {
+        CheckpointCaptureDescriptors.fromGenerated(result.copy(state = result.state.copy(
+          annotations = result.state.annotations.filterNot(_ == policy))), manifest)
+      }
+    }
+    val changed = result.state.copy(annotations = result.state.annotations.map {
+      case firrtl.passes.memlib.DefaultReadFirstAnnotation => firrtl.passes.memlib.DefaultWriteFirstAnnotation
+      case a => a
+    })
+    intercept[IllegalArgumentException] {
+      CheckpointCaptureDescriptors.fromGenerated(result.copy(state = changed), manifest)
+    }
+    val writeFirst = generate(Seq(firrtl.passes.memlib.DefaultWriteFirstAnnotation))
+    CheckpointCaptureDescriptors.fromGenerated(writeFirst, manifest)
+  }
+
+  it should "reject conflicting and duplicate global memory lowering policies" in {
+    val readFirst = firrtl.passes.memlib.DefaultReadFirstAnnotation
+    val conflict = intercept[IllegalArgumentException] {
+      generate(Seq(readFirst, firrtl.passes.memlib.DefaultWriteFirstAnnotation))
+    }
+    assert(conflict.getMessage.contains("conflicting default"))
+    val duplicate = intercept[IllegalArgumentException] { generate(Seq(readFirst, readFirst)) }
+    assert(duplicate.getMessage.contains("duplicate memory"))
+  }
+
   it should "preserve no-dedup intent for every specialized repeated owner and bind the contract" in {
     val result = generate(Seq(NoDedupAnnotation(ModuleTarget("Top", "Leaf"))))
     val copies = result.state.annotations.collect { case a: NoDedupAnnotation => a }
