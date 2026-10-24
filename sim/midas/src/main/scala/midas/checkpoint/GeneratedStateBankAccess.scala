@@ -584,8 +584,34 @@ object GeneratedStateBankAccess {
         Seq("freeze", "bank", "slot", "address").foreach(n => readStatements += s"${i.name}.ckpt_$n <= ckpt_$n")
         readers += s"${i.name}.ckpt_match" -> s"${i.name}.ckpt_data"
       }
-      val hit = readers.foldLeft("UInt<1>(0)") { case (acc, (h, _)) => s"or($acc, $h)" }
-      val data = readers.foldRight("UInt<64>(0)") { case ((h, d), acc) => s"mux($h, pad($d, 64), $acc)" }
+      // Selectors are globally unique (validated before specialization), so
+      // masked words can be OR-reduced without a priority chain. Keep explicit
+      // two-input stages: large bridge/CPU modules otherwise put every local
+      // register and child on a serial mux path into the response register.
+      // A miss is still exactly zero, including empty/stateless subtrees. This
+      // changes neither the endpoint latency nor its freeze/held-beat contract.
+      def balanced(values: Seq[String], width: Int, label: String): String = {
+        var level = values
+        var stage = 0
+        while (level.size > 1) {
+          level = level.grouped(2).zipWithIndex.map { case (group, index) =>
+            if (group.size == 2) {
+              val name = s"ckpt_${label}_${stage}_$index"
+              readStatements += s"node $name = or(${group.head}, ${group(1)})"
+              name
+            } else group.head
+          }.toVector
+          stage += 1
+        }
+        level.headOption.getOrElse(s"UInt<$width>(0)")
+      }
+      val hit = balanced(readers.map(_._1).toVector, 1, "match_tree")
+      val masked = readers.zipWithIndex.map { case ((h, d), index) =>
+        val name = s"ckpt_masked_$index"
+        readStatements += s"node $name = mux($h, pad($d, 64), UInt<64>(0))"
+        name
+      }
+      val data = balanced(masked.toVector, 64, "data_tree")
       readStatements ++= Seq(s"ckpt_match <= $hit", s"ckpt_data <= $data")
       val ports = Seq(("freeze", Input, 1), ("bank", Input, 8), ("slot", Input, 16),
         ("address", Input, 32), ("match", Output, 1), ("data", Output, 64)) ++

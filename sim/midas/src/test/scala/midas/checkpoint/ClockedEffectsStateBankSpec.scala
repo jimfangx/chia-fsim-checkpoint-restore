@@ -22,11 +22,25 @@ class ClockedEffectsStateBankSpec extends AnyFlatSpec {
       case i: WDefInstance => i.copy(module = "Original" + i.module)
       case s => s.mapStmt(rename)
     }
+    val preserved = if (state.circuit.main != "DenseStorage") Nil else {
+      // The dense readout fixture intentionally has storage whose only external
+      // observation is the checkpoint bank. Keep the independent, uninstrumented
+      // oracle's matching storage through Verilog emission as well.
+      state.circuit.modules.collect { case m: Module =>
+        def registers(s: Statement): Seq[String] = s match {
+          case r: DefRegister => Seq(r.name)
+          case b: Block => b.stmts.flatMap(registers)
+          case _ => Nil
+        }
+        registers(m.body).map { name => firrtl.transforms.DontTouchAnnotation(
+          firrtl.annotations.ReferenceTarget("Original" + state.circuit.main, "Original" + m.name, Nil, name, Nil)) }
+      }.flatten
+    }
     state.copy(circuit = state.circuit.copy(main = "Original" + state.circuit.main,
       modules = state.circuit.modules.map {
         case m: Module => m.copy(name = "Original" + m.name, body = rename(m.body))
         case _ => throw new IllegalArgumentException("opaque reference")
-      }), annotations = Nil)
+      }), annotations = preserved)
   }
   private def saveArtifacts(state: CircuitState, label: String): Unit = {
     val manifest = SimulatorStateInventory.discover(state)
@@ -64,6 +78,49 @@ class ClockedEffectsStateBankSpec extends AnyFlatSpec {
     assert(clock, not(fault), eventEnable, "CHECKPOINT_ASSERT")
 """
   behavior.of("Clocked effect and stateless hierarchy checkpoint contracts")
+  it should "emit bounded fan-in selection for dense local state and repeated child banks" in {
+    val registers = (0 until 257).map { i =>
+      val width = i % 64 + 1
+      s"""    reg word_$i : UInt<$width>, clock with :
+      reset => (reset, UInt<$width>(${BigInt(i) & ((BigInt(1) << width) - 1)}))
+    word_$i <= add(word_$i, add(data, UInt<64>(${i + 1})))"""
+    }.mkString("\n")
+    val children = Seq("a", "b", "c").map { name => s"""    inst child_$name of DenseLeaf
+    child_$name.clock <= clock
+    child_$name.reset <= reset
+    child_$name.data <= data""" }.mkString("\n")
+    val dense = s"""circuit DenseStorage :
+  module DenseLeaf :
+    input clock : Clock
+    input reset : UInt<1>
+    input data : UInt<64>
+    output result : UInt<64>
+    reg saved : UInt<64>, clock with :
+      reset => (reset, UInt<64>(9))
+    saved <= add(saved, data)
+    result <= saved
+  module DenseStorage :
+    input clock : Clock
+    input reset : UInt<1>
+    input data : UInt<64>
+    output result : UInt<64>
+$registers
+$children
+    result <= add(word_0, child_a.result)
+"""
+    val state = lower(dense)
+    val result = GeneratedStateBankAccess.generate(state, SimulatorStateInventory.discover(state))
+    assert(result.entries.size == 260 && result.state.circuit.modules.size == 4)
+    val root = result.state.circuit.modules.collectFirst { case m: Module if m.name == "DenseStorage" => m }.get
+    // 260 input words require nine pairwise OR stages; no state-dependent
+    // serial priority mux remains in the readout. The odd tail is retained.
+    val body = root.body.serialize
+    assert(body.contains("ckpt_data_tree_8_0") && !body.contains("ckpt_data_tree_9_"))
+    assert(body.contains("ckpt_match_tree_8_0") && !body.contains("ckpt_match_tree_9_"))
+    assert(!body.contains("ckpt_data <= mux("))
+    saveArtifacts(state, "dense")
+  }
+
   it should "retain clockless helpers and gate print stop and verification enables with the same cut" in {
     val state = lower(source)
     val result = GeneratedStateBankAccess.generate(state, SimulatorStateInventory.discover(state))
