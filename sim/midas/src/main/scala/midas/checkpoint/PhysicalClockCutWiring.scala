@@ -175,6 +175,7 @@ object PhysicalClockCutWiring {
     if (state.annotations.exists { case a: GoldenGateOutputFileAnnotation =>
       a.fileSuffix.startsWith(".physical-clock-wiring"); case _ => false }) fail("existing wiring output")
     val result = generate(state, manifest, plan)
+    val dependencies = PhysicalClockCutDependencies.discover(state, manifest, plan)
     val emitter = new SemanticCleanEmitter
     val emitted = new Compiler(Seq(firrtl.options.Dependency.fromTransform(emitter)), Forms.LowForm, Set(emitter))
       .execute(result.state.copy(annotations = Seq(firrtl.EmitCircuitAnnotation(emitter.getClass))))
@@ -182,6 +183,7 @@ object PhysicalClockCutWiring {
     Seq(GoldenGateOutputFileAnnotation(result.state.circuit.serialize, ".physical-clock-wiring.fir"),
       GoldenGateOutputFileAnnotation(verilog, ".physical-clock-wiring.sv"),
       GoldenGateOutputFileAnnotation(result.binding, ".physical-clock-wiring.json"),
+      GoldenGateOutputFileAnnotation(dependencies, ".physical-clock-dependencies.json"),
       GoldenGateOutputFileAnnotation(canonical(JObject(List("wiring_binding_sha256" -> JString(sha256(result.binding)),
         "wired_verilog_sha256" -> JString(sha256(verilog))))), ".physical-clock-wiring-emission.json"))
   }
