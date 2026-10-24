@@ -1,0 +1,60 @@
+circuit NativeStorage :
+  extmodule Native :
+    input I : Clock
+    input CE : UInt<1>
+    output O : Clock
+    defname = BUFGCE
+  module Leaf :
+    input clock : Clock
+    input reset : UInt<1>
+    input enable : UInt<1>
+    output count : UInt<65>
+    inst gate of Native
+    gate.I <= clock
+    gate.CE <= enable
+    reg value : UInt<65>, gate.O with :
+      reset => (reset, UInt<65>(0))
+    value <= add(value, UInt<1>(1))
+    count <= value
+  module NativeStorage :
+    input clock : Clock
+    input reset : UInt<1>
+    input enable : UInt<2>
+    input address : UInt<3>
+    input data : UInt<130>
+    input write : UInt<1>
+    output left_count : UInt<65>
+    output right_count : UInt<65>
+    output cycle : UInt<64>
+    output read_data : UInt<130>
+    reg cycles : UInt<64>, clock with :
+      reset => (reset, UInt<64>(0))
+    cycles <= add(cycles, UInt<1>(1))
+    cycle <= cycles
+    inst left of Leaf
+    inst right of Leaf
+    left.clock <= clock
+    right.clock <= clock
+    left.reset <= reset
+    right.reset <= reset
+    left.enable <= bits(enable, 0, 0)
+    right.enable <= bits(enable, 1, 1)
+    left_count <= left.count
+    right_count <= right.count
+    mem ram :
+      data-type => UInt<130>
+      depth => 8
+      reader => r
+      writer => w
+      read-latency => 1
+      write-latency => 1
+      read-under-write => old
+    ram.r.clk <= clock
+    ram.r.en <= UInt<1>(1)
+    ram.r.addr <= address
+    ram.w.clk <= clock
+    ram.w.en <= write
+    ram.w.addr <= address
+    ram.w.data <= data
+    ram.w.mask <= UInt<1>(1)
+    read_data <= ram.r.data

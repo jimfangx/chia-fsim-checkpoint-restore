@@ -34,6 +34,11 @@ object NativeFunctionalBankProbe {
       fail("one native probe, clock plan and complete root inventory required")
     if (state.annotations.contains(SimulatorBankProbeAnnotation) || state.annotations.contains(SemanticFAMEStateMapAnnotation))
       fail("native companion cannot admit ordinary bank capture or semantic mapping")
+    if (state.annotations.exists {
+      case a: GoldenGateOutputFileAnnotation =>
+        a.fileSuffix.startsWith(".native-functional") || a.fileSuffix.startsWith(".native-descriptors")
+      case _ => false
+    }) fail("existing native companion output")
   }
 
   def apply(input: CircuitState): CircuitState = {
@@ -55,6 +60,9 @@ object NativeFunctionalBankProbe {
     val inventory = GeneratedStateBankAccess.physicalFunctionalInventory(reference, manifest, plan, deps)
     val generated = GeneratedStateBankAccess.generatePhysicalCompanion(reference, manifest, plan, deps)
     GeneratedStateBankAccess.validateAnnotationBinding(generated)
+    val descriptors = midas.widgets.CheckpointCaptureDescriptors.fromNativeGenerated(
+      generated, reference, manifest, plan, deps)
+    val physicalBank = PhysicalClockStateBank.emit(reference, manifest, plan, deps)
     // Consume physical cell/pin constraints through their real downstream
     // consumer before FIRRTL's emitter optimizations. InternalXDCAnnotation's
     // DontTouchAllTargets may name native instances, which DCE cannot treat as
@@ -79,17 +87,30 @@ object NativeFunctionalBankProbe {
       ".native-functional.sv" -> rtl) ++ constrained.annotations.collect {
         case a: midas.passes.XDCOutputAnnotation => (".native-functional" + a.suffix.get) -> a.fileBody
       }
-    if (input.annotations.exists {
-      case a: GoldenGateOutputFileAnnotation => a.fileSuffix.startsWith(".native-functional")
-      case _ => false
-    }) fail("existing native functional output")
     val binding = canonical(JObject(List(
       "binding_version" -> JInt(1), "scope" -> JString("native_functional_readout_companion_only"),
       "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
       "production_freeze_owners_bound" -> JBool(false), "metasim_restore_supported" -> JBool(false),
       "inputs" -> JObject(files.map { case (name, body) => name -> JString(sha256(body)) }.toList))))
-    input.copy(annotations = input.annotations ++ files.map { case (name, body) =>
+    // Separate companion binding: the original functional emission contract is
+    // preserved. Both descriptor domains bind the same original circuit, while
+    // cut/reset/external-writer ownership and actual transport remain pending.
+    val descriptorFiles = Seq(
+      ".native-descriptors.json" -> descriptors.manifest,
+      ".native-descriptors-binding.json" -> descriptors.binding,
+      ".native-descriptors-physical-bank.json" -> physicalBank.head.body,
+      ".native-descriptors-physical-bank.sv" -> physicalBank(1).body,
+      ".native-descriptors-host.inc" -> descriptors.cppManifest)
+    val descriptorBinding = canonical(JObject(List(
+      "binding_version" -> JInt(1), "scope" -> JString("same_reference_native_descriptor_companion_only"),
+      "same_reference_sha256" -> JString(sha256(reference.circuit.serialize)),
+      "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
+      "production_freeze_owners_bound" -> JBool(false), "metasim_restore_supported" -> JBool(false),
+      "inputs" -> JObject((descriptorFiles :+ (".native-functional-emission.json" -> binding))
+        .map { case (name, body) => name -> JString(sha256(body)) }.toList))))
+    input.copy(annotations = input.annotations ++ (files ++ descriptorFiles).map { case (name, body) =>
       GoldenGateOutputFileAnnotation(body, name)
-    } :+ GoldenGateOutputFileAnnotation(binding, ".native-functional-emission.json"))
+    } ++ Seq(GoldenGateOutputFileAnnotation(binding, ".native-functional-emission.json"),
+      GoldenGateOutputFileAnnotation(descriptorBinding, ".native-descriptors-emission.json")))
   }
 }

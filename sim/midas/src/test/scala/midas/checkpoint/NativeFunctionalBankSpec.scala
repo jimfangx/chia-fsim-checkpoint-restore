@@ -152,13 +152,25 @@ class NativeFunctionalBankSpec extends AnyFlatSpec {
     val result = NativeFunctionalBankProbe(requested)
     assert(result.circuit == original.circuit)
     val files = result.annotations.collect { case a: midas.stage.GoldenGateOutputFileAnnotation => a }
-    assert(files.size == 11 && files.map(_.fileSuffix).distinct.size == 11)
+    assert(files.size == 17 && files.map(_.fileSuffix).distinct.size == 17)
     val receipt = parse(files.find(_.fileSuffix == ".native-functional-emission.json").get.body)
     assert((receipt \ "deployable_capture_image") == JBool(false))
-    files.filterNot(_.fileSuffix == ".native-functional-emission.json").foreach { f =>
+    files.filter(f => f.fileSuffix.startsWith(".native-functional") && f.fileSuffix != ".native-functional-emission.json").foreach { f =>
       assert((receipt \ "inputs" \ f.fileSuffix) == JString(SemanticStateInventory.sha256(f.body)))
     }
+    val descriptors = parse(files.find(_.fileSuffix == ".native-descriptors-emission.json").get.body)
+    assert((descriptors \ "same_reference_sha256") == JString(SemanticStateInventory.sha256(original.circuit.serialize)))
+    files.filter(f => f.fileSuffix.startsWith(".native-descriptors") &&
+      f.fileSuffix != ".native-descriptors-emission.json").foreach { f =>
+      assert((descriptors \ "inputs" \ f.fileSuffix) == JString(SemanticStateInventory.sha256(f.body)))
+    }
+    assert((descriptors \ "inputs" \ ".native-functional-emission.json") ==
+      JString(SemanticStateInventory.sha256(files.find(_.fileSuffix == ".native-functional-emission.json").get.body)))
     intercept[IllegalArgumentException] { NativeFunctionalBankProbe(result) }
+    Seq(".native-descriptors.json", ".native-descriptors-host.inc", ".native-descriptors-emission.json").foreach { suffix =>
+      intercept[IllegalArgumentException] { NativeFunctionalBankProbe(requested.copy(annotations =
+        requested.annotations :+ midas.stage.GoldenGateOutputFileAnnotation("existing", suffix))) }
+    }
     Seq(PhysicalClockCutPlanAnnotation, SimulatorCheckpointInventoryAnnotation(original.circuit.main)).foreach { missing =>
       intercept[IllegalArgumentException] { NativeFunctionalBankProbe(requested.copy(
         annotations = requested.annotations.filterNot(_ == missing))) }

@@ -24,7 +24,26 @@ final class CheckpointCaptureDescriptors private (
 }
 
 object CheckpointCaptureDescriptors {
-  def fromGenerated(result: GeneratedStateBankAccess.Result, manifest: String): CheckpointCaptureDescriptors = {
+  def fromGenerated(result: GeneratedStateBankAccess.Result, manifest: String): CheckpointCaptureDescriptors =
+    fromGeneratedImpl(result, manifest, native = false)
+
+  /** Native functional storage and physical CE identities from one original
+    * circuit. Reconstruct the generated banks instead of trusting a rehashed
+    * caller result. This is still descriptor composition, not freeze ownership
+    * or admission of a deployable checkpoint image.
+    */
+  def fromNativeGenerated(result: GeneratedStateBankAccess.Result, reference: CircuitState,
+      simulatorManifest: String, plan: String, dependencies: String): CheckpointCaptureDescriptors = {
+    val inventory = GeneratedStateBankAccess.physicalFunctionalInventory(reference, simulatorManifest, plan, dependencies)
+    val regenerated = GeneratedStateBankAccess.generatePhysicalCompanion(reference, simulatorManifest, plan, dependencies)
+    require(result.binding == regenerated.binding && result.entries == regenerated.entries,
+      "checkpoint descriptors: native banks do not match the original circuit")
+    val functional = fromGeneratedImpl(result, inventory, native = true)
+    composePhysicalClockState(functional, reference, simulatorManifest, plan, dependencies, sameReference = true)
+  }
+
+  private def fromGeneratedImpl(result: GeneratedStateBankAccess.Result, manifest: String,
+      native: Boolean): CheckpointCaptureDescriptors = {
     GeneratedStateBankAccess.validateAnnotationBinding(result)
     def check(ok: Boolean, why: String): Unit = require(ok, s"checkpoint descriptors: $why")
     val doc = parse(manifest)
@@ -45,7 +64,8 @@ object CheckpointCaptureDescriptors {
       text(binding, "protocol") == "latched-banked64-chunked-v2"
     check(chunked || (integer(binding, "access_version") == 1 && text(binding, "protocol") == "latched-banked64-v1"),
       "unsupported generated bank protocol")
-    check(text(binding, "scope") == "all_reachable_firrtl_state_only", "unsupported coverage scope")
+    check(text(binding, "scope") == (if (native) "native_functional_readout_companion_only" else
+      "all_reachable_firrtl_state_only"), "unsupported coverage scope")
     val manifestHash = SemanticStateInventory.sha256(SemanticStateInventory.canonical(doc))
     check(text(binding, "manifest_sha256") == manifestHash, "stale or incompatible inventory")
     check(text(binding, "reference_sha256") == text(doc, "reference_sha256"), "reference circuit mismatch")
@@ -90,7 +110,12 @@ object CheckpointCaptureDescriptors {
     * trusting caller-supplied slots, StateIDs, hashes or endpoint bytes.
     */
   def withPhysicalClockState(functional: CheckpointCaptureDescriptors, physicalState: CircuitState,
-      simulatorManifest: String, plan: String, dependencies: String): CheckpointCaptureDescriptors = {
+      simulatorManifest: String, plan: String, dependencies: String): CheckpointCaptureDescriptors =
+    composePhysicalClockState(functional, physicalState, simulatorManifest, plan, dependencies, sameReference = false)
+
+  private def composePhysicalClockState(functional: CheckpointCaptureDescriptors, physicalState: CircuitState,
+      simulatorManifest: String, plan: String, dependencies: String,
+      sameReference: Boolean): CheckpointCaptureDescriptors = {
     import SemanticStateInventory.{canonical, sha256}
     def check(ok: Boolean, why: String): Unit = require(ok, s"checkpoint descriptors: $why")
     check(functional.physicalClockGates == 0, "physical descriptors already composed")
@@ -113,6 +138,13 @@ object CheckpointCaptureDescriptors {
       "width" -> JInt(e.width), "depth" -> JInt(e.depth), "domain" -> JString("functional"))) }
     val flags = List("complete_fpga_capture", "deployable_capture_image",
       "production_freeze_owners_bound", "metasim_restore_supported").map(_ -> JBool(false))
+    val shared = if (!sameReference) Nil else {
+      val referenceHash = sha256(physicalState.circuit.serialize)
+      check((parse(functional.binding) \ "reference_sha256") == JString(referenceHash) &&
+        (parse(functional.manifest) \ "reference_sha256") == JString(referenceHash),
+        "functional and physical reference circuits differ")
+      List("same_reference_sha256" -> JString(referenceHash))
+    }
     val manifest = canonical(JObject(List(
       "descriptor_version" -> JInt(1),
       "scope" -> JString("functional_and_physical_ce_descriptor_composition_only"),
@@ -123,13 +155,13 @@ object CheckpointCaptureDescriptors {
       "physical_clock_gates" -> JInt(physicalEntries.size),
       "state" -> JArray(functionalRows.toList ++ physicalRows.map { row =>
         row merge JObject(List("domain" -> JString("physical_ce")))
-      })) ++ flags))
+      })) ++ shared ++ flags))
     val binding = canonical(JObject(List(
       "descriptor_binding_version" -> JInt(1), "manifest_sha256" -> JString(sha256(manifest)),
       "functional_manifest" -> parse(functional.manifest), "functional_binding" -> parse(functional.binding),
       "physical_bank_binding" -> physical,
       "access_clock" -> JString("ungated_common_source"),
-      "reset_contract" -> JString("same_reset_as_sampler_transport_and_bank_endpoints")) ++ flags))
+      "reset_contract" -> JString("same_reset_as_sampler_transport_and_bank_endpoints")) ++ shared ++ flags))
     new CheckpointCaptureDescriptors(sha256(manifest), sha256(binding), entries,
       manifest, binding, physicalEntries.size)
   }
