@@ -4,7 +4,11 @@
 // The scheduler and all write/reset owners must honor freeze on its accepting
 // edge. The coordinator/transport clock continues while simulator state freezes.
 module CheckpointCaptureCut #(
-    parameter integer OWNERS = 1
+    parameter integer OWNERS = 1,
+    // A physical gate can stop AFTER request acceptance. In this mode the
+    // complete owner_frozen vector is the post-stop acknowledgement; capture
+    // its settled label, rather than the MMIO/request accepting-edge label.
+    parameter integer DEFERRED_CUT = 0
 ) (
     input  wire clock,
     input  wire reset,
@@ -34,7 +38,7 @@ module CheckpointCaptureCut #(
     wire active = state != IDLE;
     wire [4:0] faults = {
         publish_release && state != COMPLETE,
-        target_cycle != cut_cycle,
+        (!DEFERRED_CUT || state == READING || state == COMPLETE) && target_cycle != cut_cycle,
         (state == READING || state == COMPLETE) && !all_frozen,
         |owner_error,
         !all_present
@@ -59,7 +63,7 @@ module CheckpointCaptureCut #(
             state <= IDLE;
         end else if (state == IDLE) begin
             if (accept) begin
-                cut_cycle <= target_cycle;
+                if (!DEFERRED_CUT) cut_cycle <= target_cycle;
                 error <= {3'b000, |owner_error, !all_present};
                 state <= (!all_present || |owner_error) ? FAILED : FREEZING;
             end
@@ -68,6 +72,7 @@ module CheckpointCaptureCut #(
                 state <= FAILED;
                 error <= error | faults;
             end else if (state == FREEZING && all_frozen) begin
+                if (DEFERRED_CUT) cut_cycle <= target_cycle;
                 state <= READING;
             end else if (state == READING && capture_complete) begin
                 state <= COMPLETE;

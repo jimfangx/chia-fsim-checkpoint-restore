@@ -5,6 +5,7 @@
 module CheckpointCaptureTransport #(
     parameter integer OWNERS = 1,
     parameter integer ENTRIES = 1,
+    parameter integer DEFERRED_CUT = 0,
     parameter [255:0] MANIFEST_SHA256 = 256'b0
 ) (
     input wire clock, reset,
@@ -83,7 +84,7 @@ module CheckpointCaptureTransport #(
         end
     endfunction
 
-    CheckpointCaptureCut #(.OWNERS(OWNERS+1)) cut (
+    CheckpointCaptureCut #(.OWNERS(OWNERS+1), .DEFERRED_CUT(DEFERRED_CUT)) cut (
         .clock(clock), .reset(reset), .request_valid(start),
         .request_ready(cut_ready), .target_cycle(target_cycle),
         .owner_present({1'b1, owner_present}),
