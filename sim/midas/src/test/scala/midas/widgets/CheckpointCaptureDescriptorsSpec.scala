@@ -59,6 +59,15 @@ class CheckpointCaptureDescriptorsSpec extends AnyFlatSpec {
     intercept[IllegalArgumentException] { cfg.copy(entries = 65536) }
   }
 
+  it should "reject functional state assigned to the physical CE bank namespace" in {
+    val alias = GeneratedStateBankAccess.generate(state, manifest,
+      bindings = Some(result.entries.map(_.copy(bank = 255))))
+    val error = intercept[IllegalArgumentException] {
+      CheckpointCaptureDescriptors.fromGenerated(alias, manifest)
+    }
+    assert(error.getMessage.contains("bank 255 is reserved for physical CE owners"))
+  }
+
   it should "emit a bounded ROM, actual generated storage, Widget and matching driver constructor" in {
     (new ChiselStage).emitVerilog(new CheckpointCaptureDescriptorROM(descriptors) {
       override def desiredName = "CheckpointCaptureDescriptorROMProbe"

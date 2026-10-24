@@ -167,6 +167,11 @@ class CheckpointCaptureTopSpec extends AnyFlatSpec {
 
   behavior.of("FPGATop global checkpoint registration")
 
+  it should "reject physical mode with a functional-only immutable descriptor ROM" in {
+    val error = intercept[IllegalArgumentException] { cfg.copy(physicalClockGates = 1) }
+    assert(error.getMessage.contains("bank-255 CE descriptors"))
+  }
+
   it should "preserve stock opt-out and existing bridge stream allocation" in {
     implicit val p: Parameters = parameters(None)
     val top = LazyModule(new FPGATop)

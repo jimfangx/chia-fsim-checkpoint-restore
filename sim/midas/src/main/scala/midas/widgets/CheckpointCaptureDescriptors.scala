@@ -72,6 +72,10 @@ object CheckpointCaptureDescriptors {
     check(entries.map(_.stateID) == entries.map(_.stateID).sorted &&
       entries.map(_.stateID).distinct.size == entries.size, "duplicate or unordered StateID")
     check(entries.map(e => (e.bank, e.slot)).distinct.size == entries.size, "duplicate selector")
+    // This constructor proves FIRRTL functional storage only. Native CE
+    // owners need a separate, validated composition; assigning a functional
+    // bit the physical bank's selector cannot establish that ownership.
+    check(entries.forall(_.bank != 255), "bank 255 is reserved for physical CE owners")
     new CheckpointCaptureDescriptors(manifestHash,
       SemanticStateInventory.sha256(SemanticStateInventory.canonical(binding)), entries.toVector)
   }

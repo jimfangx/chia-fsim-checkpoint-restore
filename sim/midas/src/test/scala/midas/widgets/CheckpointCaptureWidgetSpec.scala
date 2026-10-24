@@ -25,6 +25,9 @@ class CheckpointCaptureWidgetSpec extends AnyFlatSpec {
     intercept[IllegalArgumentException] { cfg.copy(ownerNames = Seq.empty) }
     intercept[IllegalArgumentException] { cfg.copy(ownerNames = Seq("same", "same")) }
     intercept[IllegalArgumentException] { cfg.copy(ownerNames = Seq("bad\nname")) }
+    intercept[IllegalArgumentException] { cfg.copy(physicalClockGates = -1) }
+    intercept[IllegalArgumentException] { cfg.copy(physicalClockGates = 65536) }
+    intercept[IllegalArgumentException] { cfg.copy(physicalClockGates = cfg.entries) }
   }
 
   it should "emit manifest, stream allocation, MMIO addresses and exact RTL provenance" in {
@@ -66,5 +69,27 @@ class CheckpointCaptureWidgetSpec extends AnyFlatSpec {
     val tb = try in.readAllBytes() finally in.close()
     Files.write(out.resolve("widget/checkpoint_capture_widget_tb.sv"), tb)
     println(s"CHECKPOINT_WIDGET_ELABORATED out=$out stream=${widget.toHostStreamIdx}")
+  }
+
+  it should "expose the physical cut through the real MMIO and stream widget without duplicate gates" in {
+    implicit val p: Parameters = Parameters.empty.alterPartial {
+      case CtrlNastiKey => NastiParameters(32, 32, 4)
+    }
+    val physicalCfg = cfg.copy(entries = 5, physicalClockGates = 3, manifestSha256 = "0123456789abcdef" * 4)
+    val widget = LazyModule(new CheckpointCaptureWidget(physicalCfg))
+    val destination = out.resolve("physical-widget")
+    val rtl = (new ChiselStage).emitVerilog(widget.module, Array("--target-dir", destination.toString))
+    assert("(?s)CheckpointPhysicalCaptureTransport\\s+#\\(".r.findFirstIn(rtl).nonEmpty)
+    assert(rtl.contains(".EXTERNAL_CLOCK_NETWORK(1)"))
+    assert(rtl.contains("capture_physical_logicalCE") && rtl.contains("capture_physical_clockMask"))
+    assert(rtl.contains("capture_physical_readEnable") && rtl.contains("capture_physical_capturedCE"))
+    assert(!rtl.contains("hPort"))
+    val header = CheckpointCaptureABI.header("PHYSICAL", BigInt(0x1000), physicalCfg, widget.toHostStreamIdx)
+    assert(header.contains("PHYSICAL_CLOCK_GATES 3U"))
+    assert(header.contains("EXTERNAL_CLOCK_NETWORK 1U"))
+    assert(header.contains("CheckpointPhysicalClockCut.sv SHA256:"))
+    assert(header.contains("CheckpointPhysicalCaptureTransport.sv SHA256:"))
+    Files.write(destination.resolve("physical_constants.h"), header.getBytes(UTF_8))
+    println(s"CHECKPOINT_PHYSICAL_WIDGET_ELABORATED out=$destination")
   }
 }

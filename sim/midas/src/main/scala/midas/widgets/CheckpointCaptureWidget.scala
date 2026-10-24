@@ -32,6 +32,8 @@ object CheckpointCaptureABI {
     sb.append(s"#define ${prefix}_TO_HOST_QUEUE_DEPTH ${cfg.queueDepth}U\n")
     sb.append(s"#define ${prefix}_ENTRIES ${cfg.entries}U\n")
     sb.append(s"#define ${prefix}_OWNERS ${cfg.ownerNames.size}U\n")
+    sb.append(s"#define ${prefix}_PHYSICAL_CLOCK_GATES ${cfg.physicalClockGates}U\n")
+    sb.append(s"#define ${prefix}_EXTERNAL_CLOCK_NETWORK ${if (cfg.physicalClockGates > 0) 1 else 0}U\n")
     sb.append(s"#define ${prefix}_MANIFEST_SHA256 \"${cfg.manifestSha256}\"\n")
     cfg.descriptors.foreach { descriptors =>
       sb.append(s"#define ${prefix}_DESCRIPTOR_BINDING_SHA256 \"${descriptors.bindingSha256}\"\n")
@@ -40,7 +42,8 @@ object CheckpointCaptureABI {
         sb.append(s"// descriptor[$index] StateID: ${entry.stateID}\n")
       }
     }
-    Seq("CheckpointCaptureTransport.sv", "CheckpointCaptureCut.sv").foreach { resource =>
+    (Seq("CheckpointCaptureTransport.sv", "CheckpointCaptureCut.sv") ++
+      (if (cfg.physicalClockGates > 0) Seq("CheckpointPhysicalCaptureTransport.sv", "CheckpointPhysicalClockCut.sv") else Nil)).foreach { resource =>
       val in = getClass.getResourceAsStream("/" + resource)
       require(in != null, s"missing checkpoint RTL resource: $resource")
       val bytes = try in.readAllBytes() finally in.close()
@@ -58,16 +61,27 @@ object CheckpointCaptureABI {
 
 case class CheckpointCaptureWidgetParams(entries: Int, manifestSha256: String,
     ownerNames: Seq[String], queueDepth: Int = 64,
-    descriptors: Option[CheckpointCaptureDescriptors] = None) {
+    descriptors: Option[CheckpointCaptureDescriptors] = None, physicalClockGates: Int = 0) {
   require(entries > 0 && entries <= 65535, "checkpoint descriptor network is missing or too large")
   require(manifestSha256.matches("[0-9a-f]{64}") && BigInt(manifestSha256, 16) != 0,
     "checkpoint requires a nonzero generated manifest SHA256")
   require(ownerNames.nonEmpty && ownerNames.distinct.size == ownerNames.size &&
     ownerNames.forall(_.matches("[A-Za-z0-9_.:/-]+")), "checkpoint owners must be explicit, unique and named")
   require(queueDepth > 0)
+  require(physicalClockGates >= 0 && physicalClockGates <= 65535,
+    "physical clock count must fit the descriptor transport")
+  require(physicalClockGates == 0 || entries > physicalClockGates,
+    "physical capture requires functional and physical CE descriptors")
   descriptors.foreach { d =>
     require(d.entries.size == entries && d.manifestSha256 == manifestSha256,
       "checkpoint descriptor ROM does not match transport manifest/count")
+    if (physicalClockGates > 0) {
+      val physical = d.entries.takeRight(physicalClockGates)
+      require(d.entries.dropRight(physicalClockGates).forall(_.bank != 255) &&
+        physical.zipWithIndex.forall { case (e, i) =>
+          e.bank == 255 && e.slot == i && e.width == 1 && e.depth == 1
+        }, "physical capture requires ordered bank-255 CE descriptors and no functional alias")
+    }
   }
 }
 
@@ -120,6 +134,51 @@ class CheckpointCaptureTransportBlackBox(cfg: CheckpointCaptureWidgetParams)
   val io = IO(new CheckpointCaptureTransportIO(cfg.ownerNames.size))
   addResource("/CheckpointCaptureTransport.sv")
   addResource("/CheckpointCaptureCut.sv")
+}
+
+/** The native gates live in the compiler-generated external clock network.
+  * Instantiating a second set here would freeze the wrong simulator clocks.
+  */
+class CheckpointPhysicalCaptureTransportIO(owners: Int, gates: Int)
+    extends CheckpointCaptureTransportIO(owners) {
+  val ce = Input(UInt(gates.W))
+  val root_clock = Output(Clock())
+  val gate_clock = Output(UInt(gates.W))
+  val clock_mask = Output(Bool())
+  val captured_ce = Output(UInt(gates.W))
+  val physical_stopped = Output(Bool())
+  val physical_read_enable = Output(Bool())
+  val physical_failed = Output(Bool())
+  val physical_cut_cycle = Output(UInt(64.W))
+  val physical_error = Output(UInt(3.W))
+}
+
+class CheckpointPhysicalCaptureTransportBlackBox(cfg: CheckpointCaptureWidgetParams)
+    extends BlackBox(Map("GATES" -> cfg.physicalClockGates, "OWNERS" -> cfg.ownerNames.size,
+      "ENTRIES" -> cfg.entries, "EXTERNAL_CLOCK_NETWORK" -> 1,
+      "MANIFEST_SHA256" -> BigInt(cfg.manifestSha256, 16))) with HasBlackBoxResource {
+  require(cfg.physicalClockGates > 0)
+  override def desiredName = "CheckpointPhysicalCaptureTransport"
+  val io = IO(new CheckpointPhysicalCaptureTransportIO(cfg.ownerNames.size, cfg.physicalClockGates))
+  Seq("CheckpointPhysicalCaptureTransport.sv", "CheckpointPhysicalClockCut.sv",
+    "CheckpointCaptureTransport.sv", "CheckpointCaptureCut.sv").foreach(r => addResource("/" + r))
+}
+
+class CheckpointPhysicalCaptureSideband(gates: Int) extends Bundle {
+  val logicalCE = Input(UInt(gates.W))
+  val clockMask = Output(Bool())
+  val capturedCE = Output(UInt(gates.W))
+  val stopped = Output(Bool())
+  val readEnable = Output(Bool())
+  val failed = Output(Bool())
+  val cutCycle = Output(UInt(64.W))
+  val error = Output(UInt(3.W))
+  def connect(t: CheckpointPhysicalCaptureTransportIO): Unit = {
+    t.ce := logicalCE
+    clockMask := t.clock_mask; capturedCE := t.captured_ce
+    stopped := t.physical_stopped; readEnable := t.physical_read_enable
+    failed := t.physical_failed; cutCycle := t.physical_cut_cycle; error := t.physical_error
+  }
 }
 
 /** One request at a time at the backend; AW and W can arrive in either order.
@@ -224,7 +283,7 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
   // Like streamEnq, this port must be accessible from the containing module
   // without relying on an anonymous WidgetImp structural refinement.
   val capturePort = InModuleBody {
-    val capture = IO(new CheckpointCaptureSideband(cfg.ownerNames.size))
+    val capture = IO(new CheckpointCaptureSideband(cfg.ownerNames.size, cfg.physicalClockGates))
     capture
   }
   lazy val module = new WidgetImp(this) {
@@ -232,25 +291,29 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
     // Exposes descriptor/bank/owners/freeze, never a target-token port. MMIO and
     // stream members are wired internally below rather than left as top ports.
     val capture = capturePort.getWrappedValue
-    val transport = Module(new CheckpointCaptureTransportBlackBox(cfg))
+    val transport: CheckpointCaptureTransportIO = if (cfg.physicalClockGates > 0) {
+      val physicalTransport = Module(new CheckpointPhysicalCaptureTransportBlackBox(cfg))
+      capture.physical.get.connect(physicalTransport.io)
+      physicalTransport.io
+    } else Module(new CheckpointCaptureTransportBlackBox(cfg)).io
     val adapter = Module(new CheckpointNastiAdapter(p(CtrlNastiKey)))
     adapter.io.ctrl <> io.ctrl
-    transport.io.clock := clock
-    transport.io.reset := reset.asBool
-    capture.connect(transport.io)
+    transport.clock := clock
+    transport.reset := reset.asBool
+    capture.connect(transport)
     cfg.descriptors.foreach { descriptors =>
       val rom = Module(new CheckpointCaptureDescriptorROM(descriptors))
-      rom.io.entry := transport.io.descriptor_entry
-      transport.io.descriptor_valid := rom.io.valid
-      transport.io.descriptor_bank := rom.io.bank
-      transport.io.descriptor_slot := rom.io.slot
-      transport.io.descriptor_width := rom.io.bitWidth
-      transport.io.descriptor_depth := rom.io.depth
+      rom.io.entry := transport.descriptor_entry
+      transport.descriptor_valid := rom.io.valid
+      transport.descriptor_bank := rom.io.bank
+      transport.descriptor_slot := rom.io.slot
+      transport.descriptor_width := rom.io.bitWidth
+      transport.descriptor_depth := rom.io.depth
     }
     capture.controllerReset := reset.asBool
-    streamEnq.valid := transport.io.dma_valid
-    streamEnq.bits := transport.io.dma_data
-    transport.io.dma_ready := streamEnq.ready
+    streamEnq.valid := transport.dma_valid
+    streamEnq.bits := transport.dma_data
+    transport.dma_ready := streamEnq.ready
     val invalid = RegInit(false.B)
     val producedFrames = RegInit(0.U(64.W))
     val producedSnapshot = RegInit(0.U(64.W))
@@ -262,7 +325,7 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
       when(producedFrames.andR) { counterOverflow := true.B; invalid := true.B }
         .otherwise { producedFrames := producedFrames + 1.U }
     }
-    when(transport.io.dma_abort) { invalid := true.B }
+    when(transport.dma_abort) { invalid := true.B }
     val req = adapter.io.request
     val isStatus = !req.bits.write && req.bits.address === 0x60.U
     val isAck = req.bits.write && req.bits.address === 0x64.U
@@ -275,14 +338,14 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
     val localValid = RegInit(false.B)
     val localData = Reg(UInt(32.W))
     val localError = Reg(Bool())
-    val ackAllowed = req.bits.data === 1.U && !transport.io.dma_abort &&
-      !transport.io.freeze && !transport.io.dma_valid && !counterOverflow &&
+    val ackAllowed = req.bits.data === 1.U && !transport.dma_abort &&
+      !transport.freeze && !transport.dma_valid && !counterOverflow &&
       hostDrainedFrames === producedFrames
-    req.ready := Mux(local, !localValid, transport.io.mmio_ready)
-    transport.io.mmio_valid := req.valid && !local
-    transport.io.mmio_write := req.bits.write
-    transport.io.mmio_address := req.bits.address
-    transport.io.mmio_wdata := req.bits.data
+    req.ready := Mux(local, !localValid, transport.mmio_ready)
+    transport.mmio_valid := req.valid && !local
+    transport.mmio_write := req.bits.write
+    transport.mmio_address := req.bits.address
+    transport.mmio_wdata := req.bits.data
     when(req.fire && local) {
       localValid := true.B
       localData := MuxCase(0.U, Seq(
@@ -296,10 +359,10 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
       localError := blockedStart || (isAck && !ackAllowed)
       when(isAck && ackAllowed) { invalid := false.B }
     }
-    adapter.io.response.valid := localValid || transport.io.mmio_response_valid
-    adapter.io.response.bits.data := Mux(localValid, localData, transport.io.mmio_rdata)
-    adapter.io.response.bits.error := Mux(localValid, localError, transport.io.mmio_response_error)
-    transport.io.mmio_response_ready := adapter.io.response.ready && !localValid
+    adapter.io.response.valid := localValid || transport.mmio_response_valid
+    adapter.io.response.bits.data := Mux(localValid, localData, transport.mmio_rdata)
+    adapter.io.response.bits.error := Mux(localValid, localError, transport.mmio_response_error)
+    transport.mmio_response_ready := adapter.io.response.ready && !localValid
     when(localValid && adapter.io.response.ready) { localValid := false.B }
     override def genHeader(base: BigInt, memoryRegions: Map[String, BigInt], sb: StringBuilder): Unit = {
       sb.append(CheckpointCaptureABI.header(getWName.toUpperCase, base, cfg, toHostStreamIdx))
@@ -315,7 +378,8 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
   }
 }
 
-class CheckpointCaptureSideband(owners: Int) extends Bundle {
+class CheckpointCaptureSideband(owners: Int, physicalClockGates: Int = 0) extends Bundle {
+  val physical = if (physicalClockGates > 0) Some(new CheckpointPhysicalCaptureSideband(physicalClockGates)) else None
   val controllerReset = Output(Bool())
   val targetCycle = Input(UInt(64.W))
   val ownerPresent = Input(UInt(owners.W))
