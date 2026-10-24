@@ -114,12 +114,45 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
 
   behavior.of("Golden Gate production host-to-FPGA pipeline")
 
+  it should "consume exactly the stage circuit and retain immutable complete input identity" in {
+    val input = Parser.parse(source)
+    val request = firrtl.stage.FirrtlCircuitAnnotation(input)
+    val (selected, annotations) = GoldenGateCompilerPhase.consumeInputCircuit(Seq(HostPipelineMarker, request))
+    assert(selected == input && annotations.head == HostPipelineMarker)
+    assert(!annotations.exists(_.isInstanceOf[firrtl.stage.FirrtlCircuitAnnotation]))
+    val h = annotations.collect { case a: GoldenGateInputCircuitAnnotation => a }.head
+    assert(h.circuit == input.main && h.modules == input.modules.map(_.name))
+    assert(h.circuitSHA256 == SemanticStateInventory.sha256(input.serialize))
+    val changed = input.copy(modules = input.modules.reverse)
+    val (_, altered) = GoldenGateCompilerPhase.consumeInputCircuit(Seq(firrtl.stage.FirrtlCircuitAnnotation(changed)))
+    assert(!altered.contains(h))
+    Seq(Nil, Seq(request, request), annotations :+ request).foreach { invalid =>
+      intercept[IllegalArgumentException] { GoldenGateCompilerPhase.consumeInputCircuit(invalid) }
+    }
+  }
+
   it should "emit functional generated banks through the real backend and bind every probe input" in {
     val injection = new InjectBankHostState
     val policies = Seq(firrtl.passes.memlib.InferReadWriteAnnotation,
       firrtl.passes.memlib.DefaultReadFirstAnnotation,
       firrtl.passes.memlib.PassthroughSimpleSyncReadMemsAnnotation)
-    val context = Seq(
+    val historicalInput = Parser.parse("""circuit HistoricalInput :
+  module Worker :
+    input clock : Clock
+    output count : UInt<8>
+    reg count_reg : UInt<8>, clock
+    count_reg <= add(count_reg, UInt<8>(1))
+    count <= count_reg
+  module HistoricalInput :
+    input clock : Clock
+    output count : UInt<8>
+    inst worker of Worker
+    worker.clock <= clock
+    count <= worker.count
+""")
+    val (_, consumedInput) = GoldenGateCompilerPhase.consumeInputCircuit(
+      Seq(firrtl.stage.FirrtlCircuitAnnotation(historicalInput)))
+    val context = consumedInput ++ Seq(
       midas.passes.PreLinkRenamingTestFixture.history,
       midas.passes.BridgeExtractionTestFixture.history,
       firrtl.stage.InfoModeAnnotation("use"),
@@ -151,6 +184,7 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
         firrtl.transforms.DedupedResult(firrtl.annotations.ModuleTarget("Historical", "Deleted"), None, -1)) ++
         constraints ++ context ++ policies)
     context.foreach(c => assert(a.contains(c)))
+    save("compiler-input.fir", historicalInput.serialize)
     val historicalLink = midas.passes.PreLinkRenamingTestFixture.run()
     save("pre-link-input.fir", midas.passes.PreLinkRenamingTestFixture.input.serialize)
     save("pre-link-output.fir", historicalLink.circuit.serialize)

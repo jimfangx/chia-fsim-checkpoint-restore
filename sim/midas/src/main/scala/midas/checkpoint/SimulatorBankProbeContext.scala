@@ -6,13 +6,13 @@ import firrtl.options.{InputAnnotationFileAnnotation, TargetDirAnnotation}
 import firrtl.stage.{AllowUnrecognizedAnnotations, FirrtlFileAnnotation, InfoModeAnnotation, OutputFileAnnotation}
 import chisel3.experimental.EnumAnnotations.EnumDefAnnotation
 import midas.passes.{ChannelClockInfoAnnotation, PreLinkRenamingResultAnnotation, BridgeExtractionResultAnnotation}
-import midas.stage.{ConfigPackageAnnotation, ConfigStringAnnotation, OutputBaseFilenameAnnotation}
+import midas.stage.{ConfigPackageAnnotation, ConfigStringAnnotation, OutputBaseFilenameAnnotation, GoldenGateInputCircuitAnnotation}
 import org.json4s._
 
 /** Exact, inert compiler context at the post-FPGA-lowering bank boundary.
   * These values name parser/config/output choices, enum TYPE definitions,
   * consumed input-file/pre-link events or global channel clock-frequency metadata;
-  * none identifies an instance, schedules a pass or embeds a circuit. Preserve
+  * none identifies a live instance, schedules a pass or embeds a circuit. Preserve
   * the original annotations for their stage consumers and bind their complete
   * values separately from the storage translation. In particular, accepting
   * AllowUnrecognizedAnnotations here never admits an UnrecognizedAnnotation.
@@ -34,6 +34,19 @@ private[checkpoint] object SimulatorBankProbeContext {
       case ConfigStringAnnotation(value) => text("config_string", value)
       case OutputBaseFilenameAnnotation(value) => text("output_base_filename", value)
       case AllowUnrecognizedAnnotations => Some("allow_unrecognized_input_annotations" -> JBool(true))
+      // Only the stage's consumed receipt is inert. A live circuit annotation
+      // (even one equal to the current IR) still needs a stage consumer and is
+      // never admitted by the bank translator. Names retain input order and
+      // identity, independently of later linking/specialization.
+      case a: GoldenGateInputCircuitAnnotation =>
+        def name(s: String): Boolean = s.matches("[A-Za-z_][A-Za-z0-9_$]*")
+        require(name(a.circuit) && a.circuitSHA256.matches("[0-9a-f]{64}") &&
+          a.modules.nonEmpty && a.modules.forall(name) && a.modules.distinct.size == a.modules.size &&
+          a.modules.count(_ == a.circuit) == 1, "Simulator bank context: invalid consumed circuit input")
+        Some("golden_gate_input_circuit" -> JObject(List(
+          "producer" -> JString("midas.stage.GoldenGateCompilerPhase"),
+          "circuit" -> JString(a.circuit), "circuit_sha256" -> JString(a.circuitSHA256),
+          "modules" -> JArray(a.modules.map(JString(_)).toList))))
       case EnumDefAnnotation(name, values) => Some("enum_type" -> JObject(List(
         "name" -> JString(name), "values" -> JObject(values.toList.map { case (k, v) => k -> JInt(v) }))))
       // These exact stage producers already consumed the named input. A

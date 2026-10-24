@@ -12,6 +12,32 @@ import firrtl.passes.memlib.InferReadWrite
 import firrtl.stage.{FirrtlCircuitAnnotation, Forms}
 import firrtl.stage.transforms.Compiler
 
+/** Immutable identity of the stage input already consumed by Golden Gate.
+  * Keeping FirrtlCircuitAnnotation here leaves a second, stale circuit in the
+  * transformed simulator. This receipt is history, never a replacement input.
+  */
+case class GoldenGateInputCircuitAnnotation(
+  circuit: String,
+  circuitSHA256: String,
+  modules: Seq[String],
+) extends firrtl.annotations.NoTargetAnnotation
+
+object GoldenGateCompilerPhase {
+  private[midas] def consumeInputCircuit(annotations: AnnotationSeq): (firrtl.ir.Circuit, AnnotationSeq) = {
+    val circuits = annotations.collect { case FirrtlCircuitAnnotation(c) => c }
+    require(circuits.size == 1, "Golden Gate can only process a single Firrtl Circuit at a time.")
+    require(!annotations.exists(_.isInstanceOf[GoldenGateInputCircuitAnnotation]),
+      "Golden Gate input circuit has already been consumed")
+    val circuit = circuits.head
+    val history = GoldenGateInputCircuitAnnotation(circuit.main,
+      midas.checkpoint.SemanticStateInventory.sha256(circuit.serialize), circuit.modules.map(_.name))
+    (circuit, annotations.map {
+      case _: FirrtlCircuitAnnotation => history
+      case a => a
+    })
+  }
+}
+
 class GoldenGateCompilerPhase extends Phase {
 
   override val prerequisites = Seq(
@@ -21,8 +47,7 @@ class GoldenGateCompilerPhase extends Phase {
   )
 
   def transform(annotations: AnnotationSeq): AnnotationSeq = {
-    val allCircuits = annotations.collect({ case FirrtlCircuitAnnotation(circuit) => circuit })
-    require(allCircuits.size == 1, "Golden Gate can only process a single Firrtl Circuit at a time.")
+    val (inputCircuit, consumedAnnotations) = GoldenGateCompilerPhase.consumeInputCircuit(annotations)
     midas.checkpoint.SimulatorFPGASynthesisConstants.validateCardinality(annotations)
 
     implicit val p = annotations.collectFirst({ case ConfigParametersAnnotation(p) => p }).get
@@ -33,7 +58,7 @@ class GoldenGateCompilerPhase extends Phase {
       firrtl.passes.memlib.PassthroughSimpleSyncReadMemsAnnotation,
     )
 
-    val state = CircuitState(allCircuits.head, firrtl.ChirrtlForm, annotations ++ midasAnnos)
+    val state = CircuitState(inputCircuit, firrtl.ChirrtlForm, consumedAnnotations ++ midasAnnos)
 
     // Lower the target design and run additional target transformations before Golden Gate xforms
     val targetLoweringCompiler = new Compiler(

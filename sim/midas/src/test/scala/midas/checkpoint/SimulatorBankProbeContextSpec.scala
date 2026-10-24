@@ -52,6 +52,47 @@ class SimulatorBankProbeContextSpec extends AnyFlatSpec {
     assert(probe(Nil).circuit == probe(Seq(OutputFileAnnotation("other.fir"))).circuit)
   }
 
+  private def consumedCircuit = midas.stage.GoldenGateCompilerPhase.consumeInputCircuit(
+    Seq(FirrtlCircuitAnnotation(state.circuit)))._2.head.asInstanceOf[midas.stage.GoldenGateInputCircuitAnnotation]
+
+  it should "retain the consumed stage circuit identity independently of the specialized hierarchy" in {
+    val h = consumedCircuit
+    val result = probe(Seq(h))
+    assert(result.annotations.contains(h) && result.circuit == probe(Nil).circuit)
+    val row = (context(Seq(h)) \ "annotations").asInstanceOf[JArray].arr.head
+    assert((row \ "kind") == JString("golden_gate_input_circuit"))
+    assert((row \ "value" \ "circuit_sha256") == JString(h.circuitSHA256))
+    assert((row \ "value" \ "modules") == JArray(List(JString("Top"))))
+    assert(intercept[IllegalArgumentException](probe(Seq(h, h))).getMessage.contains("duplicate compiler option"))
+  }
+
+  it should "reject malformed consumed circuit hashes module identities and missing roots" in {
+    val h = consumedCircuit
+    Seq(h.copy(circuit = ""), h.copy(circuitSHA256 = "bad"), h.copy(circuitSHA256 = "A" * 64),
+      h.copy(modules = Nil), h.copy(modules = Seq("Other")), h.copy(modules = Seq("Top", "Top")),
+      h.copy(modules = Seq("Top", "bad.name"))).foreach { a =>
+      assert(intercept[IllegalArgumentException](probe(Seq(a))).getMessage.contains("invalid consumed circuit"))
+    }
+  }
+
+  it should "reject dropped altered or reordered consumed circuit history at both final emission boundaries" in {
+    val h = consumedCircuit.copy(modules = Seq("Top", "HistoricalWorker"))
+    val original = probe(Seq(h))
+    val xdc = midas.targetutils.xdc.XDCFiles.allFiles.map(f => midas.passes.XDCOutputAnnotation("", Some(f.fileSuffix)))
+    SimulatorBankProbe.emissionBinding(original, "fixture RTL", original.annotations ++ xdc)
+    Seq(None, Some(h.copy(circuitSHA256 = "1" * 64)), Some(h.copy(modules = h.modules.reverse)),
+      Some(h.copy(modules = h.modules :+ "Other")),
+      Some(h.copy(circuit = "Other", modules = Seq("Other")))).foreach { change =>
+      val annotations = original.annotations.filterNot(_ == h) ++ change.toSeq
+      Seq((original.copy(annotations = annotations), original.annotations ++ xdc),
+        (original, annotations ++ xdc), (original.copy(annotations = annotations), annotations ++ xdc)).foreach {
+        case (state, emitted) => assert(intercept[IllegalArgumentException] {
+          SimulatorBankProbe.emissionBinding(state, "fixture RTL", emitted)
+        }.getMessage.contains("compiler context changed"))
+      }
+    }
+  }
+
   it should "preserve only exact consumed input-file events without reopening their historical paths" in {
     val source = DeletedAnnotation("firrtl.stage.phases.AddCircuit", FirrtlFileAnnotation("absent-original.fir"))
     val include = DeletedAnnotation("firrtl.options.phases.GetIncludes",
