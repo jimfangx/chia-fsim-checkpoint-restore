@@ -9,6 +9,7 @@ import firrtl.options.Dependency
 import firrtl.passes.{InlineAnnotation, InlineInstances}
 import firrtl.stage.{Forms, RunFirrtlTransformAnnotation}
 import firrtl.stage.transforms.Compiler
+import firrtl.transforms.NoDedupAnnotation
 import midas.checkpoint.SemanticStateInventory.{canonical, sha256}
 import org.json4s._
 import org.json4s.native.JsonMethods.parse
@@ -73,6 +74,8 @@ class ResolveSimulationInlineSpec extends AnyFlatSpec {
   private val request = RunFirrtlTransformAnnotation(new InlineInstances)
   private val target = InlineAnnotation(ModuleName("Leaf", CircuitName("InlineFixture")))
   private def input = lower.copy(annotations = lower.annotations ++ Seq(request, target,
+    NoDedupAnnotation(ModuleTarget("InlineFixture", "Leaf")),
+    NoDedupAnnotation(ModuleTarget("InlineFixture", "InlineFixture")),
     firrtl.transforms.DontTouchAnnotation(ReferenceTarget("InlineFixture", "Leaf", Nil, "time", Nil))))
   private def save(name: String, value: String): Unit = sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { dir =>
     val out = Paths.get(dir).resolve("inline"); Files.createDirectories(out)
@@ -97,6 +100,12 @@ class ResolveSimulationInlineSpec extends AnyFlatSpec {
     assert((doc \ "input_sha256") == JString(sha256(original.circuit.serialize)))
     assert((doc \ "output_sha256") == JString(sha256(result.circuit.serialize)))
     assert((doc \ "renames").asInstanceOf[JString].s.nonEmpty)
+    assert(result.annotations.collect { case a: NoDedupAnnotation => a.target.module } == Seq("InlineFixture"))
+    val protection = (doc \ "no_dedup").asInstanceOf[JArray].arr
+    assert(protection.size == 2)
+    assert(protection.map(r => (r \ "target", r \ "action")).toSet == Set(
+      JString("~InlineFixture|Leaf") -> JString("retired"),
+      JString("~InlineFixture|InlineFixture") -> JString("preserved")))
     val rows = (doc \ "storage").asInstanceOf[JArray].arr
     assert(rows.size == 4)
     assert(rows.map(_ \ "to").toSet == Set("left_time", "left_ram", "right_time", "right_ram")
@@ -112,6 +121,56 @@ class ResolveSimulationInlineSpec extends AnyFlatSpec {
     save("reference.sv", emit(original.copy(annotations = original.annotations.filterNot(a =>
       a.isInstanceOf[RunFirrtlTransformAnnotation] || a.isInstanceOf[InlineAnnotation]))))
     save("inlined.sv", emit(result))
+  }
+
+  it should "preserve NoDedup on partially inlined definitions and retire circuit-wide selections at the real pass" in {
+    val partial = input.copy(annotations = input.annotations.filterNot(_.isInstanceOf[InlineAnnotation]) :+
+      InlineAnnotation(ComponentName("left", ModuleName("InlineFixture", CircuitName("InlineFixture")))))
+    // Native FIRRTL 1.6 aliases a surviving repeated Leaf's tracking target
+    // onto the promoted copy. Keep the complete state audit fail-closed.
+    val error = intercept[IllegalArgumentException](ResolveSimulationInline(partial))
+    assert(error.getMessage.contains("missing or reshaped inline storage"))
+    val combinational = """circuit InlineFixture :
+  module Leaf :
+    input data : UInt<8>
+    output value : UInt<8>
+    value <= data
+  module InlineFixture :
+    input data : UInt<8>
+    output value : UInt<8>
+    inst left of Leaf
+    inst right of Leaf
+    left.data <= data
+    right.data <= left.value
+    value <= right.value
+"""
+    val stateless = new Compiler(Forms.LowForm).execute(CircuitState(Parser.parse(combinational), ChirrtlForm,
+      Seq(firrtl.transforms.NoCircuitDedupAnnotation))).copy(form = LowForm)
+    val result = ResolveSimulationInline(stateless.copy(annotations = stateless.annotations ++
+      partial.annotations.filter(a => a.isInstanceOf[NoDedupAnnotation] ||
+        a.isInstanceOf[InlineAnnotation] || a.isInstanceOf[RunFirrtlTransformAnnotation])))
+    assert(result.circuit.modules.exists(_.name == "Leaf"))
+    assert(result.annotations.collect { case a: NoDedupAnnotation => a }.toSet ==
+      partial.annotations.collect { case a: NoDedupAnnotation => a }.toSet)
+    val doc = ResolveSimulationInline.context(result.annotations.collectFirst {
+      case a: SimulationInlineResultAnnotation => a }.get)
+    assert((doc \ "no_dedup").asInstanceOf[JArray].arr.forall(r => (r \ "action") == JString("preserved")))
+    val all = input.copy(annotations = input.annotations.filterNot(_.isInstanceOf[InlineAnnotation]) :+
+      InlineAnnotation(CircuitName("InlineFixture")))
+    val flat = ResolveSimulationInline(all)
+    assert(flat.circuit.modules.map(_.name) == Seq("InlineFixture"))
+    assert(flat.annotations.collect { case a: NoDedupAnnotation => a.target.module } == Seq("InlineFixture"))
+  }
+
+  it should "reject stale foreign duplicate or already unreachable NoDedup constraints before inline consumption" in {
+    val leaf = NoDedupAnnotation(ModuleTarget("InlineFixture", "Leaf"))
+    val dead = lower.circuit.modules.head.asInstanceOf[firrtl.ir.Module].copy(name = "Dead")
+    Seq(input.copy(annotations = input.annotations :+ leaf),
+      input.copy(annotations = input.annotations :+ NoDedupAnnotation(ModuleTarget("Other", "Leaf"))),
+      input.copy(annotations = input.annotations :+ NoDedupAnnotation(ModuleTarget("InlineFixture", "Absent"))),
+      input.copy(circuit = input.circuit.copy(modules = input.circuit.modules :+ dead),
+        annotations = input.annotations :+ NoDedupAnnotation(ModuleTarget("InlineFixture", "Dead"))))
+      .foreach(bad => intercept[IllegalArgumentException](ResolveSimulationInline(bad)))
   }
 
   it should "preserve unrelated transform requests and reject duplicate missing and stale inline requests" in {
@@ -138,11 +197,13 @@ class ResolveSimulationInlineSpec extends AnyFlatSpec {
     val doc = parse(receipt.body)
     val rows = (doc \ "storage").asInstanceOf[JArray].arr
     def replace(key: String, value: JValue): JValue = doc transformField { case (`key`, _) => key -> value }
-    val invalid = Seq(replace("version", JInt(2)), replace("input_sha256", JString("bad")),
+    val invalid = Seq(replace("version", JInt(1)), replace("input_sha256", JString("bad")),
       replace("producer", JString("unknown")), replace("request", JArray(Nil)),
       replace("inline_annotations", JArray(Nil)), replace("renames", JArray(Nil)), replace("renames", JString("")),
       replace("storage", JArray(rows :+ rows.head)), replace("shape", JString("opaque")),
-      replace("from", JString("~Other|Other>reg")))
+      replace("from", JString("~Other|Other>reg")), replace("no_dedup", JNothing),
+      replace("no_dedup", JString("bad")), replace("action", JString("retired")),
+      replace("definition_sha256", JString("bad")), replace("target", JString("~Other|Leaf")))
     invalid.foreach(d => intercept[IllegalArgumentException](
       ResolveSimulationInline.context(SimulationInlineResultAnnotation(canonical(d)))))
     intercept[IllegalArgumentException](ResolveSimulationInline.context(receipt.copy(body = receipt.body + " ")))

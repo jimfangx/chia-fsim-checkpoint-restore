@@ -7,6 +7,7 @@ import firrtl.annotations._
 import firrtl.ir._
 import firrtl.passes.{InlineAnnotation, InlineInstances}
 import firrtl.stage.RunFirrtlTransformAnnotation
+import firrtl.transforms.NoDedupAnnotation
 import midas.checkpoint.SemanticStateInventory.{canonical, sha256}
 import org.json4s._
 import org.json4s.native.JsonMethods.parse
@@ -21,12 +22,20 @@ private case class SimulationInlineStorage(target: ReferenceTarget, original: St
 
 private class RecordedSimulationInline extends InlineInstances {
   var renameHistory: String = ""
+  var retiredNoDedup: Seq[NoDedupAnnotation] = Nil
   override def execute(state: CircuitState): CircuitState = {
     val result = super.execute(state)
     // runTransform applies and clears this map. Record it at its producer,
     // while still letting runTransform update every real annotation normally.
     renameHistory = result.renames.map(_.serialize).getOrElse("")
-    result
+    // FIRRTL's inline rename map describes component promotion, but does not
+    // delete module-only NoDedup targets. Retire ONLY definitions removed by
+    // this invocation of the real pass, before runTransform applies renames.
+    val remaining = result.circuit.modules.map(_.name).toSet
+    retiredNoDedup = state.annotations.collect {
+      case a: NoDedupAnnotation if !remaining(a.target.module) => a
+    }
+    result.copy(annotations = result.annotations.filterNot(retiredNoDedup.contains(_)))
   }
 }
 
@@ -78,10 +87,10 @@ object ResolveSimulationInline {
     val doc = parse(a.body)
     def hash(k: String): Boolean = (doc \ k) match { case JString(s) => s.matches("[0-9a-f]{64}"); case _ => false }
     val keys = Set("version", "producer", "circuit", "request", "inline_annotations", "input_sha256",
-      "output_sha256", "input_annotations_sha256", "output_annotations_sha256", "renames", "storage")
+      "output_sha256", "input_annotations_sha256", "output_annotations_sha256", "renames", "storage", "no_dedup")
     val fields = doc match { case JObject(xs) => xs.map(_._1); case _ => fail("invalid receipt") }
     if (fields.toSet != keys || fields.distinct.size != fields.size || canonical(doc) != a.body ||
-        (doc \ "version") != JInt(1) || (doc \ "producer") != JString("midas.passes.ResolveSimulationInline") ||
+        (doc \ "version") != JInt(2) || (doc \ "producer") != JString("midas.passes.ResolveSimulationInline") ||
         !Seq("input_sha256", "output_sha256", "input_annotations_sha256", "output_annotations_sha256").forall(hash) ||
         (doc \ "request") != parse(JsonProtocol.serialize(Seq(RunFirrtlTransformAnnotation(new InlineInstances)))))
       fail("invalid consumed request receipt")
@@ -93,7 +102,8 @@ object ResolveSimulationInline {
       case a: JArray if a.arr.nonEmpty => a
       case _ => fail("missing consumed inline targets")
     }
-    val targets = JsonProtocol.deserialize(canonical(inline))
+    val targets = scala.util.Try(JsonProtocol.deserialize(canonical(inline)))
+      .getOrElse(fail("invalid consumed inline targets"))
     if (!targets.forall {
       case InlineAnnotation(c: CircuitName) => c.name == circuit
       case InlineAnnotation(m: ModuleName) => m.circuit.name == circuit
@@ -101,6 +111,32 @@ object ResolveSimulationInline {
       case _ => false
     } || targets.distinct.size != targets.size)
       fail("invalid consumed inline targets")
+    val noDedup = (doc \ "no_dedup") match { case JArray(xs) => xs; case _ => fail("missing NoDedup history") }
+    val protectedTargets = noDedup.map(_ \ "target")
+    if (protectedTargets != protectedTargets.distinct.sortBy(canonical)) fail("duplicate or unordered NoDedup history")
+    noDedup.foreach { r =>
+      val fields = r match { case JObject(xs) => xs.map(_._1); case _ => fail("invalid NoDedup history") }
+      if (fields.toSet != Set("target", "definition_sha256", "action") || fields.distinct.size != fields.size)
+        fail("invalid NoDedup history schema")
+      val t = (r \ "target") match {
+        case JString(s) => Target.deserialize(s) match {
+          case m: ModuleTarget if m.circuit == circuit => m
+          case _ => fail("invalid NoDedup history target")
+        }
+        case _ => fail("missing NoDedup history target")
+      }
+      (r \ "definition_sha256") match {
+        case JString(s) if s.matches("[0-9a-f]{64}") => ()
+        case _ => fail("invalid NoDedup definition hash")
+      }
+      val selected = t.module != circuit && targets.exists {
+        case InlineAnnotation(c: CircuitName) => c.name == circuit
+        case InlineAnnotation(m: ModuleName) => m.name == t.module
+        case _ => false
+      }
+      if ((r \ "action") != JString(if (selected) "retired" else "preserved"))
+        fail("NoDedup retirement does not match module inline selection")
+    }
     (doc \ "renames") match {
       case JString(s) if s.nonEmpty => ()
       case _ => fail("invalid rename history")
@@ -136,11 +172,36 @@ object ResolveSimulationInline {
     if (state.form != LowForm) fail("inline consumption requires final lowered simulator")
     val targets = state.annotations.collect { case a: InlineAnnotation => a }
     if (targets.isEmpty || targets.distinct.size != targets.size) fail("missing or duplicate inline targets")
+    val noDedup = state.annotations.collect { case a: NoDedupAnnotation => a }
+    if (noDedup.distinct.size != noDedup.size) fail("duplicate NoDedup targets")
+    val modules = state.circuit.modules.map(m => m.name -> m).toMap
+    val reachable = firrtl.analyses.InstanceKeyGraph(state.circuit).reachableModules.map(_.value).toSet
+    noDedup.foreach { a =>
+      if (a.target.circuit != state.circuit.main || !modules.contains(a.target.module) ||
+          !reachable(a.target.module)) fail(s"stale or foreign NoDedup target: ${a.target.serialize}")
+    }
     val before = storage(state)
     val input = state.copy(annotations = state.annotations.filterNot(_ == requests.head) ++
       before.toSeq.sortBy(_._1).map { case (id, (t, _)) => SimulationInlineStorage(t, id) })
     val pass = new RecordedSimulationInline
     val result = pass.runTransform(input)
+    val survivors = result.circuit.modules.map(_.name).toSet
+    val removed = modules.keySet -- survivors
+    val selectedModules = targets.flatMap {
+      case InlineAnnotation(_: CircuitName) => state.circuit.modules.collect {
+        case m: Module if m.name != state.circuit.main => m.name
+      }
+      case InlineAnnotation(m: ModuleName) => Seq(m.name)
+      case _ => Nil
+    }.toSet
+    if (removed != selectedModules) fail("actual inline module removal differs from selection")
+    if (result.annotations.collect { case a: NoDedupAnnotation => a }.toSet !=
+        noDedup.filterNot(pass.retiredNoDedup.contains).toSet)
+      fail("inline changed surviving NoDedup protection")
+    val noDedupRows = noDedup.sortBy(_.target.serialize).map { a => JObject(List(
+      "target" -> JString(a.target.serialize),
+      "definition_sha256" -> JString(sha256(modules(a.target.module).serialize)),
+      "action" -> JString(if (pass.retiredNoDedup.contains(a)) "retired" else "preserved"))) }
     if (result.annotations.exists(_.isInstanceOf[InlineAnnotation])) fail("inline targets remain unconsumed")
     val tracked = result.annotations.collect { case a: SimulationInlineStorage => a }
     if (tracked.map(_.original).sorted != before.keys.toSeq.sorted) fail("lost or replicated storage during inline")
@@ -155,7 +216,7 @@ object ResolveSimulationInline {
       fail("incomplete or aliased output storage coverage")
     val clean = result.copy(annotations = result.annotations.filterNot(_.isInstanceOf[SimulationInlineStorage]))
     val receipt = SimulationInlineResultAnnotation(canonical(JObject(List(
-      "version" -> JInt(1), "producer" -> JString("midas.passes.ResolveSimulationInline"),
+      "version" -> JInt(2), "producer" -> JString("midas.passes.ResolveSimulationInline"),
       "circuit" -> JString(state.circuit.main), "request" -> parse(JsonProtocol.serialize(requests)),
       "inline_annotations" -> parse(JsonProtocol.serialize(targets)),
       "input_sha256" -> JString(sha256(state.circuit.serialize)),
@@ -163,6 +224,7 @@ object ResolveSimulationInline {
       "input_annotations_sha256" -> JString(sha256(JsonProtocol.serialize(state.annotations))),
       "output_annotations_sha256" -> JString(sha256(JsonProtocol.serialize(clean.annotations))),
       "renames" -> JString(pass.renameHistory),
+      "no_dedup" -> JArray(noDedupRows.toList),
       "storage" -> JArray(rows.toList)))))
     context(receipt)
     clean.copy(annotations = clean.annotations :+ receipt)
