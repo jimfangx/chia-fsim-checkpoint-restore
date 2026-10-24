@@ -75,6 +75,8 @@ case class CheckpointCaptureWidgetParams(entries: Int, manifestSha256: String,
   descriptors.foreach { d =>
     require(d.entries.size == entries && d.manifestSha256 == manifestSha256,
       "checkpoint descriptor ROM does not match transport manifest/count")
+    require(d.physicalClockGates == physicalClockGates,
+      "checkpoint descriptor ROM physical CE count does not match transport mode; ordered bank-255 CE descriptors required")
     if (physicalClockGates > 0) {
       val physical = d.entries.takeRight(physicalClockGates)
       require(d.entries.dropRight(physicalClockGates).forall(_.bank != 255) &&
