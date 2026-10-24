@@ -152,7 +152,13 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
 """)
     val (_, consumedInput) = GoldenGateCompilerPhase.consumeInputCircuit(
       Seq(firrtl.stage.FirrtlCircuitAnnotation(historicalInput)))
-    val context = consumedInput ++ Seq(
+    val passiveOutputs = Seq(
+      GoldenGateOutputFileAnnotation("// fixture driver metadata\n#define FIXTURE_CTRL_BASE 64\n", ".const.h"),
+      GoldenGateOutputFileAnnotation("// fixture widths: λ\n`define FIXTURE_WIDTH 8\n", ".const.vh"),
+      GoldenGateOutputFileAnnotation("// fixture partition metadata\n#define FIXTURE_PARTITIONS 1\n", ".partition.const.h"),
+      GoldenGateOutputFileAnnotation("", ".peer2peer.const.yaml"),
+      GoldenGateOutputFileAnnotation("// fixture platform defines\n`define USE_DDR_CHANNEL_A 0\n", ".defines.vh"))
+    val context = consumedInput ++ passiveOutputs ++ Seq(
       midas.passes.PreLinkRenamingTestFixture.history,
       midas.passes.BridgeExtractionTestFixture.history,
       firrtl.stage.InfoModeAnnotation("use"),
@@ -184,6 +190,10 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
         firrtl.transforms.DedupedResult(firrtl.annotations.ModuleTarget("Historical", "Deleted"), None, -1)) ++
         constraints ++ context ++ policies)
     context.foreach(c => assert(a.contains(c)))
+    passiveOutputs.foreach { output =>
+      assert(file(a, output.fileSuffix) == output.body)
+      save("passive-output" + output.fileSuffix, output.body)
+    }
     save("compiler-input.fir", historicalInput.serialize)
     val historicalLink = midas.passes.PreLinkRenamingTestFixture.run()
     save("pre-link-input.fir", midas.passes.PreLinkRenamingTestFixture.input.serialize)
@@ -200,6 +210,8 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
     val names = Seq(".bank-probe-reference.fir", ".bank-probe-state.json", ".bank-probe-instrumented.fir",
       ".bank-probe-binding.json", ".bank-probe-descriptors.json", ".bank-probe-context.json", ".bank-probe-emission.json")
     val binding = parse(file(a, names.last))
+    assert((binding \ "preserved_output_sha256") == parse(SemanticStateInventory.canonical(JObject(passiveOutputs.map(output =>
+      output.fileSuffix -> JString(SemanticStateInventory.sha256(output.body))).toList))))
     assert((binding \ "deployable_capture_image") == JBool(false))
     assert((binding \ "emitted_verilog_sha256") == JString(SemanticStateInventory.sha256(sv)))
     names.dropRight(1).foreach { n =>
@@ -226,7 +238,12 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
       midas.checkpoint.SimulatorBankProbe.emissionBinding(lower.copy(annotations =
         Seq(midas.checkpoint.SimulatorBankProbeAnnotation) ++ a.collect {
           case f: GoldenGateOutputFileAnnotation if names.dropRight(1).contains(f.fileSuffix) => f
-        }), sv, a.filterNot(_.isInstanceOf[midas.passes.XDCOutputAnnotation]))
+        }), sv, a.filterNot(_.isInstanceOf[midas.passes.XDCOutputAnnotation]).filter {
+          // compileSimulator appends final inventory/emission receipts after
+          // this boundary. Feed only the sidecars present at the real call.
+          case f: GoldenGateOutputFileAnnotation => names.dropRight(1).contains(f.fileSuffix)
+          case _ => true
+        })
     }
     assert(noXDC.getMessage.contains("constraint files"))
     save("bank-probe.sv", sv)

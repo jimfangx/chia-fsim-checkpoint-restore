@@ -6,7 +6,8 @@ import firrtl.options.{InputAnnotationFileAnnotation, TargetDirAnnotation}
 import firrtl.stage.{AllowUnrecognizedAnnotations, FirrtlFileAnnotation, InfoModeAnnotation, OutputFileAnnotation}
 import chisel3.experimental.EnumAnnotations.EnumDefAnnotation
 import midas.passes.{ChannelClockInfoAnnotation, PreLinkRenamingResultAnnotation, BridgeExtractionResultAnnotation}
-import midas.stage.{ConfigPackageAnnotation, ConfigStringAnnotation, OutputBaseFilenameAnnotation, GoldenGateInputCircuitAnnotation}
+import midas.stage.{ConfigPackageAnnotation, ConfigStringAnnotation, OutputBaseFilenameAnnotation, GoldenGateInputCircuitAnnotation, GoldenGateOutputFileAnnotation}
+import java.nio.charset.StandardCharsets.UTF_8
 import org.json4s._
 
 /** Exact, inert compiler context at the post-FPGA-lowering bank boundary.
@@ -19,6 +20,15 @@ import org.json4s._
   */
 private[checkpoint] object SimulatorBankProbeContext {
   import SemanticStateInventory.{canonical, sha256}
+  // SimulationMapping's fixed driver/partition/address-map files and F1Shim's
+  // platform defines are already materialized, passive output artifacts. They
+  // are preserved verbatim, not reinterpreted as checkpoint driver metadata or
+  // evidence that the specialized banks cover any physical/host owner. Dynamic
+  // IP scripts and arbitrary output payloads require separate contracts.
+  private val outputSuffixes = Set(".const.h", ".const.vh", ".partition.const.h",
+    ".peer2peer.const.yaml", ".defines.vh")
+  def isPassiveOutput(a: GoldenGateOutputFileAnnotation): Boolean = outputSuffixes(a.fileSuffix)
+
   private def row(a: Annotation): Option[(String, JValue)] = {
     def text(kind: String, value: String) = Some(kind -> JString(value))
     def deletedInput(producer: String, nestedClass: String, file: String) = {
@@ -27,6 +37,15 @@ private[checkpoint] object SimulatorBankProbeContext {
         "annotation_class" -> JString(nestedClass), "file" -> JString(file))))
     }
     a match {
+      case a: GoldenGateOutputFileAnnotation if isPassiveOutput(a) =>
+        // The generic file emitter uses the JVM's default charset. Require its
+        // actual bytes to equal the UTF-8 bytes that this context hashes.
+        require(a.body != null && !a.body.contains('\u0000') && UTF_8.newEncoder().canEncode(a.body) &&
+          a.getBytes.sameElements(a.body.getBytes(UTF_8)),
+          "Simulator bank context: invalid passive output body")
+        Some("golden_gate_output_file" -> JObject(List(
+          "file_suffix" -> JString(a.fileSuffix), "body_sha256" -> JString(sha256(a.body)),
+          "body_bytes" -> JInt(a.body.getBytes(UTF_8).length))))
       case InfoModeAnnotation(value) => text("info_mode", value)
       case OutputFileAnnotation(value) => text("firrtl_output_file", value)
       case TargetDirAnnotation(value) => text("target_directory", value)
@@ -115,8 +134,11 @@ private[checkpoint] object SimulatorBankProbeContext {
   def snapshot(annotations: Seq[Annotation], reference: String, instrumented: String): String = {
     val rows = annotations.map(a => row(a).getOrElse(throw new IllegalArgumentException(
       s"Simulator bank context unsupported: ${a.getClass.getName}")))
-    val singleton = rows.filterNot(r => Set("enum_type", "deleted_input", "pre_link_renaming", "bridge_extraction")(r._1)).groupBy(_._1)
+    val singleton = rows.filterNot(r => Set("enum_type", "deleted_input", "pre_link_renaming", "bridge_extraction",
+      "golden_gate_output_file")(r._1)).groupBy(_._1)
     require(!singleton.exists(_._2.size != 1), "Simulator bank context: duplicate compiler option")
+    val outputs = rows.collect { case ("golden_gate_output_file", value) => value \ "file_suffix" }
+    require(outputs.distinct.size == outputs.size, "Simulator bank context: duplicate passive output suffix")
     val deleted = rows.filter(_._1 == "deleted_input")
     require(deleted.distinct.size == deleted.size, "Simulator bank context: duplicate deleted input event")
     val prelinks = rows.filter(_._1 == "pre_link_renaming")

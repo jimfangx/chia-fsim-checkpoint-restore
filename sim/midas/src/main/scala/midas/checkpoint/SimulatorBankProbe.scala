@@ -82,11 +82,27 @@ object SimulatorBankProbe {
   def emissionBinding(state: CircuitState, verilog: String,
                       emittedAnnotations: firrtl.AnnotationSeq): Seq[GoldenGateOutputFileAnnotation] = {
     if (!state.annotations.contains(SimulatorBankProbeAnnotation)) return Nil
-    val files = state.annotations.collect { case a: GoldenGateOutputFileAnnotation => a.fileSuffix -> a.body }.toMap
     val names = Seq(".bank-probe-reference.fir", ".bank-probe-state.json", ".bank-probe-instrumented.fir",
       ".bank-probe-binding.json", ".bank-probe-descriptors.json", ".bank-probe-context.json")
+    // Never let toMap silently choose among duplicate file emissions, including
+    // otherwise identical bytes. Validate both actual annotation collections.
+    def outputs(annotations: firrtl.AnnotationSeq): Seq[GoldenGateOutputFileAnnotation] = {
+      val values = annotations.collect { case a: GoldenGateOutputFileAnnotation => a }
+      if (values.map(_.fileSuffix).distinct.size != values.size) fail("duplicate output artifact suffix")
+      values.foreach { a =>
+        if (!names.contains(a.fileSuffix) && !SimulatorBankProbeContext.isPassiveOutput(a) &&
+            !SimulatorFPGASynthesisConstants.isProvenanceFile(a))
+          fail(s"output artifact requires an explicit contract: ${a.fileSuffix}")
+      }
+      values
+    }
+    val stateOutputs = outputs(state.annotations)
+    val emittedOutputs = outputs(emittedAnnotations)
+    val files = stateOutputs.map(a => a.fileSuffix -> a.body).toMap
     val hashes = names.map { n =>
       val body = files.getOrElse(n, fail(s"missing generated artifact $n"))
+      if (!emittedOutputs.contains(GoldenGateOutputFileAnnotation(body, n)))
+        fail(s"generated artifact changed or missing at final emission: $n")
       n -> JString(sha256(body))
     }
     val xdc = emittedAnnotations.collect { case midas.passes.XDCOutputAnnotation(body, Some(suffix)) =>
@@ -122,6 +138,8 @@ object SimulatorBankProbe {
       "external_runtime_required" -> JBool(true), "deployable_capture_image" -> JBool(false),
       "emitted_verilog_sha256" -> JString(sha256(verilog)),
       "emitted_xdc_sha256" -> JObject(xdc.toList),
+      "preserved_output_sha256" -> JObject(stateOutputs.filter(SimulatorBankProbeContext.isPassiveOutput)
+        .map(a => a.fileSuffix -> JString(sha256(a.body))).toList),
       "inputs" -> JObject(hashes.toList))))
     Seq(GoldenGateOutputFileAnnotation(binding, ".bank-probe-emission.json"))
   }

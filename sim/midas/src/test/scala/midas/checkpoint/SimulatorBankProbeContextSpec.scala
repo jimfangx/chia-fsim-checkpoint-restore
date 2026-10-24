@@ -33,6 +33,112 @@ class SimulatorBankProbeContextSpec extends AnyFlatSpec {
 
   behavior.of("Explicit post-lowering compiler context")
 
+  private val passiveOutputs = Seq(
+    GoldenGateOutputFileAnnotation("// driver metadata\n#define BASE 64\n", ".const.h"),
+    GoldenGateOutputFileAnnotation("// widths: λ\n`define WIDTH 8\n", ".const.vh"),
+    GoldenGateOutputFileAnnotation("// partition metadata\n", ".partition.const.h"),
+    GoldenGateOutputFileAnnotation("", ".peer2peer.const.yaml"),
+    GoldenGateOutputFileAnnotation("`define USE_DDR_CHANNEL_A 0\n", ".defines.vh"))
+  private def emittedXDC = midas.targetutils.xdc.XDCFiles.allFiles.map(f =>
+    midas.passes.XDCOutputAnnotation("", Some(f.fileSuffix)))
+
+  it should "preserve exact passive output bytes without reinterpreting driver metadata or changing storage" in {
+    val result = probe(passiveOutputs)
+    passiveOutputs.foreach(a => assert(result.annotations.contains(a)))
+    assert(result.circuit == probe(Nil).circuit)
+    val rows = (context(passiveOutputs) \ "annotations").asInstanceOf[JArray].arr
+    assert(rows.size == passiveOutputs.size)
+    passiveOutputs.foreach { output =>
+      val row = rows.find(r => (r \ "value" \ "file_suffix") == JString(output.fileSuffix)).get
+      assert((row \ "kind") == JString("golden_gate_output_file"))
+      assert((row \ "value" \ "body_sha256") == JString(SemanticStateInventory.sha256(output.body)))
+      assert((row \ "value" \ "body_bytes") == JInt(output.body.getBytes(java.nio.charset.StandardCharsets.UTF_8).length))
+    }
+    assert(context(passiveOutputs) == context(passiveOutputs.reverse))
+    val binding = parse(SimulatorBankProbe.emissionBinding(result, "fixture RTL", result.annotations ++ emittedXDC).head.body)
+    passiveOutputs.foreach { output =>
+      assert((binding \ "preserved_output_sha256" \ output.fileSuffix) ==
+        JString(SemanticStateInventory.sha256(output.body)))
+    }
+    assert((binding \ "preserved_output_sha256").asInstanceOf[JObject].obj.size == passiveOutputs.size)
+  }
+
+  it should "reject malformed passive bodies and uncontracted output suffixes without wildcard admission" in {
+    Seq(null, "bad" + 0.toChar, "bad" + 0xd800.toChar).foreach { body =>
+      assert(intercept[IllegalArgumentException](probe(Seq(GoldenGateOutputFileAnnotation(body, ".const.h"))))
+        .getMessage.contains("invalid passive output body"))
+    }
+    Seq(null, "", ".hidden.json", ".const.h/../../escape", ".CONST.H", ".const.h\u0000",
+      ".ila_firesim.ipgen.tcl", ".firesim_mmcm.ipgen.tcl", ".env.tcl").foreach { suffix =>
+      val output = GoldenGateOutputFileAnnotation("opaque payload", suffix)
+      assert(!SimulatorBankProbeContext.accepts(output))
+      assert(intercept[IllegalArgumentException](probe(Seq(output))).getMessage.contains("GoldenGateOutputFileAnnotation"))
+    }
+  }
+
+  it should "reject duplicate passive suffixes even when their bodies agree" in {
+    val output = passiveOutputs.head
+    Seq(output, output.copy(body = "changed")).foreach { duplicate =>
+      assert(intercept[IllegalArgumentException](probe(Seq(output, duplicate))).getMessage
+        .contains("duplicate passive output suffix"))
+    }
+  }
+
+  it should "reject dropped changed or additional passive outputs at both emission boundaries" in {
+    val original = probe(passiveOutputs.take(2))
+    val output = passiveOutputs.head
+    val changes = Seq(original.annotations.filterNot(_ == output),
+      original.annotations.map { case `output` => output.copy(body = output.body + " "); case a => a },
+      original.annotations :+ passiveOutputs.last)
+    changes.foreach { annotations =>
+      Seq((original.copy(annotations = annotations), original.annotations ++ emittedXDC),
+          (original, annotations ++ emittedXDC),
+          (original.copy(annotations = annotations), annotations ++ emittedXDC)).foreach { case (state, emitted) =>
+        assert(intercept[IllegalArgumentException] {
+          SimulatorBankProbe.emissionBinding(state, "fixture RTL", emitted)
+        }.getMessage.contains("compiler context changed"))
+      }
+    }
+  }
+
+  it should "reject duplicate passive and generated output suffixes at both emission boundaries" in {
+    val original = probe(passiveOutputs)
+    val generated = original.annotations.collectFirst {
+      case a: GoldenGateOutputFileAnnotation if a.fileSuffix == ".bank-probe-context.json" => a
+    }.get
+    Seq(passiveOutputs.head, passiveOutputs.head.copy(body = "changed"), generated,
+      generated.copy(body = "changed")).foreach { duplicate =>
+      Seq((original.copy(annotations = original.annotations :+ duplicate), original.annotations ++ emittedXDC),
+          (original, original.annotations ++ emittedXDC :+ duplicate)).foreach { case (state, emitted) =>
+        assert(intercept[IllegalArgumentException] {
+          SimulatorBankProbe.emissionBinding(state, "fixture RTL", emitted)
+        }.getMessage.contains("duplicate output artifact suffix"))
+      }
+    }
+  }
+
+  it should "reject unknown output injections and missing or changed generated files at final emission" in {
+    val original = probe(passiveOutputs)
+    val unknown = GoldenGateOutputFileAnnotation("stale hierarchy", ".hidden.json")
+    Seq((original.copy(annotations = original.annotations :+ unknown), original.annotations ++ emittedXDC),
+        (original, original.annotations ++ emittedXDC :+ unknown)).foreach { case (state, emitted) =>
+      assert(intercept[IllegalArgumentException] {
+        SimulatorBankProbe.emissionBinding(state, "fixture RTL", emitted)
+      }.getMessage.contains("explicit contract"))
+    }
+    original.annotations.collect { case a: GoldenGateOutputFileAnnotation if a.fileSuffix.startsWith(".bank-probe-") => a }
+      .foreach { output =>
+        Seq(original.annotations.filterNot(_ == output), original.annotations.map {
+          case `output` => output.copy(body = output.body + " ")
+          case a => a
+        }).foreach { annotations =>
+          assert(intercept[IllegalArgumentException] {
+            SimulatorBankProbe.emissionBinding(original, "fixture RTL", annotations ++ emittedXDC)
+          }.getMessage.contains("generated artifact changed or missing"))
+        }
+      }
+  }
+
   it should "preserve every literal value and bind both actual circuit representations" in {
     val annotations = Seq(InfoModeAnnotation("ignore"), ConfigStringAnnotation("A_B"),
       EnumDefAnnotation("Mode", Map("wide" -> (BigInt(1) << 120), "zero" -> BigInt(0))))
