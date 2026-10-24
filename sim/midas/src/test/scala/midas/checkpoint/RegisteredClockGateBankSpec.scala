@@ -109,6 +109,61 @@ class RegisteredClockGateBankSpec extends AnyFlatSpec {
       }
     }
   }
+  it should "ignore an unused gate definition without admitting it when instantiated" in {
+    val state = new Compiler(Forms.LowForm).execute(CircuitState(Parser.parse("""circuit GateStorage :
+  module GateStorage :
+    input clock : Clock
+    input data : UInt<8>
+    output out : UInt<8>
+    reg saved : UInt<8>, clock
+    saved <= data
+    out <= saved
+"""), ChirrtlForm)).copy(form = LowForm)
+    val unused = midas.passes.DefineAbstractClockGate.blackbox.copy(name = "UnusedPhysicalReplacement")
+    val withUnused = state.copy(circuit = state.circuit.copy(modules = state.circuit.modules :+ unused))
+    val manifest = SimulatorStateInventory.discover(withUnused)
+    val result = GeneratedStateBankAccess.generate(withUnused, manifest, separateAccessClock = true)
+    midas.widgets.CheckpointCaptureDescriptors.fromGenerated(result, manifest)
+    assert(!result.state.circuit.modules.exists(_.name == unused.name))
+    assert(result.entries == GeneratedStateBankAccess.generate(state,
+      SimulatorStateInventory.discover(state), separateAccessClock = true).entries)
+    val audit = parse(GeneratedExternalOwners.audit(withUnused, withUnused.circuit.main))
+    assert((audit \ "unused_external_definitions").asInstanceOf[JArray].arr.exists(row =>
+      (row \ "module") == JString(unused.name)))
+    val root = withUnused.circuit.modules.collectFirst { case m: Module if m.name == withUnused.circuit.main => m }.get
+    val live = withUnused.copy(circuit = withUnused.circuit.copy(modules = withUnused.circuit.modules.map {
+      case m if m.name == root.name => root.copy(body = Block(Seq(root.body, firrtl.WDefInstance("gate", unused.name))))
+      case m => m
+    }))
+    assert(intercept[IllegalArgumentException] {
+      GeneratedClockGateAdapter.prepare(live)
+    }.getMessage.contains("no exact registered-enable clock-gate adapter for " + unused.name))
+    // Even an unused annotation is a contract; unknown inline source cannot be
+    // silently dropped by reachability filtering.
+    val annotated = withUnused.copy(annotations = withUnused.annotations :+
+      BlackBoxInlineAnno(ModuleName(unused.name, CircuitName(withUnused.circuit.main)), "unknown.v", "unknown"))
+    assert(intercept[IllegalArgumentException] {
+      GeneratedStateBankAccess.generate(annotated, manifest, separateAccessClock = true)
+    }.getMessage.contains("BlackBoxInlineAnno"))
+  }
+  it should "resolve a reachable concrete gate alongside an unused gate with the same defname" in {
+    val original = lower(source)
+    val unused = midas.passes.DefineAbstractClockGate.blackbox.copy(name = "UnusedPhysicalReplacement")
+    val state = original.copy(circuit = original.circuit.copy(modules = original.circuit.modules :+ unused))
+    val manifest = SimulatorStateInventory.discover(state)
+    val result = GeneratedStateBankAccess.generate(state, manifest, separateAccessClock = true)
+    midas.widgets.CheckpointCaptureDescriptors.fromGenerated(result, manifest)
+    assert(result.entries.size == 4 && result.entries.map(_.depth).sum == 7)
+    assert((parse(result.binding) \ "reference_sha256") == JString(SemanticStateInventory.sha256(state.circuit.serialize)))
+    assert(!result.state.circuit.modules.exists(_.name == unused.name))
+    // A targeted preservation request on dead state must still reject instead
+    // of disappearing at the resolver's now-reachable-only boundary.
+    val annotated = state.copy(annotations = state.annotations :+ firrtl.transforms.DontTouchAnnotation(
+      firrtl.annotations.ReferenceTarget(state.circuit.main, unused.name, Nil, "CE", Nil)))
+    assert(intercept[IllegalArgumentException] {
+      GeneratedStateBankAccess.generate(annotated, manifest, separateAccessClock = true)
+    }.getMessage.contains("annotation target is unreachable"))
+  }
   it should "reject removed or forged gate provenance and altered emitted gate behavior" in {
     val state = lower(source)
     val manifest = SimulatorStateInventory.discover(state)

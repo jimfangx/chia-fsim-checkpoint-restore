@@ -195,6 +195,7 @@ object SimulatorStateInventory {
       state.copy(annotations = state.annotations ++ Seq(
         GoldenGateOutputFileAnnotation(manifest, ".simulator-state.json"),
         GoldenGateOutputFileAnnotation(state.circuit.serialize, ".simulator-reference.fir"),
+        GoldenGateOutputFileAnnotation(GeneratedExternalOwners.audit(state, requested.head), ".simulator-external-owners.json"),
       ))
     }
   }

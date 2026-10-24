@@ -28,8 +28,9 @@ private[checkpoint] object GeneratedClockGateAdapter {
 
   def prepare(input: CircuitState): (CircuitState, Set[String]) = {
     val inline = input.annotations.collect { case a: BlackBoxInlineAnno => a }
+    val reachable = GeneratedExternalOwners.instances(input, input.circuit.main).map(_._2.name).toSet
     val accepted = input.circuit.modules.collect { case m: ExtModule if
-      m.defname == DefineAbstractClockGate.blackbox.defname =>
+      reachable(m.name) && m.defname == DefineAbstractClockGate.blackbox.defname =>
       val sources = inline.filter(_.target.name == m.name)
       if (m.params.nonEmpty || m.ports.map(p => (p.name, p.direction, p.tpe)) !=
           DefineAbstractClockGate.blackbox.ports.map(p => (p.name, p.direction, p.tpe)) ||

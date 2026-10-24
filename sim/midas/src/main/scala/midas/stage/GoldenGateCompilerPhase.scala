@@ -137,6 +137,9 @@ class GoldenGateCompilerPhase extends Phase {
       val manifest = files.collectFirst {
         case GoldenGateOutputFileAnnotation(body, ".simulator-state.json") => body
       }.get
+      val externalOwners = files.collectFirst {
+        case GoldenGateOutputFileAnnotation(body, ".simulator-external-owners.json") => body
+      }.get
       import org.json4s._
       import midas.checkpoint.SemanticStateInventory.{canonical, sha256}
       val binding = canonical(JObject(List(
@@ -146,6 +149,7 @@ class GoldenGateCompilerPhase extends Phase {
         "fpga_backend_circuit_sha256" -> JString(sha256(postLoweredSimulator.circuit.serialize)),
         "emission_reference_sha256" -> JString(sha256(emissionIR.circuit.serialize)),
         "simulator_manifest_sha256" -> JString(sha256(manifest)),
+        "external_owners_sha256" -> JString(sha256(externalOwners)),
         "emitted_verilog_sha256" -> JString(sha256(emitted.getEmittedCircuit.value)))))
       emitted.annotations ++ files ++ semanticMapFiles ++ bankProbeFiles :+
         GoldenGateOutputFileAnnotation(binding, ".simulator-emission.json")

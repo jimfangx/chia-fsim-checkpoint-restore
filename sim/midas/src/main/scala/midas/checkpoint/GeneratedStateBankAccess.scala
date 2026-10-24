@@ -420,8 +420,16 @@ object GeneratedStateBankAccess {
     }
     findGates(root, root, Set.empty)
     // Resolve the materialized gates before inspecting typed clocks.
+    // Specialization already emits only reachable modules. Apply that same
+    // boundary to the intermediate resolver *after* annotation preflight and
+    // complete inventory validation. Otherwise an unused opaque gate's
+    // defname may collide with its reachable, now concrete implementation.
+    // The original input, inventory and reference hash retain every definition;
+    // targeted annotations still need their explicit translation contract.
+    val resolutionModules = GeneratedExternalOwners.instances(prepared, root).map(_._2.name).toSet
+    val resolutionCircuit = prepared.circuit.copy(modules = prepared.circuit.modules.filter(m => resolutionModules(m.name)))
     val resolvedPrepared = if (gateModules.isEmpty) prepared else new Compiler(Forms.LowForm).execute(
-      CircuitState(Parser.parse(prepared.circuit.serialize), firrtl.ChirrtlForm,
+      CircuitState(Parser.parse(resolutionCircuit.serialize), firrtl.ChirrtlForm,
         (prepared.annotations :+ firrtl.transforms.NoCircuitDedupAnnotation).distinct)).copy(form = LowForm)
     val concreteModules = resolvedPrepared.circuit.modules.map(m => m.name -> m).toMap
     val clockProvenance = new ClockProvenance(resolvedPrepared.circuit, false, gatePaths.toSet)

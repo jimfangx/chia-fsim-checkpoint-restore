@@ -30,6 +30,19 @@ private[checkpoint] object GeneratedStateBankAnnotations {
       unsupported.map(_.getClass.getName).distinct.mkString(", "))
     if (state.annotations.contains(MemorySynthInit) && state.annotations.contains(MemoryNoSynthInit))
       fail("conflicting memory synthesis initialization policies")
+    // The resolver may omit unreachable definitions before specialization.
+    // A preservation/initialization contract on one must fail here, rather
+    // than be deleted by a compiler rename or an invalid-target cleanup pass.
+    val reachable = GeneratedExternalOwners.instances(state, state.circuit.main).map(_._2.name).toSet
+    state.annotations.foreach {
+      case a: DontTouchAnnotation if !reachable(a.target.module) =>
+        fail(s"annotation target is unreachable: ${a.target.serialize}")
+      case a: MemoryFileInlineAnnotation if !reachable(a.target.module) =>
+        fail(s"annotation target is unreachable: ${a.target.serialize}")
+      case a: SynthesisPlusArgConstantAnnotation if !reachable(a.target.module) =>
+        fail(s"annotation target is unreachable: ${a.target.serialize}")
+      case _ => ()
+    }
   }
   def annotationJSON(annotations: Seq[Annotation]): String = JsonProtocol.serialize(annotations.filter {
     case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: SynthesisPlusArgConstantAnnotation => true

@@ -174,15 +174,19 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
     assert((parse(manifest) \ "reference_sha256") == JString(SemanticStateInventory.sha256(reference)))
     assert((parse(manifest) \ "external_runtime_required") == JBool(true))
     val binding = file(a, ".simulator-emission.json")
+    val owners = file(a, ".simulator-external-owners.json")
+    assert((parse(owners) \ "reachable_external_instances") == JArray(Nil))
+    assert((parse(owners) \ "reference_sha256") == JString(SemanticStateInventory.sha256(reference)))
     val identity = parse(binding)
     for ((key, text) <- Seq("emission_reference_sha256" -> reference,
-      "simulator_manifest_sha256" -> manifest, "emitted_verilog_sha256" -> sv)) {
+      "simulator_manifest_sha256" -> manifest, "external_owners_sha256" -> owners, "emitted_verilog_sha256" -> sv)) {
       assert((identity \ key) == JString(SemanticStateInventory.sha256(text)))
     }
     assert((identity \ "host_pipeline_version") == JInt(2))
     save("host-pipeline.sv", sv); save("host-pipeline.fir", reference)
     save("host-pipeline-manifest.json", manifest)
     save("host-pipeline-emission.json", binding)
+    save("host-pipeline-external-owners.json", owners)
     save("original-input.fir", lower.circuit.serialize)
     val oldPath = new Compiler(Seq(Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm).execute(
       lower.copy(annotations = Seq(firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter]))))

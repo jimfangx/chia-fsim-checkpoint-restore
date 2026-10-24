@@ -41,7 +41,7 @@ endif
 semantic_outputs += $(GENERATED_DIR)/$(BASE_FILE_NAME).semantic-fame-map.json
 semantic_outputs += $(GENERATED_DIR)/$(BASE_FILE_NAME).semantic-fame-emitted.sv
 endif
-simulator_inventory_outputs := $(if $(SIMULATOR_CHECKPOINT_INVENTORY),$(addprefix $(GENERATED_DIR)/$(BASE_FILE_NAME),.simulator-state.json .simulator-reference.fir .simulator-emission.json),)
+simulator_inventory_outputs := $(if $(SIMULATOR_CHECKPOINT_INVENTORY),$(addprefix $(GENERATED_DIR)/$(BASE_FILE_NAME),.simulator-state.json .simulator-reference.fir .simulator-external-owners.json .simulator-emission.json),)
 
 # Pre-simulation-mapping annotations which includes all Bridge Annotations
 # extracted used to generate new runtime configurations.
