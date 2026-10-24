@@ -10,7 +10,7 @@ import org.json4s._
 import midas.InternalXDCAnnotation
 import midas.core.TargetBoxAnnotation
 import midas.targetutils.FirrtlMemModelAnnotation
-import midas.targetutils.xdc.XDCAnnotation
+import midas.targetutils.xdc.{RAMStyleHint, RAMStyles, XDCAnnotation, XDCDestinationFile, XDCFiles}
 
 /** Explicit annotation contracts for instance-specialized storage. Never copy
   * an annotation with an old module target or silently drop an unknown owner.
@@ -75,12 +75,19 @@ private[checkpoint] object GeneratedStateBankAnnotations {
 
   /** XDC arguments are correlated under one explicit root. Never expand them
     * independently: a Cartesian product would constrain unrelated instances.
-    * Only exact ground declarations, concrete instance ports and the exact
+    * Only exact ground declarations, concrete instance ports, RAMStyleHint
+    * logical memories, and the exact
     * platform BUFGCE's public pins survive this contract. A physical constraint
     * is not permission to inventory or capture a vendor-owned latch.
     */
-  private def validateXDC(state: CircuitState, format: String, args: Seq[ReferenceTarget]): Unit = {
+  private def validateXDC(state: CircuitState, destination: XDCDestinationFile,
+                          format: String, args: Seq[ReferenceTarget]): Unit = {
     if ("\\{}".r.findAllIn(format).size != args.size) fail("XDC argument/specifier count mismatch")
+    val ramStyles = Seq(RAMStyles.ULTRA, RAMStyles.BLOCK, RAMStyles.REGISTERS,
+      RAMStyles.DISTRIBUTED, RAMStyles.MIXED).map(RAMStyleHint.propertyTemplate).toSet
+    val ramHint = ramStyles(format)
+    if (ramHint && (destination != XDCFiles.Synthesis || args.size != 1))
+      fail("RAM-style XDC requires one logical memory and the synthesis destination")
     if (args.isEmpty) return
     if (args.map(_.module).distinct.size != 1) fail("XDC arguments require a common explicit root")
     val modules = state.circuit.modules.map(m => m.name -> m).toMap
@@ -110,7 +117,14 @@ private[checkpoint] object GeneratedStateBankAnnotations {
         owner = ownerModule(child.value)
       }
       val declaration = declared(owner).find(_.name == a.ref)
-      val valid = a.component match {
+      // The native RAM hint selects Vivado memory cells by a regexp suffix.
+      // Do not generalize this to arbitrary snippets, memory ports, words or
+      // registers. Reject regex metacharacters in every interpolated segment.
+      val valid = if (ramHint) {
+        val names = a.path.map(_._1.value) :+ a.ref
+        a.component.isEmpty && names.forall(_.matches("[A-Za-z_][A-Za-z0-9_]*")) &&
+          declaration.exists(_.isInstanceOf[DefMemory])
+      } else a.component match {
         case Nil => owner.ports.exists(p => p.name == a.ref && ground(p.tpe)) || declaration.exists {
           case d: DefRegister => ground(d.tpe)
           case d: DefWire => ground(d.tpe)
@@ -196,8 +210,8 @@ private[checkpoint] object GeneratedStateBankAnnotations {
       }
       case a: DontTouchAnnotation if !reachable(a.target.module) =>
         fail(s"annotation target is unreachable: ${a.target.serialize}")
-      case a: InternalXDCAnnotation => validateXDC(state, a.formatString, a.argumentList)
-      case a: XDCAnnotation => validateXDC(state, a.formatString, a.argumentList)
+      case a: InternalXDCAnnotation => validateXDC(state, a.destinationFile, a.formatString, a.argumentList)
+      case a: XDCAnnotation => validateXDC(state, a.destinationFile, a.formatString, a.argumentList)
       case a: FirrtlMemModelAnnotation if !reachable(a.target.module) =>
         fail(s"annotation target is unreachable: ${a.target.serialize}")
       case a: MemoryFileInlineAnnotation if !reachable(a.target.module) =>

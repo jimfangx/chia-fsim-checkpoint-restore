@@ -88,7 +88,14 @@ private[midas] object WriteXDCFile extends Transform with DependencyAPIMigration
 
     val iGraph                = InstanceKeyGraph(state.circuit)
     val xdcAnnosGroupedByFile = state.annotations
-      .collect { case a: InternalXDCAnnotation => a }
+      // Host widgets elaborate after MidasTransforms' external-to-internal
+      // conversion. Their public constraints must reach the same final
+      // consumer; keeping their identity until here avoids silently dropping
+      // late RAMStyleHint annotations from the synthesis file.
+      .collect {
+        case a: InternalXDCAnnotation => a
+        case a: XDCAnnotation         => InternalXDCAnnotation(a)
+      }
       .groupBy { _.destinationFile }
       .toMap
 
@@ -102,6 +109,7 @@ private[midas] object WriteXDCFile extends Transform with DependencyAPIMigration
 
     val cleanedAnnotations = state.annotations.filterNot {
       case _: InternalXDCAnnotation      => true
+      case _: XDCAnnotation              => true
       case _: XDCPathToCircuitAnnotation => true
       case _                             => false
     }

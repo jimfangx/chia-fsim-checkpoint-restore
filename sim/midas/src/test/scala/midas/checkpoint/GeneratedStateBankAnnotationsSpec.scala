@@ -12,7 +12,7 @@ import org.scalatest.flatspec.AnyFlatSpec
 import midas.InternalXDCAnnotation
 import midas.passes.{WriteXDCFile, XDCOutputAnnotation}
 import midas.targetutils.FirrtlMemModelAnnotation
-import midas.targetutils.xdc.{XDCAnnotation, XDCFiles, XDCPathToCircuitAnnotation}
+import midas.targetutils.xdc.{RAMStyleHint, RAMStyles, XDCAnnotation, XDCFiles, XDCPathToCircuitAnnotation}
 
 class GeneratedStateBankAnnotationsSpec extends AnyFlatSpec {
   private val source = """circuit Top :
@@ -393,6 +393,86 @@ class GeneratedStateBankAnnotationsSpec extends AnyFlatSpec {
       label.copy(target = label.target.field("r"))).foreach { a =>
       intercept[IllegalArgumentException] { generateMemory(a) }
     }
+  }
+
+  private def ramState: CircuitState = new Compiler(Forms.LowForm).execute(CircuitState(Parser.parse(
+    source.replace("reg stored : UInt<8>, clock", """mem ram :
+      data-type => UInt<8>
+      depth => 4
+      read-latency => 0
+      write-latency => 1
+      reader => r
+    ram.r.addr <= UInt<2>(0)
+    ram.r.en <= UInt<1>(1)
+    ram.r.clk <= clock
+    reg stored : UInt<8>, clock""").replace("stored <= data", "stored <= add(data, ram.r.data)")),
+    ChirrtlForm)).copy(form = LowForm)
+
+  it should "preserve exact native RAM-style hints and identity through specialization and downstream XDC emission" in {
+    val s = ramState
+    val inventory = SemanticStateInventory.discover(s, "Top")
+    val rt = ModuleTarget("Top", "Parent").instOf("child", "Leaf").ref("ram")
+    for (style <- Seq(RAMStyles.ULTRA, RAMStyles.BLOCK, RAMStyles.REGISTERS, RAMStyles.DISTRIBUTED, RAMStyles.MIXED);
+         external <- Seq(false, true)) {
+      val format = RAMStyleHint.propertyTemplate(style)
+      val input: Annotation = if (external) XDCAnnotation(XDCFiles.Synthesis, format, rt)
+        else InternalXDCAnnotation(XDCFiles.Synthesis, format, rt)
+      val result = GeneratedStateBankAccess.generate(s.copy(annotations = Seq(input)), inventory)
+      val copies = result.state.annotations.filter {
+        case _: XDCAnnotation | _: InternalXDCAnnotation => true
+        case _ => false
+      }
+      assert(copies.size == 2 && copies.forall(_.getClass == input.getClass))
+      def emitted(st: CircuitState): Map[String, String] = {
+        val output = WriteXDCFile.execute(st.copy(annotations = st.annotations :+ XDCPathToCircuitAnnotation(None, None)))
+        assert(!output.annotations.exists {
+          case _: XDCAnnotation | _: InternalXDCAnnotation => true
+          case _ => false
+        })
+        output.annotations.collect { case a: XDCOutputAnnotation => a.suffix.get -> a.fileBody }.toMap
+      }
+      assert(emitted(s.copy(annotations = Seq(input))) == emitted(result.state))
+      val lines = emitted(result.state)(".synthesis.xdc").split("\n").filter(s => s.nonEmpty && !s.startsWith("#")).toSet
+      assert(lines == Set("left", "right").map(side =>
+        s"set_property RAM_STYLE $style [get_cells -hierarchical -regexp .*$side/child/ram_reg.*]"))
+      CheckpointCaptureDescriptors.fromGenerated(result, inventory)
+      copies.foreach { a => intercept[IllegalArgumentException] {
+        CheckpointCaptureDescriptors.fromGenerated(result.copy(state = result.state.copy(
+          annotations = result.state.annotations.filterNot(_ == a))), inventory)
+      } }
+    }
+  }
+
+  it should "reject arbitrary RAM snippets wrong destinations nonmemories ports indices and regex metacharacters" in {
+    val s = ramState
+    val rt = ModuleTarget("Top", "Parent").instOf("child", "Leaf").ref("ram")
+    val format = RAMStyleHint.propertyTemplate(RAMStyles.DISTRIBUTED)
+    val invalid = Seq(
+      XDCAnnotation(XDCFiles.Implementation, format, rt),
+      XDCAnnotation(XDCFiles.Synthesis, format.replace("DISTRIBUTED", "UNKNOWN"), rt),
+      XDCAnnotation(XDCFiles.Synthesis, format + "; puts injected", rt),
+      XDCAnnotation(XDCFiles.Synthesis, "set_property KEEP true [get_cells {}]", rt),
+      XDCAnnotation(XDCFiles.Synthesis, format, rt.copy(ref = "stored")),
+      XDCAnnotation(XDCFiles.Synthesis, format, rt.copy(ref = "clock")),
+      XDCAnnotation(XDCFiles.Synthesis, format, rt.field("r")),
+      XDCAnnotation(XDCFiles.Synthesis, format, rt.index(0)),
+      XDCAnnotation(XDCFiles.Synthesis, format, rt.copy(circuit = "Other")),
+      XDCAnnotation(XDCFiles.Synthesis, format, rt.copy(ref = "missing")))
+    invalid.foreach(a => intercept[IllegalArgumentException] {
+      GeneratedStateBankAnnotations.preflight(s.copy(annotations = Seq(a)))
+    })
+    // A valid declaration with a regexp-active name must also reject.
+    val unsafe = s.copy(circuit = s.circuit.copy(modules = s.circuit.modules.map {
+      case m: firrtl.ir.Module if m.name == "Leaf" =>
+        def rename(st: firrtl.ir.Statement): firrtl.ir.Statement = st match {
+          case mem: firrtl.ir.DefMemory => mem.copy(name = "ram$")
+          case other => other.mapStmt(rename)
+        }
+        m.copy(body = rename(m.body))
+      case m => m
+    }))
+    intercept[IllegalArgumentException] { GeneratedStateBankAnnotations.preflight(unsafe.copy(
+      annotations = Seq(XDCAnnotation(XDCFiles.Synthesis, format, rt.copy(ref = "ram$"))))) }
   }
 
   it should "reject foreign, unreachable, opaque and non-instance hierarchy contracts before compilation" in {

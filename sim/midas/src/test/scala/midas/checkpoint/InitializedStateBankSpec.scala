@@ -9,6 +9,9 @@ import firrtl.stage.Forms
 import firrtl.stage.transforms.Compiler
 import firrtl.transforms.DontTouchAnnotation
 import midas.widgets.CheckpointCaptureDescriptors
+import midas.InternalXDCAnnotation
+import midas.passes.{WriteXDCFile, XDCOutputAnnotation}
+import midas.targetutils.xdc.{RAMStyleHint, RAMStyles, XDCAnnotation, XDCFiles, XDCPathToCircuitAnnotation}
 import org.scalatest.flatspec.AnyFlatSpec
 
 class InitializedStateBankSpec extends AnyFlatSpec {
@@ -106,7 +109,9 @@ class InitializedStateBankSpec extends AnyFlatSpec {
   it should "preserve separately targeted hex and binary initialization through emission" in {
     val annotations = Seq(MemorySynthInit, MemoryFileInlineAnnotation(child("a"), "left.hex"),
       MemoryFileInlineAnnotation(child("b"), "right.bin", MemoryLoadFileType.Binary),
-      DontTouchAnnotation(child("a")), DontTouchAnnotation(child("b")))
+      DontTouchAnnotation(child("a")), DontTouchAnnotation(child("b")),
+      XDCAnnotation(XDCFiles.Synthesis, RAMStyleHint.propertyTemplate(RAMStyles.DISTRIBUTED), child("a")),
+      InternalXDCAnnotation(XDCFiles.Synthesis, RAMStyleHint.propertyTemplate(RAMStyles.DISTRIBUTED), child("b")))
     val result = generate(annotations)
     val manifest = SemanticStateInventory.discover(state, root)
     val simulator = SimulatorStateInventory.discover(state)
@@ -132,6 +137,8 @@ class InitializedStateBankSpec extends AnyFlatSpec {
     save("generated-bank-simulator.fir", simResult.state.circuit.serialize)
     save("source-annotations.json", GeneratedStateBankAnnotations.annotationJSON(annotations))
     save("translated-annotations.json", GeneratedStateBankAnnotations.annotationJSON(result.state.annotations))
+    val xdc = WriteXDCFile.execute(result.state.copy(annotations = result.state.annotations :+ XDCPathToCircuitAnnotation(None, None)))
+    xdc.annotations.collect { case a: XDCOutputAnnotation => a }.foreach(a => save("ram-style" + a.suffix.get, a.fileBody))
     save("left.hex", (0 until 8).map(i => f"${17 + i * 29}%03x").mkString("\n") + "\n")
     save("right.bin", (0 until 8).map(i => ("0" * 9 + (401 - i * 31).toBinaryString).takeRight(9)).mkString("\n") + "\n")
   }
