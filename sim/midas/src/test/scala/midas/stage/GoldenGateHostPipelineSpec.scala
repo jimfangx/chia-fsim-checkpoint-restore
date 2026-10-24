@@ -114,6 +114,27 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
 
   behavior.of("Golden Gate production host-to-FPGA pipeline")
 
+  it should "consume post-mapping wrapper inline requests before discovering and specializing banks" in {
+    val request = firrtl.stage.RunFirrtlTransformAnnotation(new firrtl.passes.InlineInstances)
+    val target = firrtl.passes.InlineAnnotation(firrtl.annotations.ModuleName("HostConsumer",
+      firrtl.annotations.CircuitName("HostPipeline")))
+    val a = compile(inventory = true, Seq(new InjectBankHostState), Seq(
+      midas.checkpoint.SimulatorBankProbeAnnotation, request, target))
+    assert(!a.exists(_.isInstanceOf[firrtl.stage.RunFirrtlTransformAnnotation]))
+    assert(!a.exists(_.isInstanceOf[firrtl.passes.InlineAnnotation]))
+    val history = a.collectFirst { case h: midas.passes.SimulationInlineResultAnnotation => h }.get
+    val rows = (parse(history.body) \ "storage").asInstanceOf[JArray].arr
+    assert(rows.size == 2)
+    assert(rows.exists(r => (r \ "to") == JString("~HostPipeline|HostPipeline>consumer_always")))
+    val context = parse(file(a, ".bank-probe-context.json"))
+    assert((context \ "annotations").asInstanceOf[JArray].arr.exists(r =>
+      (r \ "kind") == JString("simulation_inline") && (r \ "value") == parse(history.body)))
+    val entries = (parse(file(a, ".bank-probe-state.json")) \ "state").asInstanceOf[JArray].arr
+    assert(entries.exists(e => (e \ "hierarchy") == JString("HostPipeline.consumer_always")))
+    save("inline-context.json", SemanticStateInventory.canonical(context))
+    save("inline-receipt.json", history.body)
+  }
+
   it should "consume exactly the stage circuit and retain immutable complete input identity" in {
     val input = Parser.parse(source)
     val request = firrtl.stage.FirrtlCircuitAnnotation(input)

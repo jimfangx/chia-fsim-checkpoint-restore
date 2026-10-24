@@ -132,7 +132,8 @@ class GoldenGateCompilerPhase extends Phase {
       require(p(midas.core.CheckpointCaptureTopKey).isEmpty,
         "Simulator bank probe cannot surround its own live capture transport")
     }
-    val fpgaConstants = midas.checkpoint.SimulatorFPGASynthesisConstants(backendSimulator.copy(form = firrtl.LowForm))
+    val inlinedSimulator = midas.passes.ResolveSimulationInline(backendSimulator.copy(form = firrtl.LowForm))
+    val fpgaConstants = midas.checkpoint.SimulatorFPGASynthesisConstants(inlinedSimulator)
     val postLoweredSimulator = midas.checkpoint.SimulatorBankProbe(fpgaConstants)
 
     // Workaround under-constrained transform dependencies by forcing the

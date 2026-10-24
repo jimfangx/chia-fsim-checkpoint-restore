@@ -37,6 +37,8 @@ private[checkpoint] object SimulatorBankProbeContext {
         "annotation_class" -> JString(nestedClass), "file" -> JString(file))))
     }
     a match {
+      case a: midas.passes.SimulationInlineResultAnnotation =>
+        Some("simulation_inline" -> midas.passes.ResolveSimulationInline.context(a))
       // These abstract definitions and their inline implementation were
       // retired at the actual Xilinx instance rewrite. Their receipt records
       // history only; the physical BUFGCE latch still needs its own owner.
