@@ -125,7 +125,14 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
       firrtl.options.TargetDirAnnotation("checkpoint-fixture"),
       ConfigPackageAnnotation("fixture.config"), ConfigStringAnnotation("FixtureConfig"),
       OutputBaseFilenameAnnotation("fixture"), firrtl.stage.AllowUnrecognizedAnnotations,
-      chisel3.experimental.EnumAnnotations.EnumDefAnnotation("fixture.Mode", Map("idle" -> BigInt(0), "busy" -> BigInt(3))))
+      chisel3.experimental.EnumAnnotations.EnumDefAnnotation("fixture.Mode", Map("idle" -> BigInt(0), "busy" -> BigInt(3))),
+      firrtl.annotations.DeletedAnnotation("firrtl.stage.phases.AddCircuit",
+        firrtl.stage.FirrtlFileAnnotation("historical-fixture.fir")),
+      firrtl.annotations.DeletedAnnotation("firrtl.options.phases.GetIncludes",
+        firrtl.options.InputAnnotationFileAnnotation("historical-fixture.anno.json")),
+      midas.passes.ChannelClockInfoAnnotation(Map(
+        "fixture_request" -> firesim.lib.bridgeutils.RationalClock("fixture_core", 2, 4),
+        "fixture_response" -> firesim.lib.bridgeutils.RationalClock("fixture_uncore", 1, 1))))
     val constraints = Seq(
       midas.InternalXDCAnnotation(midas.targetutils.xdc.XDCFiles.Synthesis,
         "set_property DONT_TOUCH true [get_cells {}]",

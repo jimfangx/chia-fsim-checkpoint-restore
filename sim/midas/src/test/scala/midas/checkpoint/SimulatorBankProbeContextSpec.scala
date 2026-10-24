@@ -3,10 +3,12 @@ package midas.checkpoint
 
 import firrtl.{ChirrtlForm, CircuitState, LowForm, Parser}
 import firrtl.annotations._
-import firrtl.stage.{AllowUnrecognizedAnnotations, FirrtlCircuitAnnotation, InfoModeAnnotation, OutputFileAnnotation, Forms}
+import firrtl.stage.{AllowUnrecognizedAnnotations, FirrtlCircuitAnnotation, FirrtlFileAnnotation, InfoModeAnnotation, OutputFileAnnotation, Forms}
 import firrtl.stage.transforms.Compiler
 import chisel3.experimental.EnumAnnotations.{EnumComponentAnnotation, EnumDefAnnotation}
 import midas.stage.{ConfigStringAnnotation, GoldenGateOutputFileAnnotation}
+import midas.passes.ChannelClockInfoAnnotation
+import firesim.lib.bridgeutils.RationalClock
 import org.json4s._
 import org.json4s.native.JsonMethods.parse
 import org.scalatest.flatspec.AnyFlatSpec
@@ -48,6 +50,100 @@ class SimulatorBankProbeContextSpec extends AnyFlatSpec {
 
   it should "leave the instrumented storage and behavior independent of inert context" in {
     assert(probe(Nil).circuit == probe(Seq(OutputFileAnnotation("other.fir"))).circuit)
+  }
+
+  it should "preserve only exact consumed input-file events without reopening their historical paths" in {
+    val source = DeletedAnnotation("firrtl.stage.phases.AddCircuit", FirrtlFileAnnotation("absent-original.fir"))
+    val include = DeletedAnnotation("firrtl.options.phases.GetIncludes",
+      firrtl.options.InputAnnotationFileAnnotation("absent-original.anno.json"))
+    val annotations = Seq(source, include)
+    val result = probe(annotations)
+    annotations.foreach(a => assert(result.annotations.contains(a)))
+    assert(result.circuit == probe(Nil).circuit)
+    val rows = (context(annotations) \ "annotations").asInstanceOf[JArray].arr
+    assert(rows.size == 2 && rows.forall(r => (r \ "kind") == JString("deleted_input")))
+    assert(rows.map(_ \ "value" \ "annotation_class").toSet == Set(
+      JString("firrtl.stage.FirrtlFileAnnotation"), JString("firrtl.options.InputAnnotationFileAnnotation")))
+    assert(context(annotations) == context(annotations.reverse))
+    assert(context(annotations) != context(Seq(source.copy(anno = FirrtlFileAnnotation("other.fir")), include)))
+    assert(intercept[IllegalArgumentException](probe(Seq(source, source))).getMessage.contains("duplicate deleted"))
+  }
+
+  it should "reject deleted owners nested wrappers unknown producers mismatched events and live inputs" in {
+    val pending = firrtl.stage.RunFirrtlTransformAnnotation(new firrtl.transforms.DeadCodeElimination)
+    val owner = firrtl.transforms.DontTouchAnnotation(ModuleTarget("Top", "Top").ref("stored"))
+    val file = FirrtlFileAnnotation("old.fir")
+    Seq[Annotation](
+      DeletedAnnotation("firrtl.stage.phases.AddCircuit", owner),
+      DeletedAnnotation("firrtl.stage.phases.AddCircuit", pending),
+      DeletedAnnotation("unknown.Producer", file),
+      DeletedAnnotation("firrtl.options.phases.GetIncludes", file),
+      DeletedAnnotation("firrtl.stage.phases.AddCircuit", firrtl.options.InputAnnotationFileAnnotation("old.json")),
+      DeletedAnnotation("firrtl.stage.phases.AddCircuit", DeletedAnnotation("firrtl.stage.phases.AddCircuit", file)),
+      DeletedAnnotation("firrtl.stage.phases.AddCircuit", UnknownCompilerContext),
+      file, firrtl.options.InputAnnotationFileAnnotation("old.json")).foreach { a =>
+      assert(!SimulatorBankProbeContext.accepts(a))
+      assert(intercept[IllegalArgumentException](probe(Seq(a))).getMessage.contains(a.getClass.getName))
+    }
+    Seq("", "bad" + 0.toChar + ".fir").foreach { name =>
+      assert(intercept[IllegalArgumentException] {
+        probe(Seq(DeletedAnnotation("firrtl.stage.phases.AddCircuit", FirrtlFileAnnotation(name))))
+      }.getMessage.contains("deleted input filename"))
+    }
+  }
+
+  it should "bind every global channel clock label and exact ratio without changing storage" in {
+    val clocks = ChannelClockInfoAnnotation(Map(
+      "request" -> RationalClock("core", 2, 4), "response" -> RationalClock("uncore", 1, 1)))
+    val result = probe(Seq(clocks))
+    assert(result.annotations.contains(clocks) && result.circuit == probe(Nil).circuit)
+    val row = (context(Seq(clocks)) \ "annotations").asInstanceOf[JArray].arr.head
+    assert((row \ "kind") == JString("channel_clock_info"))
+    assert((row \ "value" \ "request" \ "multiplier") == JInt(2))
+    assert((row \ "value" \ "request" \ "divisor") == JInt(4))
+    val reversed = clocks.copy(infoMap = clocks.infoMap.toSeq.reverse.toMap)
+    assert(context(Seq(clocks)) == context(Seq(reversed)))
+    Seq(clocks.copy(infoMap = clocks.infoMap - "response"),
+      clocks.copy(infoMap = clocks.infoMap.updated("request", RationalClock("core", 1, 2))),
+      clocks.copy(infoMap = clocks.infoMap.updated("request", RationalClock("other", 2, 4))),
+      clocks.copy(infoMap = clocks.infoMap.updated("request", RationalClock("core", 2, 5)))).foreach { changed =>
+      assert(context(Seq(clocks)) != context(Seq(changed)))
+    }
+    assert(intercept[IllegalArgumentException](probe(Seq(clocks, reversed))).getMessage.contains("duplicate compiler"))
+  }
+
+  it should "reject empty malformed or nonpositive channel clock metadata" in {
+    val invalid = Seq(Map.empty[String, RationalClock], Map("" -> RationalClock("core", 1, 1)),
+      Map("request" -> RationalClock("", 1, 1))) ++ Seq((0, 1), (-1, 1), (1, 0), (1, -1)).map {
+      case (m, d) => Map("request" -> RationalClock("core", m, d))
+    }
+    invalid.foreach { info =>
+      assert(intercept[IllegalArgumentException](probe(Seq(ChannelClockInfoAnnotation(info))))
+        .getMessage.contains("invalid channel clock"))
+    }
+  }
+
+  it should "reject context changes in either the bank state or final emitted annotations" in {
+    val deleted = DeletedAnnotation("firrtl.stage.phases.AddCircuit", FirrtlFileAnnotation("old.fir"))
+    val clock = ChannelClockInfoAnnotation(Map("request" -> RationalClock("core", 2, 4)))
+    val original = probe(Seq(deleted, clock))
+    val xdc = midas.targetutils.xdc.XDCFiles.allFiles.map(f => midas.passes.XDCOutputAnnotation("", Some(f.fileSuffix)))
+    SimulatorBankProbe.emissionBinding(original, "fixture RTL", original.annotations ++ xdc)
+    val changes = Seq(
+      original.annotations.filterNot(_ == deleted),
+      original.annotations.filterNot(_ == clock),
+      original.annotations.map { case `deleted` => deleted.copy(anno = FirrtlFileAnnotation("other.fir")); case a => a },
+      original.annotations.map { case `clock` => clock.copy(infoMap = Map("request" -> RationalClock("core", 1, 2))); case a => a })
+    changes.foreach { annotations =>
+      val stateError = intercept[IllegalArgumentException] {
+        SimulatorBankProbe.emissionBinding(original.copy(annotations = annotations), "fixture RTL", original.annotations ++ xdc)
+      }
+      val emittedError = intercept[IllegalArgumentException] {
+        SimulatorBankProbe.emissionBinding(original, "fixture RTL", annotations ++ xdc)
+      }
+      assert(stateError.getMessage.contains("compiler context changed"))
+      assert(emittedError.getMessage.contains("compiler context changed"))
+    }
   }
 
   it should "reject duplicate compiler options and conflicting enum definitions" in {

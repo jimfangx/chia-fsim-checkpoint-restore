@@ -94,6 +94,14 @@ object SimulatorBankProbe {
     val suffixes = midas.targetutils.xdc.XDCFiles.allFiles.map(_.fileSuffix).toSet
     if (xdc.size != suffixes.size || xdc.map(_._1).toSet != suffixes)
       fail("missing or duplicate emitted physical-constraint files")
+    // The sidecar describes the context actually retained through final
+    // emission. Hashing an old snapshot alone would miss a dropped/changed
+    // channel frequency or consumed-input event in the returned annotations.
+    Seq(state.annotations, emittedAnnotations).foreach { annotations =>
+      val actual = SimulatorBankProbeContext.snapshot(annotations.filter(SimulatorBankProbeContext.accepts),
+        files(".bank-probe-reference.fir"), files(".bank-probe-instrumented.fir"))
+      if (actual != files(".bank-probe-context.json")) fail("compiler context changed after bank specialization")
+    }
     val binding = canonical(JObject(List(
       "binding_version" -> JInt(1), "scope" -> JString("generated_rtl_probe_only"),
       "external_runtime_required" -> JBool(true), "deployable_capture_image" -> JBool(false),
