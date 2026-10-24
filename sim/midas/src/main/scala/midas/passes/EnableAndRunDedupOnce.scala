@@ -16,11 +16,12 @@ class EnableAndRunDedupOnce extends Transform with DependencyAPIMigration {
   override def invalidates(a: Transform) = false
 
   override def execute(state: CircuitState): CircuitState = {
-    val (noDedupAnnos, otherAnnos) = state.annotations.partition {
-      case firrtl.transforms.NoCircuitDedupAnnotation => true
-      case _                                          => false
-    }
-    val deduped                    = (new firrtl.transforms.DedupModules).execute(state.copy(annotations = otherAnnos))
-    deduped.copy(annotations = deduped.annotations ++ noDedupAnnos)
+    // The constraints have been enforced and ordinary dedup remains disabled.
+    // Retire module targets now, before FAME/inline removes definitions; never
+    // keep stale module constraints as if they still targeted live storage.
+    val result = GoldenGateDedupGroups.run(state)
+    if (result.annotations.exists(_.isInstanceOf[DedupGroupPolicyAnnotation]))
+      GoldenGateDedupGroups.retire(result)
+    else result
   }
 }

@@ -52,6 +52,7 @@ object SimulatorBankProbe {
   def apply(input: CircuitState): CircuitState = {
     validateRequest(input)
     if (!input.annotations.contains(SimulatorBankProbeAnnotation)) return input
+    midas.passes.GoldenGateDedupGroups.validateFinal(input.annotations)
     val (metadata, storage) = input.annotations.partition(bookkeeping)
     val (context, owners) = storage.partition(SimulatorBankProbeContext.accepts)
     val reference = input.copy(annotations = owners)
@@ -115,6 +116,7 @@ object SimulatorBankProbe {
     // emission. Hashing an old snapshot alone would miss a dropped/changed
     // channel frequency or consumed-input event in the returned annotations.
     Seq(state.annotations, emittedAnnotations).foreach { annotations =>
+      midas.passes.GoldenGateDedupGroups.validateFinal(annotations)
       val actual = SimulatorBankProbeContext.snapshot(annotations.filter(SimulatorBankProbeContext.accepts),
         files(".bank-probe-reference.fir"), files(".bank-probe-instrumented.fir"))
       if (actual != files(".bank-probe-context.json")) fail("compiler context changed after bank specialization")

@@ -59,7 +59,8 @@ class GoldenGateCompilerPhase extends Phase {
       firrtl.passes.memlib.PassthroughSimpleSyncReadMemsAnnotation,
     )
 
-    val state = CircuitState(inputCircuit, firrtl.ChirrtlForm, consumedAnnotations ++ midasAnnos)
+    val state = midas.passes.GoldenGateDedupGroups.prepare(
+      CircuitState(inputCircuit, firrtl.ChirrtlForm, consumedAnnotations ++ midasAnnos))
 
     // Lower the target design and run additional target transformations before Golden Gate xforms
     val targetLoweringCompiler = new Compiler(
@@ -85,6 +86,7 @@ class GoldenGateCompilerPhase extends Phase {
         .execute(loweredTarget)
 
     GoldenGateEmitterPolicy.validatePreserved(consumedAnnotations, simulator.annotations)
+    midas.passes.GoldenGateDedupGroups.validatePreserved(state.annotations, simulator.annotations)
     compileSimulator(simulator)
   }
 
@@ -132,7 +134,8 @@ class GoldenGateCompilerPhase extends Phase {
       require(p(midas.core.CheckpointCaptureTopKey).isEmpty,
         "Simulator bank probe cannot surround its own live capture transport")
     }
-    val inlinedSimulator = midas.passes.ResolveSimulationInline(backendSimulator.copy(form = firrtl.LowForm))
+    val dedupRetiredSimulator = midas.passes.GoldenGateDedupGroups.retire(backendSimulator.copy(form = firrtl.LowForm))
+    val inlinedSimulator = midas.passes.ResolveSimulationInline(dedupRetiredSimulator)
     val fpgaConstants = midas.checkpoint.SimulatorFPGASynthesisConstants(inlinedSimulator)
     val postLoweredSimulator = midas.checkpoint.SimulatorBankProbe(fpgaConstants)
 
@@ -154,6 +157,8 @@ class GoldenGateCompilerPhase extends Phase {
     val emitted = emitter.execute(if (observeEmission) emissionInput.copy(annotations =
       emissionInput.annotations.filterNot(_.isInstanceOf[firrtl.EmitCircuitAnnotation]) :+
         firrtl.EmitCircuitAnnotation(verilogEmitter.getClass)) else emissionInput)
+    midas.passes.GoldenGateDedupGroups.validatePreserved(simulator.annotations, emitted.annotations)
+    midas.passes.GoldenGateDedupGroups.validateFinal(emitted.annotations)
     GoldenGateEmitterPolicy.validatePreserved(simulator.annotations, postLoweredSimulator.annotations)
     val emitterPolicyFiles = GoldenGateEmitterPolicy.emissionBinding(
       simulator.annotations, emitted, verilogEmitter, observeEmission)

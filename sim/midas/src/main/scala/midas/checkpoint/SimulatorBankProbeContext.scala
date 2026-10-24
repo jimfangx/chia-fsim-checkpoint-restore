@@ -37,6 +37,12 @@ private[checkpoint] object SimulatorBankProbeContext {
         "annotation_class" -> JString(nestedClass), "file" -> JString(file))))
     }
     a match {
+      case a: midas.passes.DedupGroupPolicyAnnotation =>
+        Some("dedup_group_policy" -> midas.passes.GoldenGateDedupGroups.context(a))
+      case a: midas.passes.DedupGroupResultAnnotation =>
+        Some("dedup_group_result" -> midas.passes.GoldenGateDedupGroups.context(a))
+      case a: midas.passes.DedupGroupRetirementAnnotation =>
+        Some("dedup_group_retirement" -> midas.passes.GoldenGateDedupGroups.context(a))
       case a: midas.passes.SimulationInlineResultAnnotation =>
         Some("simulation_inline" -> midas.passes.ResolveSimulationInline.context(a))
       // These abstract definitions and their inline implementation were
@@ -141,6 +147,7 @@ private[checkpoint] object SimulatorBankProbeContext {
   def accepts(a: Annotation): Boolean = row(a).nonEmpty
 
   def snapshot(annotations: Seq[Annotation], reference: String, instrumented: String): String = {
+    midas.passes.GoldenGateDedupGroups.validateHistory(annotations)
     val rows = annotations.map(a => row(a).getOrElse(throw new IllegalArgumentException(
       s"Simulator bank context unsupported: ${a.getClass.getName}")))
     val singleton = rows.filterNot(r => Set("enum_type", "deleted_input", "pre_link_renaming", "bridge_extraction",
