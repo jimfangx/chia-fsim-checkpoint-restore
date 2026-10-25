@@ -63,7 +63,8 @@ object NativeCheckpointStateAccess {
     * through the original host; its access clock was proven by in-place grafting.
     */
   private[checkpoint] def render(root: Module, name: String, clock: String, gates: Int,
-      entries: Seq[StateAccessEntry], ceModule: String, sideband: String): String = {
+      entries: Seq[StateAccessEntry], ceModule: String, sideband: String,
+      adapterPorts: Option[Seq[Port]] = None): String = {
     def port(p: Port): String = {
       val (signed, width) = p.tpe match {
         case UIntType(IntWidth(w)) if w > 0 => ("", w)
@@ -80,7 +81,7 @@ object NativeCheckpointStateAccess {
     }.mkString("\n")
     s"""// Generated native state/CE routing companion. Complete capture is unsupported.
 module $name (
-${root.ports.map(port).mkString(",\n")},
+${adapterPorts.getOrElse(root.ports).map(port).mkString(",\n")},
   input wire capture_reset, capture_clock_mask, capture_read_enable,
   input wire [${gates-1}:0] capture_captured_ce,
   output wire [${gates-1}:0] capture_logical_ce,
@@ -140,14 +141,30 @@ $cases
     .bank(endpoint_bank),.slot(endpoint_slot),.address(endpoint_address),
     .response_valid(ce_response_valid),.response_ready(ce_response_ready),
     .response_data(ce_response_data),.response_error(ce_response_error));
-  ${root.name} network(
+  ${adapterPorts match {
+      case None => s"""${root.name} network(
 ${root.ports.map(p => s"    .${p.name}(${p.name})").mkString(",\n")},
     .${sideband}checkpoint_physical_mask(capture_clock_mask),.${sideband}checkpoint_physical_logical_ce(capture_logical_ce),
     ${if (sideband.isEmpty) s".ckpt_clock($clock)," else ""}.${sideband}ckpt_reset(capture_reset),.${sideband}ckpt_freeze(capture_clock_mask),
     .${sideband}ckpt_bank(endpoint_bank),.${sideband}ckpt_slot(endpoint_slot),.${sideband}ckpt_address(endpoint_address),.${sideband}ckpt_match(),.${sideband}ckpt_data(),
     .${sideband}ckpt_req_valid(functional_request_valid),.${sideband}ckpt_req_ready(functional_request_ready),
     .${sideband}ckpt_resp_valid(functional_response_valid),.${sideband}ckpt_resp_ready(functional_response_ready),
-    .${sideband}ckpt_resp_data(functional_response_data),.${sideband}ckpt_resp_error(functional_response_error));
+    .${sideband}ckpt_resp_data(functional_response_data),.${sideband}ckpt_resp_error(functional_response_error));"""
+      case Some(_) => Seq(
+        "checkpoint_physical_mask" -> "capture_clock_mask",
+        "checkpoint_physical_logical_ce" -> "capture_logical_ce",
+        "ckpt_reset" -> "capture_reset", "ckpt_freeze" -> "capture_clock_mask",
+        "ckpt_bank" -> "endpoint_bank", "ckpt_slot" -> "endpoint_slot", "ckpt_address" -> "endpoint_address",
+        "ckpt_req_valid" -> "functional_request_valid", "ckpt_req_ready" -> "functional_request_ready",
+        "ckpt_resp_valid" -> "functional_response_valid", "ckpt_resp_ready" -> "functional_response_ready",
+        "ckpt_resp_data" -> "functional_response_data", "ckpt_resp_error" -> "functional_response_error"
+      ).map { case (pin, wire) =>
+        val p = adapterPorts.get.find(_.name == sideband + pin).getOrElse(
+          throw new IllegalArgumentException("native state adapter: missing pin " + pin))
+        if (p.direction == Input) s"assign $wire = ${p.name};"
+        else s"assign ${p.name} = $wire;"
+      }.mkString("\n  ")
+    }}
 endmodule
 """
   }

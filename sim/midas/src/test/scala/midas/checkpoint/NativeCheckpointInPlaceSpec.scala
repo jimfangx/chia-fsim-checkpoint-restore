@@ -192,6 +192,8 @@ class NativeCheckpointInPlaceSpec extends AnyFlatSpec {
     constrained.annotations.collect { case a: XDCOutputAnnotation => a }.foreach(a =>
       Files.write(out.resolve("instrumented" + a.suffix.get), a.fileBody.getBytes(UTF_8)))
     saveAccess(result, out.resolve("access"), emitHost = false)
+    saveGraft(result, out.resolve("graft"), emitHost = false)
+    saveAccess(result, out.resolve("graft/original"), emitHost = false)
     println(s"NATIVE_INPLACE_ROCKET_PRODUCTION out=$out annotations=${annotations.size} complete_fpga_capture=false")
   }
 
@@ -299,6 +301,55 @@ class NativeCheckpointInPlaceSpec extends AnyFlatSpec {
       case m => m
     }), annotations = Nil)
     save("NativeReference.sv", emit(refRTL))
+  }
+
+  private def saveGraft(result: NativeCheckpointInPlaceContext.Result, out: java.nio.file.Path,
+      emitHost: Boolean): Unit = {
+    val graft = NativeCheckpointInPlaceGraft.generate(result, XDCPathToCircuitAnnotation(Some("host"), Some("host")))
+    val root = result.host.circuit.main
+    val before = GeneratedExternalOwners.instances(result.state, root).map { case (p, m) => p -> m.name }
+    val after = GeneratedExternalOwners.instances(graft.state, root).map { case (p, m) => p -> m.name }
+    assert(after.filterNot(_._1 == root + ".checkpoint_readout_adapter") == before)
+    assert(graft.state.annotations == result.state.annotations)
+    val top = graft.state.circuit.modules.find(_.name == root).get
+    assert(!top.ports.exists(_.name.startsWith(NativeCheckpointInPlace.prefix)))
+    assert(top.ports.filterNot(_.name.startsWith("capture_")) ==
+      result.host.circuit.modules.find(_.name == root).get.ports)
+    Files.createDirectories(out)
+    def save(name: String, body: String): Unit = Files.write(out.resolve(name), body.getBytes(UTF_8))
+    save("grafted.fir", graft.state.circuit.serialize)
+    save("grafted-annotations.json", JsonProtocol.serialize(graft.state.annotations))
+    if (emitHost) save("grafted.sv", emit(graft.state))
+    graft.files.foreach(f => save("FireSim-generated" + f.fileSuffix, f.body))
+  }
+
+  it should "graft readout inside the existing root without wrapping or moving execution" in {
+    val result = NativeCheckpointInPlaceContext.generate(accessFixture, target)
+    val out = Paths.get(sys.env("CHECKPOINT_TEST_ARTIFACT_DIR")).resolve("native-inplace-graft")
+    saveGraft(result, out, emitHost = true)
+    // Retain original source, context, selectors and independent golden model.
+    saveAccess(result, out.resolve("original"), emitHost = true)
+    val graft = NativeCheckpointInPlaceGraft.generate(result)
+    val adapter = graft.files.find(_.fileSuffix == ".native-inplace-graft.sv").get.body
+    assert(!adapter.contains("NativeHost network("))
+    assert(adapter.contains("assign checkpoint_inplace_ckpt_req_valid = functional_request_valid;"))
+    assert(adapter.contains("assign capture_logical_ce = checkpoint_inplace_checkpoint_physical_logical_ce;"))
+    Seq(result.copy(plan = result.plan + " "), result.copy(dependencies = result.dependencies + " "),
+      result.copy(state = result.state.copy(circuit = result.state.circuit.copy(main = "Changed"))))
+      .foreach(r => intercept[IllegalArgumentException](NativeCheckpointInPlaceGraft.generate(r)))
+    val collision = accessFixture
+    val root = collision.circuit.modules.find(_.name == collision.circuit.main).get.asInstanceOf[Module]
+    Seq("capture_reset", "checkpoint_readout_adapter").foreach { name =>
+      val changed = collision.copy(circuit = collision.circuit.copy(modules = collision.circuit.modules.map {
+        case m if m.name == root.name => root.copy(body = Block(Seq(root.body,
+          DefWire(NoInfo, name, UIntType(IntWidth(1))))))
+        case m => m
+      }))
+      val rebuilt = NativeCheckpointInPlaceContext.generate(changed, target)
+      assert(intercept[IllegalArgumentException](NativeCheckpointInPlaceGraft.generate(rebuilt))
+        .getMessage.contains("reserved identifier collision"))
+    }
+    println(s"NATIVE_INPLACE_GRAFT out=$out existing_execution=1 constraints_relocated=false")
   }
 
   it should "reject stale source, ambiguous hierarchy, unknown host owners and nontransparent clocks" in {
