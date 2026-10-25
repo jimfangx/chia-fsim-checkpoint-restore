@@ -265,9 +265,15 @@ object GeneratedStateBankAccess {
       }
     }
     val root = new Scope(concrete(circuit.main, circuit.main), circuit.main, (pin, _) => {
-      if (!modules(circuit.main).ports.exists(p => p.name == pin && p.direction == Input && p.tpe == ClockType) ||
-          (hasAccessClock && pin == "ckpt_clock")) fail(s"non-functional root clock at ${circuit.main}.$pin")
-      ClockOrigin(Some(pin))
+      modules(circuit.main).ports.find(p => p.name == pin && p.direction == Input) match {
+        case Some(p) if p.tpe == ClockType && !(hasAccessClock && pin == "ckpt_clock") => ClockOrigin(Some(pin))
+        // A scoped SimWrapper receives target clock tokens as UInt<1> data.
+        // Preserve that explicit boundary origin through Clock-typed metadata;
+        // functional() still rejects its use by any storage/effect/native I.
+        case Some(p) if p.tpe == UIntType(IntWidth(1)) =>
+          ClockOrigin(None, data = Some(circuit.main -> pin))
+        case _ => fail(s"non-functional root clock at ${circuit.main}.$pin")
+      }
     }, Set.empty)
     private val scopes = mutable.Map(circuit.main -> root)
     def scope(path: String): Scope = scopes.getOrElseUpdate(path, {

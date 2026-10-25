@@ -393,6 +393,29 @@ class MultipleFunctionalClocksSpec extends AnyFlatSpec {
     }
   }
 
+  it should "preserve one-bit root token data without admitting it as a functional clock" in {
+    val tokenSource = dataSource.replace("module MultiClockStorage :\n    input clock_a : Clock",
+      "module MultiClockStorage :\n    input root_token : UInt<1>\n    input clock_a : Clock")
+      .replace("asClock(eq(bits(data, 0, 0), UInt<1>(0)))", "asClock(root_token)")
+      .replace("asClock(lt(data, UInt<17>(65536)))", "asClock(root_token)")
+    val state = lower(tokenSource)
+    val manifest = SimulatorStateInventory.discover(state)
+    val result = GeneratedStateBankAccess.generate(state, manifest, separateAccessClock = true)
+    midas.widgets.CheckpointCaptureDescriptors.fromGenerated(result, manifest)
+    val domains = (parse(result.binding) \ "functional_clock_domains").asInstanceOf[JArray].arr
+    assert(domains.count(row => (row \ "data_clock" \ "expression") == JString("root_token")) == 8)
+    for (bad <- Seq(
+      tokenSource.replace("reg saved_a : UInt<9>, local_a", "reg saved_a : UInt<9>, metadata"),
+      tokenSource.replace("ram.r.clk <= local_a", "ram.r.clk <= metadata"),
+      tokenSource.replace("ram.w.clk <= b", "ram.w.clk <= metadata"),
+      tokenSource.replace("saved_b <= data", "saved_b <= data\n    stop(metadata, wen, 1)"))) {
+      val mutated = lower(bad)
+      assert(intercept[IllegalArgumentException] {
+        GeneratedStateBankAccess.generate(mutated, SimulatorStateInventory.discover(mutated), separateAccessClock = true)
+      }.getMessage.contains("computed clock data drives functional"))
+    }
+  }
+
   it should "independently reconstruct token origins and reject coherently rehashed sequential rewiring" in {
     val state = lower(dataSource)
     val manifest = SimulatorStateInventory.discover(state)
