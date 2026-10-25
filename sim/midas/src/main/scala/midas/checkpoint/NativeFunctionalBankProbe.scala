@@ -130,7 +130,7 @@ object NativeFunctionalBankProbe {
       "inputs" -> JObject((wiredFiles ++ Seq(
         ".native-functional-emission.json" -> binding, ".native-descriptors-emission.json" -> descriptorBinding))
         .map { case (name, body) => name -> JString(sha256(body)) }.toList))))
-    val stateAccessFiles = NativeCheckpointStateAccess.emit(reference, manifest, plan, deps, generated, wired)
+    val stateAccessFiles = NativeCheckpointStateAccess.emit(reference, manifest, plan, deps, generated, wired, mappings.head)
     input.copy(annotations = input.annotations ++ stateAccessFiles ++ (files ++ descriptorFiles ++ wiredFiles).map { case (name, body) =>
       GoldenGateOutputFileAnnotation(body, name)
     } ++ Seq(GoldenGateOutputFileAnnotation(binding, ".native-functional-emission.json"),

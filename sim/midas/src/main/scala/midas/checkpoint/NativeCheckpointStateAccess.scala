@@ -17,7 +17,9 @@ import scala.io.Source
 object NativeCheckpointStateAccess {
   import SemanticStateInventory.{canonical, sha256}
   def emit(reference: CircuitState, manifest: String, plan: String, dependencies: String,
-      banks: GeneratedStateBankAccess.Result, wired: PhysicalClockCutWiring.Result):
+      banks: GeneratedStateBankAccess.Result, wired: PhysicalClockCutWiring.Result,
+      placement: midas.targetutils.xdc.XDCPathToCircuitAnnotation =
+        midas.targetutils.xdc.XDCPathToCircuitAnnotation(None, None)):
       Seq[GoldenGateOutputFileAnnotation] = {
     val descriptors = CheckpointCaptureDescriptors.fromNativeGenerated(banks, reference, manifest, plan, dependencies)
     val regenerated = PhysicalClockCutWiring.generateNative(reference, manifest, plan, dependencies, banks)
@@ -138,6 +140,7 @@ endmodule
       "production_freeze_owners_bound" -> JBool(false), "metasim_restore_supported" -> JBool(false))))
     Seq(GoldenGateOutputFileAnnotation(rtl, ".native-state-access.sv"),
       GoldenGateOutputFileAnnotation(router, ".native-state-access-router.sv"),
-      GoldenGateOutputFileAnnotation(binding, ".native-state-access.json"))
+      GoldenGateOutputFileAnnotation(binding, ".native-state-access.json")) ++
+      NativeCheckpointConstraints.emit(wired.state, name, placement)
   }
 }

@@ -21,7 +21,17 @@ class CheckpointNativeDescriptorsSpec extends AnyFlatSpec {
   private val source = try resource.mkString finally resource.close()
   private def input = new Compiler(Forms.LowForm).execute(CircuitState(Parser.parse(source),
     ChirrtlForm, Seq(firrtl.transforms.NoCircuitDedupAnnotation))).copy(form = LowForm)
-  private val reference = input
+  private val reference = {
+    val s = input
+    val leaf = firrtl.annotations.ModuleTarget(s.circuit.main, "Leaf")
+    s.copy(annotations = s.annotations ++ Seq(
+      midas.InternalXDCAnnotation(midas.targetutils.xdc.XDCFiles.Synthesis,
+        "set_property DONT_TOUCH true [get_cells {}]", leaf.ref("gate")),
+      midas.InternalXDCAnnotation(midas.targetutils.xdc.XDCFiles.Implementation,
+        "create_generated_clock -name {} -source [get_pins {}] [get_pins {}] -divide_by 1",
+        leaf.instOf("gate", "Native").ref("O"), leaf.instOf("gate", "Native").ref("I"),
+        leaf.instOf("gate", "Native").ref("O"))))
+  }
   private val manifest = SimulatorStateInventory.discover(reference)
   private val plan = PhysicalClockCutPlan.discover(reference, manifest)
   private val deps = PhysicalClockCutDependencies.discover(reference, manifest, plan)
@@ -34,8 +44,10 @@ class CheckpointNativeDescriptorsSpec extends AnyFlatSpec {
   private def save(name: String, text: String): Unit = Files.write(out.resolve(name), text.getBytes(UTF_8))
   private def emit(s: CircuitState): String = {
     val emitter = new SemanticCleanEmitter
+    val constrained = midas.passes.WriteXDCFile.execute(s.copy(annotations = s.annotations :+
+      midas.targetutils.xdc.XDCPathToCircuitAnnotation(None, None)))
     new Compiler(Seq(firrtl.options.Dependency.fromTransform(emitter)), Forms.LowForm, Set(emitter))
-      .execute(s.copy(annotations = s.annotations :+ firrtl.EmitCircuitAnnotation(emitter.getClass)))
+      .execute(constrained.copy(annotations = constrained.annotations :+ firrtl.EmitCircuitAnnotation(emitter.getClass)))
       .getEmittedCircuit.value
   }
 

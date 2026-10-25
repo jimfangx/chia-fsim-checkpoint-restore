@@ -152,7 +152,7 @@ class NativeFunctionalBankSpec extends AnyFlatSpec {
     val result = NativeFunctionalBankProbe(requested)
     assert(result.circuit == original.circuit)
     val files = result.annotations.collect { case a: midas.stage.GoldenGateOutputFileAnnotation => a }
-    assert(files.size == 26 && files.map(_.fileSuffix).distinct.size == 26)
+    assert(files.size == 29 && files.map(_.fileSuffix).distinct.size == 29)
     val receipt = parse(files.find(_.fileSuffix == ".native-functional-emission.json").get.body)
     assert((receipt \ "deployable_capture_image") == JBool(false))
     files.filter(f => f.fileSuffix.startsWith(".native-functional") && f.fileSuffix != ".native-functional-emission.json").foreach { f =>
@@ -193,7 +193,8 @@ class NativeFunctionalBankSpec extends AnyFlatSpec {
     val b = GeneratedStateBankAccess.generatePhysicalCompanion(s, m, p, d)
     val w = PhysicalClockCutWiring.generateNative(s, m, p, d, b)
     val files = NativeCheckpointStateAccess.emit(s, m, p, d, b, w)
-    val rtl = files.head.body; val binding = parse(files.last.body)
+    val rtl = files.head.body
+    val binding = parse(files.find(_.fileSuffix == ".native-state-access.json").get.body)
     assert(rtl.contains("NativeStorage network(") && rtl.contains("NativeStorageCheckpointPhysicalCEBank ce_endpoint("))
     assert(rtl.contains(".ckpt_clock(clock),.ckpt_reset(capture_reset),.ckpt_freeze(capture_clock_mask)"))
     assert(rtl.contains(".clock(clock),.reset(capture_reset),.read_enable(capture_read_enable)"))
@@ -224,12 +225,16 @@ class NativeFunctionalBankSpec extends AnyFlatSpec {
     val pin = ModuleTarget("NativeStorage", "Leaf").instOf("gate", "Native").ref("O")
     val constraint = InternalXDCAnnotation(XDCFiles.Implementation,
       "set_max_delay 7.0 -from [get_pins {}]", pin)
-    val s = original.copy(annotations = original.annotations :+ constraint)
+    val shell = InternalXDCAnnotation(XDCFiles.Synthesis,
+      "set_property IOSTANDARD LVDS [get_ports shell_clock]")
+    val s = original.copy(annotations = original.annotations ++ Seq(constraint, shell))
     val m = SimulatorStateInventory.discover(s); val p = PhysicalClockCutPlan.discover(s, m)
     val d = PhysicalClockCutDependencies.discover(s, m, p)
     val generated = GeneratedStateBankAccess.generatePhysicalCompanion(s, m, p, d)
     val constraints = generated.state.annotations.collect { case a: InternalXDCAnnotation => a }
-    assert(constraints.size == 2 && constraints.map(_.argumentList.head.module).distinct.size == 2)
+    val targeted = constraints.filter(_.argumentList.nonEmpty)
+    assert(targeted.size == 2 && targeted.map(_.argumentList.head.module).distinct.size == 2)
+    assert(constraints.filter(_.argumentList.isEmpty) == Seq(shell))
     val emitted = midas.passes.WriteXDCFile.execute(generated.state.copy(annotations =
       generated.state.annotations :+ XDCPathToCircuitAnnotation(None, None)))
     val xdc = emitted.annotations.collect { case a: midas.passes.XDCOutputAnnotation => a.fileBody }.mkString
@@ -244,6 +249,45 @@ class NativeFunctionalBankSpec extends AnyFlatSpec {
     assert(rtl.contains("assign gate_I = checkpoint_physical_source_clock;"))
     assert(rtl.contains("always @(posedge ckpt_clock)"))
     assert((parse(wired.binding) \ "bank_annotations_preserved") == JBool(true))
+    val files = NativeCheckpointStateAccess.emit(s, m, p, d, generated, wired,
+      XDCPathToCircuitAnnotation(Some("shell/pre"), Some("shell/post")))
+    val wrapped = files.find(_.fileSuffix == ".native-state-access.implementation.xdc").get.body
+    assert(wrapped.contains("shell/post/network/left_/gate/O") &&
+      wrapped.contains("shell/post/network/right_/gate/O"))
+    assert(!wrapped.contains("shell/pre/network/"))
+    val synthesis = files.find(_.fileSuffix == ".native-state-access.synthesis.xdc").get.body
+    assert(synthesis.endsWith(shell.formatString) && !synthesis.contains("network/shell_clock"))
+    val binding = parse(files.find(_.fileSuffix == ".native-state-access-constraints.json").get.body)
+    assert((binding \ "rebased_pre_link_path") == JString("shell/pre/network"))
+    assert((binding \ "production_constraints_attached") == JBool(false))
+  }
+
+  it should "reject unsafe constraint placements and stale constraint targets before emission" in {
+    import firrtl.annotations.ModuleTarget
+    import midas.InternalXDCAnnotation
+    import midas.targetutils.xdc.{XDCFiles, XDCPathToCircuitAnnotation}
+    val s = input
+    val m = SimulatorStateInventory.discover(s); val p = PhysicalClockCutPlan.discover(s, m)
+    val d = PhysicalClockCutDependencies.discover(s, m, p)
+    val b = GeneratedStateBankAccess.generatePhysicalCompanion(s, m, p, d)
+    val w = PhysicalClockCutWiring.generateNative(s, m, p, d, b)
+    Seq("", "/shell", "shell/", "shell//top", "shell/../top", "shell/*", "shell/[bad]", "shell/$x").foreach { bad =>
+      // A literal dollar is a legal HDL identifier character; Tcl substitution
+      // requires a stricter placement contract than ordinary Verilog names.
+      intercept[IllegalArgumentException] {
+        NativeCheckpointConstraints.emit(w.state, s.circuit.main + "CheckpointStateAccess",
+          XDCPathToCircuitAnnotation(Some(bad), None))
+      }
+    }
+    val stale = InternalXDCAnnotation(XDCFiles.Implementation, "set_max_delay 7 -from [get_pins {}]",
+      ModuleTarget(s.circuit.main, "MissingModule").ref("missing"))
+    intercept[IllegalArgumentException] {
+      NativeCheckpointConstraints.emit(w.state.copy(annotations = w.state.annotations :+ stale),
+        s.circuit.main + "CheckpointStateAccess", XDCPathToCircuitAnnotation(None, None))
+    }
+    intercept[IllegalArgumentException] {
+      NativeCheckpointConstraints.emit(w.state, "ChangedWrapper", XDCPathToCircuitAnnotation(None, None))
+    }
   }
 
   it should "reject native wiring with coherently changed banks, selectors or source identity" in {
