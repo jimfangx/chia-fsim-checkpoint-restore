@@ -31,6 +31,39 @@ object NativeCheckpointStateAccess {
       "native state access: module name collision")
     require(root.ports.forall(p => p.name.matches("[a-zA-Z_][a-zA-Z0-9_$]*") && !p.name.startsWith("capture_")),
       "native state access: reserved or unsupported port name")
+    val JString(clock) = parse(plan) \ "common_source_clock"
+    val gates = descriptors.physicalClockGates
+    val entries = banks.entries
+    val ce = PhysicalClockStateBank.emit(reference, manifest, plan, dependencies)
+    val JString(ceModule) = parse(ce.head.body) \ "endpoint_module"
+    val source = Source.fromResource("CheckpointPhysicalStateRouter.sv")
+    val router = try source.mkString finally source.close()
+    val rtl = render(root, name, clock, gates, entries, ceModule, "")
+    val binding = canonical(JObject(List(
+      "binding_version" -> JInt(1), "scope" -> JString("same_reference_native_state_router_companion_only"),
+      "module" -> JString(name), "common_source_clock" -> JString(clock),
+      "functional_entries" -> JInt(entries.size), "physical_clock_gates" -> JInt(gates),
+      "same_reference_sha256" -> JString(sha256(reference.circuit.serialize)),
+      "wired_binding_sha256" -> JString(sha256(wired.binding)),
+      "descriptor_binding_sha256" -> JString(descriptors.bindingSha256),
+      "descriptor_manifest_sha256" -> JString(descriptors.manifestSha256),
+      "endpoint_sha256" -> JString(sha256(rtl)), "router_sha256" -> JString(sha256(router)),
+      "physical_bank_sha256" -> JString(sha256(ce(1).body)),
+      "reset_contract" -> JString("widget_controller_reset_shared_by_native_endpoint_router_and_ce_bank"),
+      "external_inputs_require_freeze" -> (parse(dependencies) \ "external_inputs_require_freeze"),
+      "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
+      "production_freeze_owners_bound" -> JBool(false), "metasim_restore_supported" -> JBool(false))))
+    Seq(GoldenGateOutputFileAnnotation(rtl, ".native-state-access.sv"),
+      GoldenGateOutputFileAnnotation(router, ".native-state-access-router.sv"),
+      GoldenGateOutputFileAnnotation(binding, ".native-state-access.json")) ++
+      NativeCheckpointConstraints.emit(wired.state, name, placement)
+  }
+  /** Reuse transaction routing without reconstructing or duplicating the
+    * functional execution. A nonempty prefix denotes sidebands already carried
+    * through the original host; its access clock was proven by in-place grafting.
+    */
+  private[checkpoint] def render(root: Module, name: String, clock: String, gates: Int,
+      entries: Seq[StateAccessEntry], ceModule: String, sideband: String): String = {
     def port(p: Port): String = {
       val (signed, width) = p.tpe match {
         case UIntType(IntWidth(w)) if w > 0 => ("", w)
@@ -40,19 +73,12 @@ object NativeCheckpointStateAccess {
       }
       s"  ${if (p.direction == Input) "input" else "output"} wire $signed${if (width == 1) "" else s"[${width-1}:0] "}${p.name}"
     }
-    val JString(clock) = parse(plan) \ "common_source_clock"
-    val gates = descriptors.physicalClockGates
-    val entries = banks.entries
     val cases = entries.zipWithIndex.map { case (e, i) =>
       s"      32'd$i: begin functional_descriptor_valid=1; functional_descriptor_bank=8'd${e.bank}; " +
         s"functional_descriptor_slot=16'd${e.slot}; functional_descriptor_width=16'd${e.width}; " +
         s"functional_descriptor_depth=32'd${e.depth}; end"
     }.mkString("\n")
-    val ce = PhysicalClockStateBank.emit(reference, manifest, plan, dependencies)
-    val JString(ceModule) = parse(ce.head.body) \ "endpoint_module"
-    val source = Source.fromResource("CheckpointPhysicalStateRouter.sv")
-    val router = try source.mkString finally source.close()
-    val rtl = s"""// Generated native state/CE routing companion. Complete capture is unsupported.
+    s"""// Generated native state/CE routing companion. Complete capture is unsupported.
 module $name (
 ${root.ports.map(port).mkString(",\n")},
   input wire capture_reset, capture_clock_mask, capture_read_enable,
@@ -116,31 +142,13 @@ $cases
     .response_data(ce_response_data),.response_error(ce_response_error));
   ${root.name} network(
 ${root.ports.map(p => s"    .${p.name}(${p.name})").mkString(",\n")},
-    .checkpoint_physical_mask(capture_clock_mask),.checkpoint_physical_logical_ce(capture_logical_ce),
-    .ckpt_clock($clock),.ckpt_reset(capture_reset),.ckpt_freeze(capture_clock_mask),
-    .ckpt_bank(endpoint_bank),.ckpt_slot(endpoint_slot),.ckpt_address(endpoint_address),.ckpt_match(),.ckpt_data(),
-    .ckpt_req_valid(functional_request_valid),.ckpt_req_ready(functional_request_ready),
-    .ckpt_resp_valid(functional_response_valid),.ckpt_resp_ready(functional_response_ready),
-    .ckpt_resp_data(functional_response_data),.ckpt_resp_error(functional_response_error));
+    .${sideband}checkpoint_physical_mask(capture_clock_mask),.${sideband}checkpoint_physical_logical_ce(capture_logical_ce),
+    ${if (sideband.isEmpty) s".ckpt_clock($clock)," else ""}.${sideband}ckpt_reset(capture_reset),.${sideband}ckpt_freeze(capture_clock_mask),
+    .${sideband}ckpt_bank(endpoint_bank),.${sideband}ckpt_slot(endpoint_slot),.${sideband}ckpt_address(endpoint_address),.${sideband}ckpt_match(),.${sideband}ckpt_data(),
+    .${sideband}ckpt_req_valid(functional_request_valid),.${sideband}ckpt_req_ready(functional_request_ready),
+    .${sideband}ckpt_resp_valid(functional_response_valid),.${sideband}ckpt_resp_ready(functional_response_ready),
+    .${sideband}ckpt_resp_data(functional_response_data),.${sideband}ckpt_resp_error(functional_response_error));
 endmodule
 """
-    val binding = canonical(JObject(List(
-      "binding_version" -> JInt(1), "scope" -> JString("same_reference_native_state_router_companion_only"),
-      "module" -> JString(name), "common_source_clock" -> JString(clock),
-      "functional_entries" -> JInt(entries.size), "physical_clock_gates" -> JInt(gates),
-      "same_reference_sha256" -> JString(sha256(reference.circuit.serialize)),
-      "wired_binding_sha256" -> JString(sha256(wired.binding)),
-      "descriptor_binding_sha256" -> JString(descriptors.bindingSha256),
-      "descriptor_manifest_sha256" -> JString(descriptors.manifestSha256),
-      "endpoint_sha256" -> JString(sha256(rtl)), "router_sha256" -> JString(sha256(router)),
-      "physical_bank_sha256" -> JString(sha256(ce(1).body)),
-      "reset_contract" -> JString("widget_controller_reset_shared_by_native_endpoint_router_and_ce_bank"),
-      "external_inputs_require_freeze" -> (parse(dependencies) \ "external_inputs_require_freeze"),
-      "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
-      "production_freeze_owners_bound" -> JBool(false), "metasim_restore_supported" -> JBool(false))))
-    Seq(GoldenGateOutputFileAnnotation(rtl, ".native-state-access.sv"),
-      GoldenGateOutputFileAnnotation(router, ".native-state-access-router.sv"),
-      GoldenGateOutputFileAnnotation(binding, ".native-state-access.json")) ++
-      NativeCheckpointConstraints.emit(wired.state, name, placement)
   }
 }

@@ -172,6 +172,7 @@ $connects
       XDCPathToCircuitAnnotation(None, Some("shell/CL"))))
     constrained.annotations.collect { case a: XDCOutputAnnotation => a }.foreach(a =>
       Files.write(out.resolve("instrumented" + a.suffix.get), a.fileBody.getBytes(UTF_8)))
+    saveAccess(result, out.resolve("access"), emitHost = false)
     println(s"NATIVE_INPLACE_ROCKET_PRODUCTION out=$out annotations=${annotations.size} complete_fpga_capture=false")
   }
 
@@ -227,6 +228,74 @@ $connects
     }), annotations = Nil)
     save("NativeReference.sv", emit(refRTL))
     println(s"NATIVE_INPLACE_ELABORATED out=$out existing_execution=1 raw_ancestors=2")
+  }
+
+  it should "connect functional and physical readout to the existing host on its proven raw clock" in {
+    import org.json4s._
+    import org.json4s.native.JsonMethods.parse
+    val (original, _) = fixture
+    // Use synthesis-valid source constraints for this execution fixture. The
+    // older structural fixture also tests clock-pin max-delay preservation;
+    // Vivado segments that artificial I->O path and drops its hold analysis.
+    // Here both primitive pins select the original cells for preservation.
+    val h = original.copy(annotations = original.annotations.map {
+      case a: InternalXDCAnnotation if a.formatString ==
+          "set_max_delay 4 -from [get_cells {}] -to [get_cells {}]" =>
+        InternalXDCAnnotation(a.destinationFile,
+          "set_max_delay 4 -from [get_cells {}_reg*] -to [get_cells {}_reg*]", a.argumentList: _*)
+      case a: InternalXDCAnnotation if a.formatString ==
+          "set_max_delay 9 -from [get_pins {}] -to [get_pins {}]" =>
+        InternalXDCAnnotation(a.destinationFile,
+          "set_property DONT_TOUCH true [get_cells -of_objects [get_pins {}]]; " +
+          "set_property DONT_TOUCH true [get_cells -of_objects [get_pins {}]]", a.argumentList: _*)
+      case a => a
+    })
+    val result = NativeCheckpointInPlaceContext.generate(h, target)
+    val files = NativeCheckpointInPlaceAccess.emit(result, XDCPathToCircuitAnnotation(Some("host"), Some("host")))
+    val rtl = files.find(_.fileSuffix == ".native-inplace-access.sv").get.body
+    val binding = parse(files.find(_.fileSuffix == ".native-inplace-access.json").get.body)
+    assert(rtl.contains("NativeHost network("))
+    assert(rtl.contains(".checkpoint_inplace_ckpt_reset(capture_reset)"))
+    assert(rtl.contains(".checkpoint_inplace_ckpt_req_valid(functional_request_valid)"))
+    assert(!rtl.contains(".ckpt_clock(")) // Already connected inside the original hierarchy.
+    assert((binding \ "in_place_ce_endpoint_connected") == JBool(true))
+    assert((binding \ "in_place_checkpoint_widget_connected") == JBool(false))
+    assert((binding \ "complete_fpga_capture") == JBool(false))
+    val changedIdentity = result.native.identity.copy(entries = result.native.identity.entries.reverse)
+    intercept[IllegalArgumentException](NativeCheckpointInPlaceAccess.emit(
+      result.copy(native = result.native.copy(identity = changedIdentity))))
+    intercept[IllegalArgumentException](NativeCheckpointInPlaceAccess.emit(
+      result.copy(plan = result.plan + " ")))
+    intercept[IllegalArgumentException](NativeCheckpointInPlaceAccess.emit(
+      result.copy(dependencies = result.dependencies + " ")))
+    val out = Paths.get(sys.env("CHECKPOINT_TEST_ARTIFACT_DIR")).resolve("native-inplace-access")
+    saveAccess(result, out, emitHost = true)
+    println(s"NATIVE_INPLACE_ACCESS out=$out existing_execution=1 ce_endpoint_connected=true complete_fpga_capture=false")
+  }
+
+  private def saveAccess(result: NativeCheckpointInPlaceContext.Result, out: java.nio.file.Path,
+      emitHost: Boolean): Unit = {
+    val h = result.host.copy(annotations = result.host.annotations.filterNot(SimulatorBankProbeContext.accepts))
+    val files = NativeCheckpointInPlaceAccess.emit(result, XDCPathToCircuitAnnotation(Some("host"), Some("host")))
+    Files.createDirectories(out)
+    def save(name: String, body: String): Unit = Files.write(out.resolve(name), body.getBytes(UTF_8))
+    save("host.fir", h.circuit.serialize); save("instrumented.fir", result.state.circuit.serialize)
+    if (emitHost) save("instrumented.sv", emit(result.native.state))
+    save("binding.json", result.native.binding)
+    saveAnnotations(h, result.native, save); saveIdentity(result.native, save)
+    saveContext(result, out.resolve("context"))
+    val r = result.reference
+    val probe = NativeFunctionalBankProbe(r.copy(annotations = r.annotations ++ Seq(
+      NativeFunctionalBankProbeAnnotation, PhysicalClockCutPlanAnnotation,
+      SimulatorCheckpointInventoryAnnotation(r.circuit.main), XDCPathToCircuitAnnotation(None, None))))
+    probe.annotations.collect { case a: midas.stage.GoldenGateOutputFileAnnotation => a }
+      .foreach(a => save("FireSim-generated" + a.fileSuffix, a.body))
+    files.foreach(a => save("FireSim-generated" + a.fileSuffix, a.body))
+    val refRTL = r.copy(circuit = r.circuit.copy(main = "NativeReference", modules = r.circuit.modules.map {
+      case m: Module if m.name == r.circuit.main => m.copy(name = "NativeReference")
+      case m => m
+    }), annotations = Nil)
+    save("NativeReference.sv", emit(refRTL))
   }
 
   it should "reject stale source, ambiguous hierarchy, unknown host owners and nontransparent clocks" in {
