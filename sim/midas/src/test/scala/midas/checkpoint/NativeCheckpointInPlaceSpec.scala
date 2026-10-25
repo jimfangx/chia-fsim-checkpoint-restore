@@ -81,6 +81,7 @@ $connects
     def save(name: String, body: String): Unit = Files.write(out.resolve(name), body.getBytes(UTF_8))
     save("host.fir", h.circuit.serialize); save("instrumented.fir", result.state.circuit.serialize)
     save("instrumented.sv", emit(result.state)); save("binding.json", result.binding)
+    saveIdentity(result, save)
     // Retain separately reconstructed selected-subtree banks/clock provenance.
     val probe = NativeFunctionalBankProbe(r.copy(annotations = r.annotations ++ Seq(
       NativeFunctionalBankProbeAnnotation, PhysicalClockCutPlanAnnotation,
@@ -144,6 +145,13 @@ $connects
     val d = PhysicalClockCutDependencies.discover(r, m, p)
     val t = ModuleTarget("F1Shim", "F1Shim").instOf("top", "FPGATop").instOf("sim", "SimWrapper")
     val result = NativeCheckpointInPlace.generate(h, t, r, m, p, d)
+    val identityDoc = org.json4s.native.JsonMethods.parse(result.identity.manifest)
+    val identityRows = (identityDoc \ "state").asInstanceOf[org.json4s.JArray].arr
+    val ceRows = identityRows.filter(row => (row \ "domain") == org.json4s.JString("physical_ce"))
+    assert(ceRows.size == 2 && ceRows.forall(row => (row \ "ce_bit") != (row \ "global_physical_index")))
+    val uncoveredCE = (identityDoc \ "uncovered_physical_gates").asInstanceOf[org.json4s.JArray].arr
+    assert(uncoveredCE.size == 1 && (uncoveredCE.head \ "hierarchy") ==
+      org.json4s.JString("F1Shim.top.FASEDMemoryTimingModel_0.gate"))
     val live = GeneratedExternalOwners.instances(result.state, "F1Shim")
     assert(live.count(_._1 == "F1Shim.top.sim") == 1)
     assert(live.exists(_._1 == "F1Shim.top.FASEDMemoryTimingModel_0.gate"))
@@ -153,6 +161,7 @@ $connects
     save("host.fir", h.circuit.serialize); save("instrumented.fir", result.state.circuit.serialize)
     save("source-input.json", s"""{"path":"${source.toAbsolutePath}","sha256":"${SemanticStateInventory.sha256(text)}","scope":"retained exact-recipe structural input; no production annotations or capture admission"}""")
     save("binding.json", result.binding)
+    saveIdentity(result, save)
     val probe = NativeFunctionalBankProbe(r.copy(annotations = r.annotations ++ Seq(
       NativeFunctionalBankProbeAnnotation, PhysicalClockCutPlanAnnotation,
       SimulatorCheckpointInventoryAnnotation(r.circuit.main),
@@ -160,5 +169,64 @@ $connects
     probe.annotations.collect { case a: midas.stage.GoldenGateOutputFileAnnotation => a }
       .foreach(a => save("FireSim-generated" + a.fileSuffix, a.body))
     println(s"NATIVE_INPLACE_ROCKET_STRUCTURAL out=$out selected=F1Shim.top.sim complete_fpga_capture=false")
+  }
+
+  private def saveIdentity(result: NativeCheckpointInPlace.Result, save: (String, String) => Unit): Unit = {
+    val identity = result.identity
+    save("global-identity.json", identity.manifest); save("global-identity-binding.json", identity.binding)
+    save("global-simulator-state.json", identity.simulatorManifest)
+    save("global-physical-clock-plan.json", identity.clockPlan)
+    save("global-physical-clock-dependencies.json", identity.dependencies)
+  }
+
+  it should "use original global identities while preserving local selectors and declaring every uncovered owner" in {
+    import org.json4s._
+    import org.json4s.native.JsonMethods.parse
+    val (h, r) = fixture
+    val m = SimulatorStateInventory.discover(r); val p = PhysicalClockCutPlan.discover(r, m)
+    val d = PhysicalClockCutDependencies.discover(r, m, p)
+    val result = generate(h, r)
+    val identity = result.identity
+    val global = (parse(identity.simulatorManifest) \ "state").asInstanceOf[JArray].arr
+      .filterNot(row => (row \ "adapter") == JString("metasim-bufgce-v1"))
+    val projection = parse(identity.manifest)
+    val rows = (projection \ "state").asInstanceOf[JArray].arr
+    val uncovered = (projection \ "uncovered_functional_state").asInstanceOf[JArray].arr
+    assert(uncovered.map(_ \ "hierarchy").toSet == Set(JString("NativeHost.host_ticks"),
+      JString("NativeHost.stage.control_ticks")))
+    assert(global.map(_ \ "state_id").toSet ==
+      (rows.filter(row => (row \ "domain") == JString("functional")).map(_ \ "state_id") ++
+        uncovered.map(_ \ "state_id")).toSet)
+    val local = midas.widgets.CheckpointCaptureDescriptors.fromNativeGenerated(
+      GeneratedStateBankAccess.generatePhysicalCompanion(r, m, p, d), r, m, p, d)
+    assert(identity.entries.map(e => (e.bank, e.slot, e.width, e.depth)) ==
+      local.entries.map(e => (e.bank, e.slot, e.width, e.depth)))
+    assert(identity.entries.map(_.stateID).toSet.intersect(local.entries.map(_.stateID).toSet).isEmpty)
+    val descriptors = midas.widgets.CheckpointCaptureDescriptors.fromNativeInPlace(h, target, r, m, p, d)
+    assert(descriptors.entries == identity.entries && descriptors.manifest == identity.manifest)
+    assert(descriptors.manifestSha256 == SemanticStateInventory.sha256(identity.manifest))
+    assert(descriptors.cppManifest.contains("255U"))
+    assert((projection \ "complete_fpga_capture") == JBool(false))
+    assert((projection \ "metasim_restore_supported") == JBool(false))
+    assert((parse(result.binding) \ "identity_binding_sha256") ==
+      JString(SemanticStateInventory.sha256(identity.binding)))
+  }
+
+  it should "reject stale concrete paths, changed original state and stale selected provenance during identity reconciliation" in {
+    val (h, r) = fixture
+    val m = SimulatorStateInventory.discover(r); val p = PhysicalClockCutPlan.discover(r, m)
+    val d = PhysicalClockCutDependencies.discover(r, m, p)
+    def project(host: CircuitState = h, t: InstanceTarget = target, manifest: String = m) =
+      NativeCheckpointIdentity.discover(host, t, r, manifest, p, d)
+    val wrong = ModuleTarget("NativeHost", "NativeHost").instOf("stage", "Stage")
+      .instOf("missing", "NativeStorage")
+    assert(intercept[IllegalArgumentException](project(t = wrong)).getMessage.contains("stale concrete target"))
+    assert(intercept[IllegalArgumentException](project(manifest = m.replace("firrtl-memory-v1", "unsupported")))
+      .getMessage.contains("stale or incomplete simulator inventory"))
+    val changed = h.copy(circuit = h.circuit.copy(modules = h.circuit.modules.map {
+      case mod: Module if mod.name == "NativeStorage" => mod.copy(info = FileInfo("changed"))
+      case mod => mod
+    }))
+    assert(intercept[IllegalArgumentException](project(host = changed)).getMessage.contains("stale executing"))
   }
 }

@@ -20,7 +20,7 @@ import scala.collection.mutable
 object NativeCheckpointInPlace {
   import SemanticStateInventory.{canonical, sha256}
   val prefix = "checkpoint_inplace_"
-  case class Result(state: CircuitState, binding: String)
+  case class Result(state: CircuitState, binding: String, identity: NativeCheckpointIdentity.Result)
   private def check(ok: Boolean, why: String): Unit =
     require(ok, "Native in-place checkpoint: " + why)
   private def statements(s: Statement): Seq[Statement] = {
@@ -133,13 +133,15 @@ object NativeCheckpointInPlace {
     val renames = firrtl.RenameMap(Map(CircuitName(reference.circuit.main) -> Seq(CircuitName(host.circuit.main))))
     val annotations = (host.annotations ++ wired.state.annotations.flatMap(_.update(renames))).distinct
     val result = CircuitState(flowed, LowForm, annotations)
+    val identity = NativeCheckpointIdentity.discover(host, target, reference, manifest, plan, dependencies)
     val binding = canonical(JObject(List(
-      "binding_version" -> JInt(1), "scope" -> JString("existing_instance_native_banks_only"),
+      "binding_version" -> JInt(2), "scope" -> JString("existing_instance_native_banks_only"),
       "target" -> JString(target.serialize), "host_sha256" -> JString(sha256(host.circuit.serialize)),
       "reference_sha256" -> JString(sha256(reference.circuit.serialize)),
       "bank_binding_sha256" -> JString(sha256(banks.binding)),
       "wiring_binding_sha256" -> JString(sha256(wired.binding)),
       "instrumented_sha256" -> JString(sha256(result.circuit.serialize)),
+      "identity_binding_sha256" -> JString(sha256(identity.binding)),
       "enclosing_raw_clock" -> JString(enclosingClock),
       "selected_raw_clock" -> JString(commonClock),
       "endpoint_raw_clock" -> JString("ckpt_clock"),
@@ -149,6 +151,6 @@ object NativeCheckpointInPlace {
         "type" -> JString(p.tpe.serialize)))).toList),
       "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
       "production_freeze_owners_bound" -> JBool(false), "metasim_restore_supported" -> JBool(false))))
-    Result(result, binding)
+    Result(result, binding, identity)
   }
 }

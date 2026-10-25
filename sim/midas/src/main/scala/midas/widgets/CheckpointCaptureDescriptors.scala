@@ -24,6 +24,26 @@ final class CheckpointCaptureDescriptors private (
 }
 
 object CheckpointCaptureDescriptors {
+  /** Use enclosing simulator StateIDs without changing the selected endpoint's
+    * selectors, CE bit order or transfer order. Complete global deficits remain
+    * in the manifest; this factory never grants capture/restore admission.
+    */
+  def fromNativeInPlace(host: CircuitState, target: firrtl.annotations.InstanceTarget,
+      reference: CircuitState, simulatorManifest: String, plan: String,
+      dependencies: String): CheckpointCaptureDescriptors = {
+    val identity = midas.checkpoint.NativeCheckpointIdentity.discover(host, target, reference,
+      simulatorManifest, plan, dependencies)
+    fromNativeInPlaceIdentity(identity)
+  }
+
+  private def fromNativeInPlaceIdentity(identity: midas.checkpoint.NativeCheckpointIdentity.Result):
+      CheckpointCaptureDescriptors = {
+    // Only the reconstructed result above is accepted by this private path.
+    val sha = SemanticStateInventory.sha256 _
+    new CheckpointCaptureDescriptors(sha(identity.manifest), sha(identity.binding), identity.entries,
+      identity.manifest, identity.binding, identity.physicalClockGates)
+  }
+
   def fromGenerated(result: GeneratedStateBankAccess.Result, manifest: String): CheckpointCaptureDescriptors =
     fromGeneratedImpl(result, manifest, native = false)
 
