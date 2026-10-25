@@ -235,4 +235,95 @@ class CheckpointCaptureTopSpec extends AnyFlatSpec {
     Files.write(enabled.resolve("manifest.inc"), descriptors.cppManifest.getBytes(UTF_8))
     println(s"CHECKPOINT_TOP_ELABORATED out=$enabled streams=2 checkpoint_stream=1")
   }
+
+  it should "attach a reconstructed native clock/bank network to the registered raw-clock widget" in {
+    import midas.checkpoint._
+    val resource = scala.io.Source.fromResource("checkpoint/NativeStorage.firrtl")
+    val source = try resource.mkString finally resource.close()
+    val low = new Compiler(Forms.LowForm).execute(CircuitState(Parser.parse(source), ChirrtlForm,
+      Seq(firrtl.transforms.NoCircuitDedupAnnotation))).copy(form = LowForm)
+    val leaf = firrtl.annotations.ModuleTarget(low.circuit.main, "Leaf")
+    val reference = low.copy(annotations = low.annotations ++ Seq(
+      midas.InternalXDCAnnotation(midas.targetutils.xdc.XDCFiles.Synthesis,
+        "set_property DONT_TOUCH true [get_cells {}]", leaf.ref("gate")),
+      midas.InternalXDCAnnotation(midas.targetutils.xdc.XDCFiles.Implementation,
+        "create_generated_clock -name {} -source [get_pins {}] [get_pins {}] -divide_by 1",
+        leaf.instOf("gate", "Native").ref("O"), leaf.instOf("gate", "Native").ref("I"),
+        leaf.instOf("gate", "Native").ref("O"))))
+    val manifest = SimulatorStateInventory.discover(reference)
+    val plan = PhysicalClockCutPlan.discover(reference, manifest)
+    val deps = PhysicalClockCutDependencies.discover(reference, manifest, plan)
+    val enclosing = reference.copy(circuit = reference.circuit.copy(modules = reference.circuit.modules :+
+      firrtl.ir.Module(firrtl.ir.NoInfo, "FPGATop", Nil, firrtl.ir.EmptyStmt)))
+    val rejected = intercept[IllegalArgumentException] {
+      new NativeCheckpointCaptureBinding(enclosing, manifest, plan, deps, Seq("fixture.functional")) {
+        def connectOwnersAndFunctional(top: FPGATopImp, capture: CheckpointCaptureSideband,
+            functional: Map[String, Data]): Unit = ()
+      }
+    }
+    assert(rejected.getMessage.contains("in-place production mapping"))
+    class Binding(omitReset: Boolean = false, omitOwner: Boolean = false)
+        extends NativeCheckpointCaptureBinding(reference, manifest, plan, deps,
+          Seq("fixture.functional", "fixture.host"), queueDepth = 2) {
+      def connectOwnersAndFunctional(top: FPGATopImp, capture: CheckpointCaptureSideband,
+          functional: Map[String, Data]): Unit = {
+        assert(!functional.contains("clock"))
+        functional.foreach { case (name, port) =>
+          val external = if (Set("reset", "enable", "address", "data", "write").contains(name)) {
+            IO(Input(chiselTypeOf(port)))
+          } else IO(Output(chiselTypeOf(port)))
+          external.suggestName("native_" + name)
+          if (Set("reset", "enable", "address", "data", "write").contains(name)) {
+            if (!omitReset || name != "reset") port := external
+          } else external := port
+        }
+        val cycleFault = IO(Input(UInt(64.W))).suggestName("native_cycle_fault")
+        val ownerPresent = IO(Input(UInt(2.W))).suggestName("native_owner_present")
+        capture.targetCycle := functional("cycle").asUInt ^ cycleFault
+        capture.ownerPresent := ownerPresent
+        if (!omitOwner) capture.ownerFrozen := Fill(2, capture.freeze)
+        capture.ownerError := 0.U
+        val physical = capture.physical.get
+        // Public diagnostic outputs; the test does not drive internal signals.
+        Seq("mask" -> physical.clockMask, "stopped" -> physical.stopped,
+          "read_enable" -> physical.readEnable, "failed" -> physical.failed,
+          "freeze" -> capture.freeze).foreach { case (name, value) =>
+          IO(Output(Bool())).suggestName("native_" + name) := value
+        }
+        IO(Output(UInt(2.W))).suggestName("native_captured_ce") := physical.capturedCE
+        IO(Output(UInt(2.W))).suggestName("native_logical_ce") := physical.logicalCE
+        IO(Output(UInt(64.W))).suggestName("native_cut_cycle") := physical.cutCycle
+      }
+    }
+    val nativeOut = out.resolve("native")
+    Files.createDirectories(nativeOut)
+    for ((name, binding) <- Seq("enabled" -> new Binding, "missing-reset" -> new Binding(omitReset = true),
+        "missing-owner" -> new Binding(omitOwner = true))) {
+      implicit val p: Parameters = parameters(Some(binding))
+      val top = LazyModule(new FPGATop)
+      val destination = nativeOut.resolve(name)
+      if (name != "enabled") {
+        val error = intercept[Exception] {
+          (new ChiselStage).emitVerilog(top.module, Array("--target-dir", destination.toString))
+        }
+        assert(error.getMessage.contains("not fully initialized") &&
+          error.getMessage.contains(if (name == "missing-reset") "nativeCapture.reset" else "ownerFrozen"))
+      } else {
+        val rtl = (new ChiselStage).emitVerilog(top.module, Array("--target-dir", destination.toString))
+        assert(top.checkpointCapture.get.toHostStreamIdx == 1 && top.toCPUStreamParams.map(_.idx) == Seq(0, 1))
+        assert(rtl.contains("module CPUManagedStreamEngine") && rtl.contains("NativeStorageCheckpointStateAccess nativeCapture"))
+        val header = new StringBuilder
+        top.genHeader(header)
+        Files.write(destination.resolve("top_constants.h"), header.toString.getBytes(UTF_8))
+        val probe = NativeFunctionalBankProbe(reference.copy(annotations = reference.annotations ++ Seq(
+          NativeFunctionalBankProbeAnnotation, PhysicalClockCutPlanAnnotation,
+          SimulatorCheckpointInventoryAnnotation(reference.circuit.main),
+          midas.targetutils.xdc.XDCPathToCircuitAnnotation(None, None))))
+        probe.annotations.collect { case f: midas.stage.GoldenGateOutputFileAnnotation => f }.foreach { f =>
+          Files.write(destination.resolve("FireSim-generated" + f.fileSuffix), f.body.getBytes(UTF_8))
+        }
+        println(s"NATIVE_CHECKPOINT_TOP_ELABORATED out=$destination streams=2 checkpoint_stream=1")
+      }
+    }
+  }
 }
