@@ -35,7 +35,7 @@ object GeneratedStateBankAccess {
     GeneratedStateBankAnnotations.preflight(result.state)
     val doc = parse(result.binding)
     val binding = doc \ "annotation_translation"
-    require((binding \ "translation_version") == JInt(1) &&
+    require((binding \ "translation_version") == JInt(GeneratedStateBankAnnotations.translationVersion) &&
       (binding \ "translated_sha256") == JString(GeneratedStateBankAnnotations.translatedHash(result.state)),
       "checkpoint descriptors: missing or altered translated annotations")
     val root = result.state.circuit.modules.collectFirst {

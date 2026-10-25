@@ -94,7 +94,12 @@ class PhysicalClockGateContractSpec extends AnyFlatSpec {
       ModuleTarget(top.name, "Parent").instOf("gate", "Physical").ref("O"))
     val original = s.copy(annotations = Seq(cell, clocks, nested))
     val (translated, mappings) = GeneratedStateBankAnnotations.translate(original, clones)
-    assert(translated.collect { case a: InternalXDCAnnotation if a.formatString == clocks.formatString => a } == Seq(clocks))
+    val clockCopies = translated.collect { case a: InternalXDCAnnotation if a.formatString == clocks.formatString => a }
+    assert(clockCopies.size == 2)
+    assert(clockCopies.forall(_.argumentList.forall(_.module == top.name)))
+    assert(clockCopies.map(_.argumentList.head.path.map(_._1.value)) ==
+      Seq(Seq("left", "gate"), Seq("right", "gate")))
+    assert(clockCopies.forall(a => a.argumentList.map(_.path).distinct.size == 1))
     val nestedCopies = translated.collect { case a: XDCAnnotation => a }
     assert(nestedCopies.size == 2 && nestedCopies.forall(_.argumentList.head.path.head._2.value == "Physical"))
     assert(nestedCopies.map(_.argumentList.head.module).toSet == Set("LeftParent", "RightParent"))

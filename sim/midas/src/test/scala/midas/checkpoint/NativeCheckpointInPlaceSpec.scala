@@ -61,6 +61,9 @@ $connects
         top.ref("host_ticks"), top.instOf("stage", "Stage").instOf("network", "NativeStorage").ref("cycles")),
       XDCAnnotation(XDCFiles.Implementation,
         "set_false_path -to [get_pins {}]", leaf.instOf("gate", "Native").ref("CE")),
+      InternalXDCAnnotation(XDCFiles.Implementation,
+        "set_max_delay 9 -from [get_pins {}] -to [get_pins {}]",
+        ModuleTarget("NativeHost", "Native").ref("I"), ModuleTarget("NativeHost", "Native").ref("O")),
       XDCAnnotation(XDCFiles.Synthesis, RAMStyleHint.propertyTemplate(RAMStyles.DISTRIBUTED),
         top.instOf("stage", "Stage").instOf("network", "NativeStorage").ref("ram")))
     (h.copy(annotations = h.annotations ++ annotations), selected)
@@ -242,8 +245,6 @@ $connects
       top.ref("host_ticks"), ModuleTarget("NativeHost", "Stage").ref("control_ticks")), "common explicit root")
     reject(XDCAnnotation(XDCFiles.Implementation, "set_false_path -to {}",
       ModuleTarget("NativeHost", "Native").ref("hidden_latch")), "exact ground declaration")
-    reject(XDCAnnotation(XDCFiles.Implementation, "set_false_path -to {}",
-      ModuleTarget("NativeHost", "Native").ref("CE")), "concrete original instance root")
   }
 
   it should "preserve an unbanked sibling sharing the selected leaf and constrain each execution exactly once" in {
@@ -270,6 +271,29 @@ $connects
     }.mkString("\n")
     Seq("observer/gate/CE", "stage/network/left_/gate/CE", "stage/network/right_/gate/CE").foreach { path =>
       assert(constraints.sliding(path.length).count(_ == path) == 1)
+    }
+    val clocks = constraints.linesIterator.filter(_.startsWith("set_max_delay 9")).toSeq
+    assert(clocks.size == 3 && !clocks.exists(_.contains("checkpoint_physical_root_gate")))
+    Seq("observer/gate", "stage/network/left_/gate", "stage/network/right_/gate").foreach { path =>
+      assert(clocks.count(_ == s"set_max_delay 9 -from [get_pins $path/I] -to [get_pins $path/O]") == 1)
+    }
+  }
+
+  it should "keep selected primitive constraints on original gates after adding the mask gate" in {
+    val (h, original) = fixture
+    val constraint = XDCAnnotation(XDCFiles.Implementation,
+      "set_max_delay 11 -from [get_pins {}] -to [get_pins {}]",
+      ModuleTarget("NativeStorage", "Native").ref("I"), ModuleTarget("NativeStorage", "Native").ref("O"))
+    val r = original.copy(annotations = original.annotations :+ constraint)
+    val result = generate(h, r)
+    val lines = WriteXDCFile.execute(result.state.copy(annotations = result.state.annotations :+
+      XDCPathToCircuitAnnotation(None, Some("shell/CL")))).annotations.collect {
+      case a: XDCOutputAnnotation => a.fileBody
+    }.mkString("\n").linesIterator.filter(_.startsWith("set_max_delay 11")).toSeq
+    assert(lines.size == 2 && !lines.exists(_.contains("checkpoint_physical_root_gate")))
+    Seq("left_", "right_").foreach { side =>
+      val path = s"shell/CL/stage/network/$side/gate"
+      assert(lines.contains(s"set_max_delay 11 -from [get_pins $path/I] -to [get_pins $path/O]"))
     }
   }
 

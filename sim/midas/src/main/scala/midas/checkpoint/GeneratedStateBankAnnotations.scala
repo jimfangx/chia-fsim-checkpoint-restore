@@ -18,6 +18,7 @@ import midas.targetutils.xdc.{RAMStyleHint, RAMStyles, XDCAnnotation, XDCDestina
   * target applies only to the named subtree in each instance of its parent.
   */
 private[checkpoint] object GeneratedStateBankAnnotations {
+  val translationVersion = 2
   case class Clone(originalModule: String, originalPath: String, module: String, body: Module)
   private def fail(why: String): Nothing =
     throw new IllegalArgumentException(s"Generated checkpoint bank unsupported: $why")
@@ -272,13 +273,32 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     }
     def xdcCopies(args: Seq[ReferenceTarget]): Seq[Seq[ReferenceTarget]] = {
       if (args.isEmpty) return Seq(Nil)
-      // Native primitive definitions remain shared leaves, never fabricated
-      // storage clones. WriteXDCFile expands their local pin targets against
-      // the final concrete instance graph.
+      // A shared primitive definition may gain NEW executions (the root mask
+      // gate). Anchor its local pin constraints to the ORIGINAL executions,
+      // using the concrete root and renamed ancestor hops. Keeping a local
+      // primitive target would silently broaden the constraint after wiring.
+      // All arguments of one annotation follow the same physical execution.
       modules(args.head.module) match {
         case m: ExtModule =>
           PhysicalClockGateContract.validate(state, m)
-          return Seq(args)
+          val root = clones.filter(_.originalPath == state.circuit.main)
+          if (root.size != 1 || root.head.originalModule != state.circuit.main)
+            fail("physical XDC requires exactly one original circuit root clone")
+          val live = GeneratedExternalOwners.instances(state, state.circuit.main).toMap
+          return live.toSeq.filter(_._2.name == m.name).sortBy(_._1).map { case (execution, _) =>
+            var path = state.circuit.main
+            val hops = execution.stripPrefix(state.circuit.main + ".").split("\\.").toSeq.map { instance =>
+              path += "." + instance
+              val original = live.getOrElse(path, fail(s"missing physical XDC execution: $path"))
+              val emitted = original match {
+                case _: ExtModule => original.name
+                case _ => clones.find(_.originalPath == path).map(_.module)
+                  .getOrElse(fail(s"missing physical XDC ancestor clone: $path"))
+              }
+              (TargetToken.Instance(instance), TargetToken.OfModule(emitted))
+            }
+            args.map(a => a.copy(module = root.head.module, path = hops))
+          }
         case _ => ()
       }
       moduleClones(args.head.circuit, args.head.module).map { parent =>
@@ -398,7 +418,7 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     // from merging even stateless repeated helpers and returning stale clone
     // targets or an unowned DedupedResult side channel.
     val translated = (requested :+ firrtl.transforms.NoCircuitDedupAnnotation).distinct
-    val provenance = JObject(List("translation_version" -> JInt(1),
+    val provenance = JObject(List("translation_version" -> JInt(translationVersion),
       "source_sha256" -> JString(SemanticStateInventory.sha256(annotationJSON(state.annotations))),
       "translated_sha256" -> JString(SemanticStateInventory.sha256(annotationJSON(translated))),
       "mappings" -> JArray(mappings.toList)))

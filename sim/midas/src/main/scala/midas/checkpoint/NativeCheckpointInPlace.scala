@@ -34,20 +34,6 @@ object NativeCheckpointInPlace {
       manifest: String, plan: String, dependencies: String): Result = {
     check(host.form == LowForm && reference.form == LowForm, "resolved LowForm required")
     GeneratedStateBankAnnotations.preflight(host)
-    // A module-local primitive constraint would also expand onto the NEW root
-    // mask gate, which reuses that primitive definition. Until original physical
-    // executions have an explicit projection, require a concrete ancestor root.
-    // Never silently change the set of constrained cells when adding hardware.
-    Seq(host, reference).foreach { state =>
-      val opaque = state.circuit.modules.collect { case m: ExtModule => m.name }.toSet
-      state.annotations.foreach {
-        case a: midas.InternalXDCAnnotation => check(!a.argumentList.exists(t => opaque(t.module)),
-          "physical constraints require a concrete original instance root")
-        case a: midas.targetutils.xdc.XDCAnnotation => check(!a.argumentList.exists(t => opaque(t.module)),
-          "physical constraints require a concrete original instance root")
-        case _ => ()
-      }
-    }
     check(target.circuit == host.circuit.main && target.module == host.circuit.main,
       "instance must be rooted at the enclosing circuit")
     val modules = host.circuit.modules.map(m => m.name -> m).toMap
