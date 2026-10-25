@@ -9,6 +9,54 @@ import midas.checkpoint._
 import midas.widgets._
 import scala.collection.immutable.ListMap
 
+/** Validated emissions shared by both attachments. Construction is private to
+  * this package; callers cannot supply arbitrary RTL or a descriptor sidecar.
+  */
+private[core] case class NativeCheckpointCaptureEndpoint(root: ir.Module, clock: String,
+    descriptors: CheckpointCaptureDescriptors, rtl: String)
+
+private[core] object NativeCheckpointCaptureEndpoint {
+  private def rejectEnclosingSimulator(reference: CircuitState): Unit =
+    require(!reference.circuit.modules.exists(m => Set("F1Shim", "FPGATop", "SimWrapper", "TargetBox",
+      "CheckpointCaptureWidget", "CPUManagedStreamEngine").contains(m.name)),
+      "native capture attachment: enclosing simulator/control harness requires in-place production mapping; cannot embed a second simulator")
+
+  private def emit(state: CircuitState): String = {
+    val emitter = new SemanticCleanEmitter
+    val constrained = midas.passes.WriteXDCFile.execute(state.copy(annotations = state.annotations :+
+      midas.targetutils.xdc.XDCPathToCircuitAnnotation(None, None)))
+    new firrtl.stage.transforms.Compiler(
+      Seq(firrtl.options.Dependency.fromTransform(emitter)), firrtl.stage.Forms.LowForm, Set(emitter))
+      .execute(constrained.copy(annotations = constrained.annotations :+
+        firrtl.EmitCircuitAnnotation(emitter.getClass))).getEmittedCircuit.value
+  }
+  def standalone(reference: CircuitState, manifest: String, plan: String,
+      dependencies: String): NativeCheckpointCaptureEndpoint = {
+    rejectEnclosingSimulator(reference)
+    val banks = GeneratedStateBankAccess.generatePhysicalCompanion(reference, manifest, plan, dependencies)
+    val descriptors = CheckpointCaptureDescriptors.fromNativeGenerated(banks, reference, manifest, plan, dependencies)
+    val wired = PhysicalClockCutWiring.generateNative(reference, manifest, plan, dependencies, banks)
+    val files = NativeCheckpointStateAccess.emit(reference, manifest, plan, dependencies, banks, wired)
+    val root = reference.circuit.modules.find(_.name == reference.circuit.main).get.asInstanceOf[ir.Module]
+    val org.json4s.JString(clock) = org.json4s.native.JsonMethods.parse(plan) \ "common_source_clock"
+    NativeCheckpointCaptureEndpoint(root, clock, descriptors, emit(wired.state) + "\n" +
+      PhysicalClockStateBank.emit(reference, manifest, plan, dependencies)(1).body + "\n" +
+      files.filter(_.fileSuffix.endsWith(".sv")).map(_.body).mkString("\n"))
+  }
+  def inPlace(result: NativeCheckpointInPlaceContext.Result): NativeCheckpointCaptureEndpoint = {
+    // This elaboration attachment may contain an instrumented component host,
+    // but cannot nest an entire running FireSim inside another FPGATop. Actual
+    // production mapping must graft into the existing top after lowering.
+    rejectEnclosingSimulator(result.host)
+    val files = NativeCheckpointInPlaceAccess.emit(result)
+    val descriptors = NativeCheckpointInPlaceAccess.descriptors(result)
+    val root = result.host.circuit.modules.find(_.name == result.host.circuit.main).get.asInstanceOf[ir.Module]
+    val org.json4s.JString(clock) = org.json4s.native.JsonMethods.parse(result.native.binding) \ "enclosing_raw_clock"
+    NativeCheckpointCaptureEndpoint(root, clock, descriptors, emit(result.native.state) + "\n" +
+      files.filter(_.fileSuffix.endsWith(".sv")).map(_.body).mkString("\n"))
+  }
+}
+
 /** Elaboration attachment for an independently reconstructed native network.
   * The transport stays on FPGATop's raw clock; only functional clocks inside
   * the generated network are masked. The callback must supply every original
@@ -21,21 +69,25 @@ import scala.collection.immutable.ListMap
   */
 abstract class NativeCheckpointCaptureBinding(reference: CircuitState, manifest: String,
     plan: String, dependencies: String, owners: Seq[String], queueDepth: Int = 64)
+    extends NativeCheckpointCaptureEndpointBinding(
+      NativeCheckpointCaptureEndpoint.standalone(reference, manifest, plan, dependencies), owners, queueDepth)
+
+/** In-place component execution through the registered MMIO/CPU DMA widget.
+  * Global descriptor identities and raw ancestor clocks survive attachment.
+  * Complete production ownership and post-lowering top mapping remain required.
+  */
+abstract class NativeCheckpointInPlaceCaptureBinding(result: NativeCheckpointInPlaceContext.Result,
+    owners: Seq[String], queueDepth: Int = 64)
+    extends NativeCheckpointCaptureEndpointBinding(NativeCheckpointCaptureEndpoint.inPlace(result), owners, queueDepth)
+
+abstract class NativeCheckpointCaptureEndpointBinding private[core] (
+    endpoint: NativeCheckpointCaptureEndpoint, owners: Seq[String], queueDepth: Int)
     extends CheckpointCaptureTopBinding {
-  require(!reference.circuit.modules.exists(m => Set("F1Shim", "FPGATop", "SimWrapper", "TargetBox",
-    "CheckpointCaptureWidget", "CPUManagedStreamEngine").contains(m.name)),
-    "native capture attachment: enclosing simulator/control harness requires in-place production mapping; cannot embed a second simulator")
-  private val banks = GeneratedStateBankAccess.generatePhysicalCompanion(reference, manifest, plan, dependencies)
-  val descriptors = CheckpointCaptureDescriptors.fromNativeGenerated(banks, reference, manifest, plan, dependencies)
-  private val wired = PhysicalClockCutWiring.generateNative(reference, manifest, plan, dependencies, banks)
-  private val files = NativeCheckpointStateAccess.emit(reference, manifest, plan, dependencies, banks, wired)
+  val descriptors = endpoint.descriptors
   val params = CheckpointCaptureWidgetParams(descriptors.entries.size, descriptors.manifestSha256,
     owners, queueDepth, Some(descriptors), descriptors.physicalClockGates)
-  private val root = reference.circuit.modules.find(_.name == reference.circuit.main).get.asInstanceOf[ir.Module]
-  private val commonClock = (org.json4s.native.JsonMethods.parse(plan) \ "common_source_clock") match {
-    case org.json4s.JString(name) => name
-    case _ => throw new IllegalArgumentException("native capture attachment: missing common source clock")
-  }
+  private val root = endpoint.root
+  private val commonClock = endpoint.clock
   require(root.ports.exists(p => p.name == commonClock && p.direction == ir.Input && p.tpe == ir.ClockType),
     "native capture attachment: common source must be an original clock input")
 
@@ -67,18 +119,7 @@ abstract class NativeCheckpointCaptureBinding(reference: CircuitState, manifest:
   private class Network extends BlackBox with HasBlackBoxInline {
     override def desiredName = root.name + "CheckpointStateAccess"
     val io = IO(new NetworkPorts)
-    // Emit the same validated native clock/bank network used by the descriptor
-    // factory, without running the normal emitter's unrelated transformations.
-    private val emitter = new SemanticCleanEmitter
-    private val constrained = midas.passes.WriteXDCFile.execute(wired.state.copy(annotations = wired.state.annotations :+
-      midas.targetutils.xdc.XDCPathToCircuitAnnotation(None, None)))
-    private val rtl = new firrtl.stage.transforms.Compiler(
-      Seq(firrtl.options.Dependency.fromTransform(emitter)), firrtl.stage.Forms.LowForm, Set(emitter))
-      .execute(constrained.copy(annotations = constrained.annotations :+
-        firrtl.EmitCircuitAnnotation(emitter.getClass))).getEmittedCircuit.value
-    private val physicalBank = PhysicalClockStateBank.emit(reference, manifest, plan, dependencies)(1).body
-    setInline(desiredName + ".sv", rtl + "\n" + physicalBank + "\n" +
-      files.filter(f => f.fileSuffix.endsWith(".sv")).map(_.body).mkString("\n"))
+    setInline(desiredName + ".sv", endpoint.rtl)
   }
 
   /** Deliberately leaves all functional inputs and owner inputs uninitialized. */

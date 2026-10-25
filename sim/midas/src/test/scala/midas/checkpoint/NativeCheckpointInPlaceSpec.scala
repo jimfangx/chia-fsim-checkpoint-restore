@@ -13,14 +13,14 @@ import midas.InternalXDCAnnotation
 import midas.targetutils.xdc.{RAMStyleHint, RAMStyles, XDCAnnotation, XDCFiles, XDCPathToCircuitAnnotation}
 import midas.passes.{WriteXDCFile, XDCOutputAnnotation}
 
-class NativeCheckpointInPlaceSpec extends AnyFlatSpec {
-  private def reference: CircuitState = {
+object NativeCheckpointInPlaceFixture {
+  def reference: CircuitState = {
     val resource = scala.io.Source.fromResource("checkpoint/NativeStorage.firrtl")
     val source = try resource.mkString finally resource.close()
     new Compiler(Forms.LowForm).execute(CircuitState(Parser.parse(source), ChirrtlForm,
       Seq(firrtl.transforms.NoCircuitDedupAnnotation))).copy(form = LowForm)
   }
-  private def host(ref: CircuitState): CircuitState = {
+  def host(ref: CircuitState): CircuitState = {
     val root = ref.circuit.modules.find(_.name == ref.circuit.main).get
     def wrapper(name: String, child: String, instance: String, counter: String): String = {
       val ports = root.ports.map(p => "    " + p.serialize).mkString("\n")
@@ -45,9 +45,9 @@ $connects
     new Compiler(Forms.LowForm).execute(CircuitState(circuit, ChirrtlForm,
       Seq(firrtl.transforms.NoCircuitDedupAnnotation))).copy(form = LowForm)
   }
-  private val target = ModuleTarget("NativeHost", "NativeHost").instOf("stage", "Stage")
+  val target = ModuleTarget("NativeHost", "NativeHost").instOf("stage", "Stage")
     .instOf("network", "NativeStorage")
-  private def fixture: (CircuitState, CircuitState) = {
+  def fixture: (CircuitState, CircuitState) = {
     val h = host(reference)
     val selected = h.copy(circuit = h.circuit.copy(main = "NativeStorage",
       modules = h.circuit.modules.filterNot(m => Set("Stage", "NativeHost")(m.name))))
@@ -68,6 +68,25 @@ $connects
         top.instOf("stage", "Stage").instOf("network", "NativeStorage").ref("ram")))
     (h.copy(annotations = h.annotations ++ annotations), selected)
   }
+  def accessFixture: CircuitState = {
+    val (original, _) = fixture
+    original.copy(annotations = original.annotations.map {
+      case a: InternalXDCAnnotation if a.formatString ==
+          "set_max_delay 4 -from [get_cells {}] -to [get_cells {}]" =>
+        InternalXDCAnnotation(a.destinationFile,
+          "set_max_delay 4 -from [get_cells {}_reg*] -to [get_cells {}_reg*]", a.argumentList: _*)
+      case a: InternalXDCAnnotation if a.formatString ==
+          "set_max_delay 9 -from [get_pins {}] -to [get_pins {}]" =>
+        InternalXDCAnnotation(a.destinationFile,
+          "set_property DONT_TOUCH true [get_cells -of_objects [get_pins {}]]; " +
+          "set_property DONT_TOUCH true [get_cells -of_objects [get_pins {}]]", a.argumentList: _*)
+      case a => a
+    })
+  }
+}
+
+class NativeCheckpointInPlaceSpec extends AnyFlatSpec {
+  import NativeCheckpointInPlaceFixture._
   private def generate(h: CircuitState, r: CircuitState, t: InstanceTarget = target) = {
     val manifest = SimulatorStateInventory.discover(r)
     val plan = PhysicalClockCutPlan.discover(r, manifest)
@@ -233,23 +252,7 @@ $connects
   it should "connect functional and physical readout to the existing host on its proven raw clock" in {
     import org.json4s._
     import org.json4s.native.JsonMethods.parse
-    val (original, _) = fixture
-    // Use synthesis-valid source constraints for this execution fixture. The
-    // older structural fixture also tests clock-pin max-delay preservation;
-    // Vivado segments that artificial I->O path and drops its hold analysis.
-    // Here both primitive pins select the original cells for preservation.
-    val h = original.copy(annotations = original.annotations.map {
-      case a: InternalXDCAnnotation if a.formatString ==
-          "set_max_delay 4 -from [get_cells {}] -to [get_cells {}]" =>
-        InternalXDCAnnotation(a.destinationFile,
-          "set_max_delay 4 -from [get_cells {}_reg*] -to [get_cells {}_reg*]", a.argumentList: _*)
-      case a: InternalXDCAnnotation if a.formatString ==
-          "set_max_delay 9 -from [get_pins {}] -to [get_pins {}]" =>
-        InternalXDCAnnotation(a.destinationFile,
-          "set_property DONT_TOUCH true [get_cells -of_objects [get_pins {}]]; " +
-          "set_property DONT_TOUCH true [get_cells -of_objects [get_pins {}]]", a.argumentList: _*)
-      case a => a
-    })
+    val h = accessFixture
     val result = NativeCheckpointInPlaceContext.generate(h, target)
     val files = NativeCheckpointInPlaceAccess.emit(result, XDCPathToCircuitAnnotation(Some("host"), Some("host")))
     val rtl = files.find(_.fileSuffix == ".native-inplace-access.sv").get.body

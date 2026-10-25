@@ -326,4 +326,90 @@ class CheckpointCaptureTopSpec extends AnyFlatSpec {
       }
     }
   }
+
+  it should "capture an existing in-place host through registered MMIO and CPU DMA without masking its ancestors" in {
+    import midas.checkpoint._
+    val source = NativeCheckpointInPlaceFixture.accessFixture
+    val result = NativeCheckpointInPlaceContext.generate(source, NativeCheckpointInPlaceFixture.target)
+    class Binding(omitReset: Boolean = false, omitOwner: Boolean = false)
+        extends NativeCheckpointInPlaceCaptureBinding(result,
+          Seq("fixture.functional", "fixture.host"), queueDepth = 2) {
+      def connectOwnersAndFunctional(top: FPGATopImp, capture: CheckpointCaptureSideband,
+          functional: Map[String, Data]): Unit = {
+        assert(!functional.contains("clock"))
+        functional.foreach { case (name, port) =>
+          val external = if (Set("reset", "enable", "address", "data", "write").contains(name)) {
+            IO(Input(chiselTypeOf(port)))
+          } else IO(Output(chiselTypeOf(port)))
+          external.suggestName("native_" + name)
+          if (Set("reset", "enable", "address", "data", "write").contains(name)) {
+            if (!omitReset || name != "reset") port := external
+          } else external := port
+        }
+        val cycleFault = IO(Input(UInt(64.W))).suggestName("native_cycle_fault")
+        val ownerPresent = IO(Input(UInt(2.W))).suggestName("native_owner_present")
+        capture.targetCycle := functional("cycle").asUInt ^ cycleFault
+        capture.ownerPresent := ownerPresent
+        if (!omitOwner) capture.ownerFrozen := Fill(2, capture.freeze)
+        capture.ownerError := 0.U
+        val physical = capture.physical.get
+        // Public diagnostic outputs; the test does not drive internal signals.
+        Seq("mask" -> physical.clockMask, "stopped" -> physical.stopped,
+          "read_enable" -> physical.readEnable, "failed" -> physical.failed,
+          "freeze" -> capture.freeze).foreach { case (name, value) =>
+          IO(Output(Bool())).suggestName("native_" + name) := value
+        }
+        IO(Output(UInt(2.W))).suggestName("native_captured_ce") := physical.capturedCE
+        IO(Output(UInt(2.W))).suggestName("native_logical_ce") := physical.logicalCE
+        IO(Output(UInt(64.W))).suggestName("native_cut_cycle") := physical.cutCycle
+      }
+    }
+
+    val rejected = intercept[IllegalArgumentException] {
+      new NativeCheckpointInPlaceCaptureBinding(result.copy(dependencies = result.dependencies + " "),
+          Seq("fixture.functional", "fixture.host")) {
+        def connectOwnersAndFunctional(top: FPGATopImp, capture: CheckpointCaptureSideband,
+            functional: Map[String, Data]): Unit = ()
+      }
+    }
+    assert(rejected.getMessage.contains("changed source, network, context or identity"))
+    val enclosing = source.copy(circuit = source.circuit.copy(modules = source.circuit.modules :+
+      firrtl.ir.Module(firrtl.ir.NoInfo, "FPGATop", Nil, firrtl.ir.EmptyStmt)))
+    val rejectedTop = intercept[IllegalArgumentException] {
+      new NativeCheckpointInPlaceCaptureBinding(result.copy(host = enclosing), Seq("fixture.functional")) {
+        def connectOwnersAndFunctional(top: FPGATopImp, capture: CheckpointCaptureSideband,
+            functional: Map[String, Data]): Unit = ()
+      }
+    }
+    assert(rejectedTop.getMessage.contains("cannot embed a second simulator"))
+    for ((name, binding) <- Seq("enabled" -> new Binding, "missing-reset" -> new Binding(omitReset = true),
+        "missing-owner" -> new Binding(omitOwner = true))) {
+      implicit val p: Parameters = parameters(Some(binding))
+      val top = LazyModule(new FPGATop)
+      val destination = out.resolve("native-inplace").resolve(name)
+      if (name != "enabled") {
+        val error = intercept[Exception] {
+          (new ChiselStage).emitVerilog(top.module, Array("--target-dir", destination.toString))
+        }
+        assert(error.getMessage.contains("not fully initialized") &&
+          error.getMessage.contains(if (name == "missing-reset") "nativeCapture.reset" else "ownerFrozen"))
+      } else {
+        val rtl = (new ChiselStage).emitVerilog(top.module, Array("--target-dir", destination.toString))
+        assert(top.checkpointCapture.get.toHostStreamIdx == 1 && top.toCPUStreamParams.map(_.idx) == Seq(0, 1))
+        assert(rtl.contains("NativeHostCheckpointStateAccess nativeCapture"))
+        val header = new StringBuilder
+        top.genHeader(header)
+        Files.write(destination.resolve("top_constants.h"), header.toString.getBytes(UTF_8))
+        assert(header.toString.contains(binding.descriptors.bindingSha256))
+        assert(binding.descriptors.manifest == result.native.identity.manifest)
+        val constraintOut = destination.resolve("attachment")
+        Files.createDirectories(constraintOut)
+        NativeCheckpointInPlaceAccess.emit(result,
+          midas.targetutils.xdc.XDCPathToCircuitAnnotation(Some("nativeCapture"), Some("nativeCapture")))
+          .filter(a => a.fileSuffix.endsWith(".xdc") || a.fileSuffix.endsWith("-constraints.json")).foreach(a =>
+            Files.write(constraintOut.resolve("FireSim-generated" + a.fileSuffix), a.body.getBytes(UTF_8)))
+        println(s"NATIVE_INPLACE_TOP_ELABORATED out=$destination existing_execution=1 checkpoint_stream=1 complete_fpga_capture=false")
+      }
+    }
+  }
 }

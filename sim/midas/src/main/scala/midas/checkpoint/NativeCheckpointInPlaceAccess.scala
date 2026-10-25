@@ -21,6 +21,18 @@ import scala.io.Source
 object NativeCheckpointInPlaceAccess {
   import SemanticStateInventory.{canonical, sha256}
 
+  /** Reconstruct global descriptors without exposing internal context policy. */
+  def descriptors(result: NativeCheckpointInPlaceContext.Result): CheckpointCaptureDescriptors = {
+    NativeCheckpointInPlaceContext.validate(result, result.state)
+    val target = Target.deserialize((parse(result.binding) \ "target").asInstanceOf[JString].s) match {
+      case t: firrtl.annotations.InstanceTarget => t
+      case _ => throw new IllegalArgumentException("native in-place access: concrete target required")
+    }
+    CheckpointCaptureDescriptors.fromNativeInPlace(
+      result.host.copy(annotations = result.host.annotations.filterNot(SimulatorBankProbeContext.accepts)),
+      target, result.reference, result.manifest, result.plan, result.dependencies)
+  }
+
   def emit(result: NativeCheckpointInPlaceContext.Result,
       placement: XDCPathToCircuitAnnotation = XDCPathToCircuitAnnotation(None, None)):
       Seq[GoldenGateOutputFileAnnotation] = {
@@ -43,9 +55,7 @@ object NativeCheckpointInPlaceAccess {
       rebuilt.native.annotationProjection == result.native.annotationProjection &&
       rebuilt.native.generatedAnnotations.toVector == result.native.generatedAnnotations.toVector,
       "native in-place access: changed source, network, context or identity")
-    val descriptors = CheckpointCaptureDescriptors.fromNativeInPlace(
-      result.host.copy(annotations = result.host.annotations.filterNot(SimulatorBankProbeContext.accepts)),
-      target, result.reference, result.manifest, result.plan, result.dependencies)
+    val descriptors = NativeCheckpointInPlaceAccess.descriptors(result)
     val root = result.host.circuit.modules.find(_.name == result.host.circuit.main).get.asInstanceOf[Module]
     val name = root.name + "CheckpointStateAccess"
     val ce = PhysicalClockStateBank.emit(result.reference, result.manifest, result.plan, result.dependencies)
