@@ -4,11 +4,14 @@ package midas.checkpoint
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Paths}
 import firrtl.{ChirrtlForm, CircuitState, LowForm, Parser, WRef}
-import firrtl.annotations.{InstanceTarget, ModuleTarget}
+import firrtl.annotations.{InstanceTarget, JsonProtocol, ModuleTarget, NoTargetAnnotation}
 import firrtl.ir._
 import firrtl.stage.Forms
 import firrtl.stage.transforms.Compiler
 import org.scalatest.flatspec.AnyFlatSpec
+import midas.InternalXDCAnnotation
+import midas.targetutils.xdc.{RAMStyleHint, RAMStyles, XDCAnnotation, XDCFiles, XDCPathToCircuitAnnotation}
+import midas.passes.{WriteXDCFile, XDCOutputAnnotation}
 
 class NativeCheckpointInPlaceSpec extends AnyFlatSpec {
   private def reference: CircuitState = {
@@ -48,7 +51,19 @@ $connects
     val h = host(reference)
     val selected = h.copy(circuit = h.circuit.copy(main = "NativeStorage",
       modules = h.circuit.modules.filterNot(m => Set("Stage", "NativeHost")(m.name))))
-    (h, selected)
+    val top = ModuleTarget("NativeHost", "NativeHost")
+    val leaf = ModuleTarget("NativeHost", "Leaf")
+    val annotations = Seq(
+      // A parent-rooted constraint correlates a raw control register with a
+      // selected descendant; a module-local constraint expands once per leaf.
+      InternalXDCAnnotation(XDCFiles.Implementation,
+        "set_max_delay 4 -from [get_cells {}] -to [get_cells {}]",
+        top.ref("host_ticks"), top.instOf("stage", "Stage").instOf("network", "NativeStorage").ref("cycles")),
+      XDCAnnotation(XDCFiles.Implementation,
+        "set_false_path -to [get_pins {}]", leaf.instOf("gate", "Native").ref("CE")),
+      XDCAnnotation(XDCFiles.Synthesis, RAMStyleHint.propertyTemplate(RAMStyles.DISTRIBUTED),
+        top.instOf("stage", "Stage").instOf("network", "NativeStorage").ref("ram")))
+    (h.copy(annotations = h.annotations ++ annotations), selected)
   }
   private def generate(h: CircuitState, r: CircuitState, t: InstanceTarget = target) = {
     val manifest = SimulatorStateInventory.discover(r)
@@ -58,8 +73,9 @@ $connects
   }
   private def emit(s: CircuitState): String = {
     val emitter = new SemanticCleanEmitter
+    val constrained = WriteXDCFile.execute(s.copy(annotations = s.annotations :+ XDCPathToCircuitAnnotation(None, None)))
     new Compiler(Seq(firrtl.options.Dependency.fromTransform(emitter)), Forms.LowForm, Set(emitter))
-      .execute(s.copy(annotations = s.annotations :+ firrtl.EmitCircuitAnnotation(emitter.getClass)))
+      .execute(constrained.copy(annotations = constrained.annotations :+ firrtl.EmitCircuitAnnotation(emitter.getClass)))
       .getEmittedCircuit.value
   }
 
@@ -81,6 +97,7 @@ $connects
     def save(name: String, body: String): Unit = Files.write(out.resolve(name), body.getBytes(UTF_8))
     save("host.fir", h.circuit.serialize); save("instrumented.fir", result.state.circuit.serialize)
     save("instrumented.sv", emit(result.state)); save("binding.json", result.binding)
+    saveAnnotations(h, result, save)
     saveIdentity(result, save)
     // Retain separately reconstructed selected-subtree banks/clock provenance.
     val probe = NativeFunctionalBankProbe(r.copy(annotations = r.annotations ++ Seq(
@@ -104,9 +121,9 @@ $connects
       case m => m
     }))
     assert(intercept[IllegalArgumentException](generate(h, stale)).getMessage.contains("stale or different"))
-    assert(intercept[IllegalArgumentException](generate(h.copy(annotations = h.annotations :+
-      firrtl.transforms.DontTouchAnnotation(ModuleTarget("NativeHost", "NativeHost").ref("host_ticks"))), r))
-      .getMessage.contains("host annotation projection unsupported"))
+    case object UnknownOwner extends NoTargetAnnotation
+    assert(intercept[IllegalArgumentException](generate(h.copy(annotations = h.annotations :+ UnknownOwner), r))
+      .getMessage.contains("explicit clone/rename translation"))
     assert(intercept[IllegalArgumentException](generate(h, r,
       ModuleTarget("NativeHost", "NativeHost").instOf("missing", "Stage").instOf("network", "NativeStorage")))
       .getMessage.contains("instance path mismatch"))
@@ -161,6 +178,7 @@ $connects
     save("host.fir", h.circuit.serialize); save("instrumented.fir", result.state.circuit.serialize)
     save("source-input.json", s"""{"path":"${source.toAbsolutePath}","sha256":"${SemanticStateInventory.sha256(text)}","scope":"retained exact-recipe structural input; no production annotations or capture admission"}""")
     save("binding.json", result.binding)
+    saveAnnotations(h, result, save)
     saveIdentity(result, save)
     val probe = NativeFunctionalBankProbe(r.copy(annotations = r.annotations ++ Seq(
       NativeFunctionalBankProbeAnnotation, PhysicalClockCutPlanAnnotation,
@@ -177,6 +195,82 @@ $connects
     save("global-simulator-state.json", identity.simulatorManifest)
     save("global-physical-clock-plan.json", identity.clockPlan)
     save("global-physical-clock-dependencies.json", identity.dependencies)
+  }
+
+  private def saveAnnotations(h: CircuitState, result: NativeCheckpointInPlace.Result,
+      save: (String, String) => Unit): Unit = {
+    def json(as: firrtl.AnnotationSeq) = JsonProtocol.serialize(as.distinct.sortBy(_.serialize))
+    save("host-annotations.json", json(h.annotations))
+    save("instrumented-annotations.json", json(result.state.annotations))
+    save("generated-annotations.json", json(result.generatedAnnotations))
+    save("annotation-projection.json", result.annotationProjection)
+    WriteXDCFile.execute(result.state.copy(annotations = result.state.annotations :+
+      XDCPathToCircuitAnnotation(None, Some("shell/CL")))).annotations.collect {
+      case a: XDCOutputAnnotation => a
+    }.foreach(a => save("instrumented" + a.suffix.get, a.fileBody))
+  }
+
+  it should "project correlated host constraints and preservation into actual specialized executions" in {
+    val (h, r) = fixture
+    val touch = firrtl.transforms.DontTouchAnnotation(ModuleTarget("NativeHost", "Leaf").ref("value"))
+    val result = generate(h.copy(annotations = h.annotations :+ touch), r)
+    val touched = result.state.annotations.collect { case a: firrtl.transforms.DontTouchAnnotation => a.target }
+    assert(touched.size == 2 && touched.forall(_.module != "Leaf"))
+    assert(touched.map(_.module).distinct.size == 2 && touched.forall(_.circuit == "NativeHost"))
+    val constraints = WriteXDCFile.execute(result.state.copy(annotations = result.state.annotations :+
+      XDCPathToCircuitAnnotation(None, Some("shell/CL")))).annotations.collect {
+      case a: XDCOutputAnnotation => a.fileBody
+    }.mkString("\n")
+    assert(constraints.contains("-from [get_cells shell/CL/host_ticks] -to [get_cells shell/CL/stage/network/cycles]"))
+    Seq("left_", "right_").foreach(i => assert(constraints.contains(s"shell/CL/stage/network/$i/gate/CE")))
+    assert(constraints.contains("stage/network/ram"))
+    assert(!constraints.contains("NativeStorage") && !constraints.contains("Leaf"))
+    assert(!result.binding.contains("\"complete_fpga_capture\":true"))
+  }
+
+  it should "reject stale, foreign, cross-root and hidden-pin host constraints before emission" in {
+    val (h, r) = fixture
+    def reject(a: firrtl.annotations.Annotation, message: String): Unit = {
+      assert(intercept[IllegalArgumentException](generate(h.copy(annotations = h.annotations :+ a), r))
+        .getMessage.contains(message))
+    }
+    val top = ModuleTarget("NativeHost", "NativeHost")
+    reject(firrtl.transforms.DontTouchAnnotation(top.ref("missing")), "declaration/kind mismatch")
+    reject(XDCAnnotation(XDCFiles.Implementation, "set_false_path -to [get_pins {}]",
+      ModuleTarget("Foreign", "NativeHost").ref("clock")), "foreign XDC")
+    reject(XDCAnnotation(XDCFiles.Implementation, "set_max_delay 4 -from {} -to {}",
+      top.ref("host_ticks"), ModuleTarget("NativeHost", "Stage").ref("control_ticks")), "common explicit root")
+    reject(XDCAnnotation(XDCFiles.Implementation, "set_false_path -to {}",
+      ModuleTarget("NativeHost", "Native").ref("hidden_latch")), "exact ground declaration")
+    reject(XDCAnnotation(XDCFiles.Implementation, "set_false_path -to {}",
+      ModuleTarget("NativeHost", "Native").ref("CE")), "concrete original instance root")
+  }
+
+  it should "preserve an unbanked sibling sharing the selected leaf and constrain each execution exactly once" in {
+    val (h, r) = fixture
+    val additions = Parser.parse("""circuit Extra :
+  module Extra :
+    inst observer of Leaf
+    observer.clock <= clock
+    observer.reset <= reset
+    observer.enable <= UInt<1>(1)
+""").modules.head.asInstanceOf[Module].body
+    val circuit = h.circuit.copy(modules = h.circuit.modules.map {
+      case m: Module if m.name == "NativeHost" => m.copy(body = Block(Seq(m.body, additions)))
+      case m => m
+    })
+    val working = firrtl.passes.ToWorkingIR.run(circuit)
+    val typed = firrtl.passes.InferTypes.run(firrtl.passes.ResolveKinds.run(working))
+    val enclosing = h.copy(circuit = firrtl.passes.ResolveFlows.run(typed))
+    val result = generate(enclosing, r)
+    assert(result.state.circuit.modules.find(_.name == "Leaf") == h.circuit.modules.find(_.name == "Leaf"))
+    val constraints = WriteXDCFile.execute(result.state.copy(annotations = result.state.annotations :+
+      XDCPathToCircuitAnnotation(None, None))).annotations.collect {
+      case a: XDCOutputAnnotation => a.fileBody
+    }.mkString("\n")
+    Seq("observer/gate/CE", "stage/network/left_/gate/CE", "stage/network/right_/gate/CE").foreach { path =>
+      assert(constraints.sliding(path.length).count(_ == path) == 1)
+    }
   }
 
   it should "use original global identities while preserving local selectors and declaring every uncovered owner" in {
