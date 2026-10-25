@@ -152,7 +152,7 @@ class NativeFunctionalBankSpec extends AnyFlatSpec {
     val result = NativeFunctionalBankProbe(requested)
     assert(result.circuit == original.circuit)
     val files = result.annotations.collect { case a: midas.stage.GoldenGateOutputFileAnnotation => a }
-    assert(files.size == 29 && files.map(_.fileSuffix).distinct.size == 29)
+    assert(files.size == 32 && files.map(_.fileSuffix).distinct.size == 32)
     val receipt = parse(files.find(_.fileSuffix == ".native-functional-emission.json").get.body)
     assert((receipt \ "deployable_capture_image") == JBool(false))
     files.filter(f => f.fileSuffix.startsWith(".native-functional") && f.fileSuffix != ".native-functional-emission.json").foreach { f =>

@@ -83,6 +83,118 @@ $connects
   }
 
   behavior.of("Native checkpoint in-place instrumentation")
+  it should "bind complete compiler context separately and reject downstream drift at either boundary" in {
+    val (h, _) = fixture
+    val contexts = Seq(
+      midas.stage.ConfigPackageAnnotation("fixture"), midas.stage.ConfigStringAnnotation("NativeFixture"),
+      midas.stage.GoldenGateOutputFileAnnotation("`define NATIVE_WIDTH 8\n", ".defines.vh"),
+      midas.passes.ChannelClockInfoAnnotation(Map("native_channel" ->
+        firesim.lib.bridgeutils.RationalClock("native_core", 2, 4))))
+    val source = h.copy(annotations = h.annotations ++ contexts)
+    val result = NativeCheckpointInPlaceContext.generate(source, target)
+    NativeCheckpointInPlaceContext.validate(result, result.state)
+    assert(result.state.circuit == result.native.state.circuit)
+    assert(contexts.forall(result.state.annotations.contains))
+    val changes = Seq(result.state.annotations.filterNot(_ == contexts.head),
+      result.state.annotations.map {
+        case a: midas.stage.ConfigStringAnnotation => a.copy(configString = "ChangedFixture")
+        case a => a
+      }, result.state.annotations :+ midas.stage.ConfigPackageAnnotation("changed"))
+    changes.foreach { annotations =>
+      val changed = result.state.copy(annotations = annotations)
+      intercept[IllegalArgumentException](NativeCheckpointInPlaceContext.validate(result, changed))
+      intercept[IllegalArgumentException](NativeCheckpointInPlaceContext.validate(result.copy(state = changed), result.state))
+    }
+    intercept[IllegalArgumentException](NativeCheckpointInPlaceContext.generate(
+      source.copy(annotations = source.annotations :+ contexts.head), target))
+    case object HiddenContextOwner extends NoTargetAnnotation
+    assert(intercept[IllegalArgumentException](NativeCheckpointInPlaceContext.generate(
+      source.copy(annotations = source.annotations :+ HiddenContextOwner), target)).getMessage
+      .contains("explicit clone/rename translation"))
+    val out = Paths.get(sys.env("CHECKPOINT_TEST_ARTIFACT_DIR")).resolve("native-inplace-context")
+    saveContext(result, out)
+    println(s"NATIVE_INPLACE_CONTEXT out=$out retained_context=${contexts.size}")
+  }
+
+  it should "project the actual exact Rocket annotations and compiler context without granting image admission" in {
+    val input = Paths.get(sys.props.getOrElse("checkpoint.inplace.rocket.production",
+      fail("checkpoint.inplace.rocket.production must identify the current annotated exact-recipe source")))
+    def read(suffix: String): String = new String(Files.readAllBytes(Paths.get(input.toString + suffix)), UTF_8)
+    val working = firrtl.passes.ToWorkingIR.run(Parser.parse(read("-reference.fir")))
+    val typed = firrtl.passes.InferTypes.run(firrtl.passes.ResolveKinds.run(working))
+    // JsonProtocol omits the nested class hint in DeletedAnnotation. Recover
+    // only the two stage-consumed input events, then require an exact JSON
+    // round trip. A deleted owner or pass request is never a context exemption.
+    import org.json4s._
+    import org.json4s.native.JsonMethods.parse
+    val rawContext = parse(read("-context.anno.json")).asInstanceOf[JArray].arr
+    val contexts = rawContext.flatMap { value =>
+      if ((value \ "class") == JString("firrtl.annotations.DeletedAnnotation")) {
+        val JString(file) = value \ "anno" \ "file"
+        val annotation = (value \ "xFormName") match {
+          case JString("firrtl.stage.phases.AddCircuit") => firrtl.annotations.DeletedAnnotation(
+            "firrtl.stage.phases.AddCircuit", firrtl.stage.FirrtlFileAnnotation(file))
+          case JString("firrtl.options.phases.GetIncludes") => firrtl.annotations.DeletedAnnotation(
+            "firrtl.options.phases.GetIncludes", firrtl.options.InputAnnotationFileAnnotation(file))
+          case _ => fail("unsupported deleted input context")
+        }
+        assert(parse(JsonProtocol.serialize(Seq(annotation))) == JArray(List(value)))
+        Seq(annotation)
+      } else JsonProtocol.deserialize(SemanticStateInventory.canonical(JArray(List(value))))
+    }
+    val owners = JsonProtocol.deserialize(read("-reference.anno.json"))
+    def isXDC(a: firrtl.annotations.Annotation): Boolean = a match {
+      case _: InternalXDCAnnotation | _: XDCAnnotation => true
+      case _ => false
+    }
+    // The companion's JSON is normalized for hashing. Its translation binding
+    // also retains the ORIGINAL order, which matters to downstream XDC. Restore
+    // that order rather than letting lexical JSON order become compiler policy.
+    def normalized(s: String): String = s.replace(",ArraySeq(", ",List(")
+    val originalOrder = (parse(read("-binding.json")) \ "annotation_translation" \ "mappings")
+      .asInstanceOf[JArray].arr.map(r => (r \ "source").asInstanceOf[JString].s).filter(s =>
+        s.startsWith("XDCAnnotation(") || s.startsWith("InternalXDCAnnotation(")).map(normalized)
+    val bySource = owners.filter(isXDC).map(a => normalized(a.serialize) -> a).toMap
+    assert(originalOrder.size == 7 && bySource.size == originalOrder.size &&
+      originalOrder.distinct.size == originalOrder.size && originalOrder.forall(bySource.contains))
+    val ordered = originalOrder.map(bySource).iterator
+    val annotations = owners.map(a => if (isXDC(a)) ordered.next() else a) ++ contexts
+    assert(!ordered.hasNext)
+    val h = CircuitState(firrtl.passes.ResolveFlows.run(typed), LowForm, annotations)
+    assert(annotations.size > 1 && annotations.exists(_.isInstanceOf[midas.passes.ChannelClockInfoAnnotation]))
+    val t = ModuleTarget("F1Shim", "F1Shim").instOf("top", "FPGATop").instOf("sim", "SimWrapper")
+    val result = NativeCheckpointInPlaceContext.generate(h, t)
+    NativeCheckpointInPlaceContext.validate(result, result.state)
+    assert(result.native.identity.entries.size == 10151)
+    val out = Paths.get(sys.env("CHECKPOINT_TEST_ARTIFACT_DIR")).resolve("native-inplace-rocket-production")
+    saveContext(result, out)
+    val constrained = WriteXDCFile.execute(result.state.copy(annotations = result.state.annotations :+
+      XDCPathToCircuitAnnotation(None, Some("shell/CL"))))
+    constrained.annotations.collect { case a: XDCOutputAnnotation => a }.foreach(a =>
+      Files.write(out.resolve("instrumented" + a.suffix.get), a.fileBody.getBytes(UTF_8)))
+    println(s"NATIVE_INPLACE_ROCKET_PRODUCTION out=$out annotations=${annotations.size} complete_fpga_capture=false")
+  }
+
+  private def saveContext(result: NativeCheckpointInPlaceContext.Result, out: java.nio.file.Path): Unit = {
+    Files.createDirectories(out)
+    def save(name: String, body: String): Unit = Files.write(out.resolve(name), body.getBytes(UTF_8))
+    def json(as: firrtl.AnnotationSeq) = JsonProtocol.serialize(as.distinct.sortBy(_.serialize))
+    save("host.fir", result.host.circuit.serialize)
+    save("host-annotations.json", json(result.host.annotations))
+    save("host-storage-annotations.json", json(result.host.annotations.filterNot(SimulatorBankProbeContext.accepts)))
+    save("host-context-annotations.json", json(result.host.annotations.filter(SimulatorBankProbeContext.accepts)))
+    save("instrumented.fir", result.state.circuit.serialize)
+    save("instrumented-annotations.json", json(result.state.annotations))
+    save("instrumented-storage-annotations.json", json(result.native.state.annotations))
+    save("reference.fir", result.reference.circuit.serialize)
+    save("reference-annotations.json", json(result.reference.annotations))
+    save("binding.json", result.binding); save("compiler-context.json", result.context)
+    save("native-binding.json", result.native.binding)
+    save("annotation-projection.json", result.native.annotationProjection)
+    save("generated-annotations.json", json(result.native.generatedAnnotations))
+    save("global-identity.json", result.native.identity.manifest)
+  }
+
   it should "instrument the existing execution and keep both ancestor control clocks raw" in {
     val (h, r) = fixture; val result = generate(h, r)
     val paths = GeneratedExternalOwners.instances(result.state, "NativeHost").map(_._1)

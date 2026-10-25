@@ -46,15 +46,15 @@ object NativeFunctionalBankProbe {
   def apply(input: CircuitState): CircuitState = {
     validateRequest(input)
     if (!input.annotations.contains(NativeFunctionalBankProbeAnnotation)) return input
-    val owners = input.annotations.filterNot {
+    val storageAndContext = input.annotations.filterNot {
       case NativeFunctionalBankProbeAnnotation | PhysicalClockCutPlanAnnotation | PhysicalClockCutWiringProbeAnnotation |
            SimulatorFPGASynthesisConstantsAnnotation | _: SimulatorCheckpointInventoryAnnotation |
            _: midas.stage.phases.ConfigParametersAnnotation | _: firrtl.EmitCircuitAnnotation |
            _: firrtl.transforms.BlackBoxTargetDirAnno | _: midas.targetutils.xdc.XDCPathToCircuitAnnotation => true
       case a: GoldenGateOutputFileAnnotation if SimulatorFPGASynthesisConstants.isProvenanceFile(a) => true
-      case a if SimulatorBankProbeContext.accepts(a) => true
       case _ => false
     }
+    val (context, owners) = storageAndContext.partition(SimulatorBankProbeContext.accepts)
     val reference = input.copy(annotations = owners)
     val manifest = SimulatorStateInventory.discover(reference)
     val plan = PhysicalClockCutPlan.discover(reference, manifest)
@@ -80,6 +80,10 @@ object NativeFunctionalBankProbe {
     val rtl = emitted.getEmittedCircuit.value
     val files = Seq(
       ".native-functional-reference.fir" -> reference.circuit.serialize,
+      ".native-functional-reference.anno.json" -> firrtl.annotations.JsonProtocol.serialize(owners.distinct.sortBy(_.serialize)),
+      ".native-functional-context.anno.json" -> firrtl.annotations.JsonProtocol.serialize(context.distinct.sortBy(_.serialize)),
+      ".native-functional-context.json" -> SimulatorBankProbeContext.snapshot(context,
+        reference.circuit.serialize, generated.state.circuit.serialize),
       ".native-functional-simulator-state.json" -> manifest,
       ".native-functional-plan.json" -> plan,
       ".native-functional-dependencies.json" -> deps,
@@ -90,7 +94,7 @@ object NativeFunctionalBankProbe {
         case a: midas.passes.XDCOutputAnnotation => (".native-functional" + a.suffix.get) -> a.fileBody
       }
     val binding = canonical(JObject(List(
-      "binding_version" -> JInt(1), "scope" -> JString("native_functional_readout_companion_only"),
+      "binding_version" -> JInt(2), "scope" -> JString("native_functional_readout_companion_only"),
       "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
       "production_freeze_owners_bound" -> JBool(false), "metasim_restore_supported" -> JBool(false),
       "inputs" -> JObject(files.map { case (name, body) => name -> JString(sha256(body)) }.toList))))
