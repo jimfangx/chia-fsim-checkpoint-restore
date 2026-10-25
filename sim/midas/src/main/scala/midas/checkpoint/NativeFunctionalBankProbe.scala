@@ -38,7 +38,7 @@ object NativeFunctionalBankProbe {
     if (state.annotations.exists {
       case a: GoldenGateOutputFileAnnotation =>
         a.fileSuffix.startsWith(".native-functional") || a.fileSuffix.startsWith(".native-descriptors") ||
-          a.fileSuffix.startsWith(".native-clock-cut")
+          a.fileSuffix.startsWith(".native-clock-cut") || a.fileSuffix.startsWith(".native-state-access")
       case _ => false
     }) fail("existing native companion output")
   }
@@ -130,7 +130,8 @@ object NativeFunctionalBankProbe {
       "inputs" -> JObject((wiredFiles ++ Seq(
         ".native-functional-emission.json" -> binding, ".native-descriptors-emission.json" -> descriptorBinding))
         .map { case (name, body) => name -> JString(sha256(body)) }.toList))))
-    input.copy(annotations = input.annotations ++ (files ++ descriptorFiles ++ wiredFiles).map { case (name, body) =>
+    val stateAccessFiles = NativeCheckpointStateAccess.emit(reference, manifest, plan, deps, generated, wired)
+    input.copy(annotations = input.annotations ++ stateAccessFiles ++ (files ++ descriptorFiles ++ wiredFiles).map { case (name, body) =>
       GoldenGateOutputFileAnnotation(body, name)
     } ++ Seq(GoldenGateOutputFileAnnotation(binding, ".native-functional-emission.json"),
       GoldenGateOutputFileAnnotation(descriptorBinding, ".native-descriptors-emission.json"),

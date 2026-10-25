@@ -152,7 +152,7 @@ class NativeFunctionalBankSpec extends AnyFlatSpec {
     val result = NativeFunctionalBankProbe(requested)
     assert(result.circuit == original.circuit)
     val files = result.annotations.collect { case a: midas.stage.GoldenGateOutputFileAnnotation => a }
-    assert(files.size == 23 && files.map(_.fileSuffix).distinct.size == 23)
+    assert(files.size == 26 && files.map(_.fileSuffix).distinct.size == 26)
     val receipt = parse(files.find(_.fileSuffix == ".native-functional-emission.json").get.body)
     assert((receipt \ "deployable_capture_image") == JBool(false))
     files.filter(f => f.fileSuffix.startsWith(".native-functional") && f.fileSuffix != ".native-functional-emission.json").foreach { f =>
@@ -173,7 +173,8 @@ class NativeFunctionalBankSpec extends AnyFlatSpec {
     }
     intercept[IllegalArgumentException] { NativeFunctionalBankProbe(result) }
     Seq(".native-descriptors.json", ".native-descriptors-host.inc", ".native-descriptors-emission.json",
-      ".native-clock-cut.sv", ".native-clock-cut-emission.json").foreach { suffix =>
+      ".native-clock-cut.sv", ".native-clock-cut-emission.json", ".native-state-access.sv",
+      ".native-state-access-router.sv", ".native-state-access.json").foreach { suffix =>
       intercept[IllegalArgumentException] { NativeFunctionalBankProbe(requested.copy(annotations =
         requested.annotations :+ midas.stage.GoldenGateOutputFileAnnotation("existing", suffix))) }
     }
@@ -183,6 +184,36 @@ class NativeFunctionalBankSpec extends AnyFlatSpec {
     }
     intercept[IllegalArgumentException] { NativeFunctionalBankProbe(requested.copy(
       annotations = requested.annotations :+ SimulatorBankProbeAnnotation)) }
+  }
+
+  it should "connect the exact native banks and physical CE endpoint through one raw-clock router" in {
+    val s = input
+    val m = SimulatorStateInventory.discover(s); val p = PhysicalClockCutPlan.discover(s, m)
+    val d = PhysicalClockCutDependencies.discover(s, m, p)
+    val b = GeneratedStateBankAccess.generatePhysicalCompanion(s, m, p, d)
+    val w = PhysicalClockCutWiring.generateNative(s, m, p, d, b)
+    val files = NativeCheckpointStateAccess.emit(s, m, p, d, b, w)
+    val rtl = files.head.body; val binding = parse(files.last.body)
+    assert(rtl.contains("NativeStorage network(") && rtl.contains("NativeStorageCheckpointPhysicalCEBank ce_endpoint("))
+    assert(rtl.contains(".ckpt_clock(clock),.ckpt_reset(capture_reset),.ckpt_freeze(capture_clock_mask)"))
+    assert(rtl.contains(".clock(clock),.reset(capture_reset),.read_enable(capture_read_enable)"))
+    assert((binding \ "functional_entries") == JInt(5) && (binding \ "physical_clock_gates") == JInt(2))
+    assert((binding \ "endpoint_sha256") == JString(SemanticStateInventory.sha256(rtl)))
+    assert((binding \ "router_sha256") == JString(SemanticStateInventory.sha256(files(1).body)))
+    Seq("complete_fpga_capture", "deployable_capture_image", "production_freeze_owners_bound",
+      "metasim_restore_supported").foreach(k => assert((binding \ k) == JBool(false)))
+  }
+
+  it should "reject changed clock-mask circuits and coherently rehashed admission bindings before routing" in {
+    val s = input
+    val m = SimulatorStateInventory.discover(s); val p = PhysicalClockCutPlan.discover(s, m)
+    val d = PhysicalClockCutDependencies.discover(s, m, p)
+    val b = GeneratedStateBankAccess.generatePhysicalCompanion(s, m, p, d)
+    val w = PhysicalClockCutWiring.generateNative(s, m, p, d, b)
+    val changed = w.state.copy(circuit = w.state.circuit.copy(info = firrtl.ir.FileInfo("changed")))
+    Seq(w.copy(state = changed), w.copy(binding = w.binding + " ")).foreach { bad =>
+      intercept[IllegalArgumentException] { NativeCheckpointStateAccess.emit(s, m, p, d, b, bad) }
+    }
   }
 
   it should "preserve correlated native pin constraints through real storage specialization" in {
