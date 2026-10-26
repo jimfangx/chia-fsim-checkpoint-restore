@@ -27,11 +27,16 @@ module CheckpointPhysicalClockCut #(
     output reg [GATES-1:0] captured_ce,
     output reg [63:0] cut_cycle,
     // missing owner, logical CE drift, target-cycle drift; sticky until reset
-    output reg [2:0] error
+    output reg [2:0] error,
+    // Includes the falling-edge mask, not the vendor primitive's hidden CE
+    // latch (which remains a distinct generated physical owner).
+    output wire [GATES+69:0] control_state
 );
     reg freeze_low;
     reg sampled;
     reg release_pending;
+    assign control_state = {error, cut_cycle, captured_ce, release_pending,
+        sampled, freeze_low};
     wire missing_owner = !(&owner_present);
     wire [2:0] faults = {sampled && target_cycle != cut_cycle,
                          sampled && ce != captured_ce, missing_owner};

@@ -55,9 +55,15 @@ module CheckpointPhysicalCaptureTransport #(
     output wire dma_valid,
     input wire dma_ready,
     output wire [511:0] dma_data,
-    output wire dma_last, dma_abort
+    output wire dma_last, dma_abort,
+    // Exact live register readout. This port neither freezes transport state
+    // nor includes external primitive/stream/host owners.
+    output wire [GATES+480:0] control_state
 );
     wire transport_freeze;
+    wire [410:0] transport_control_state;
+    wire [GATES+69:0] physical_control_state;
+    assign control_state = {physical_control_state, transport_control_state};
     // Separately stopped owners must not resume while the physical release is
     // still being validated. They and the gated owners resume at the same
     // source edge, after the common falling-edge unmask. Feeding this extended
@@ -71,7 +77,8 @@ module CheckpointPhysicalCaptureTransport #(
         .clock_mask(clock_mask),
         .stopped(physical_stopped), .read_enable(physical_read_enable),
         .failed(physical_failed), .captured_ce(captured_ce),
-        .cut_cycle(physical_cut_cycle), .error(physical_error)
+        .cut_cycle(physical_cut_cycle), .error(physical_error),
+        .control_state(physical_control_state)
     );
     // The physical sampler acknowledges only AFTER the common low phase and
     // its post-stop sample. The deferred coordinator then binds the settled
@@ -117,6 +124,7 @@ module CheckpointPhysicalCaptureTransport #(
         .dma_ready(dma_ready),
         .dma_data(dma_data),
         .dma_last(dma_last),
-        .dma_abort(dma_abort)
+        .dma_abort(dma_abort),
+        .control_state(transport_control_state)
     );
 endmodule

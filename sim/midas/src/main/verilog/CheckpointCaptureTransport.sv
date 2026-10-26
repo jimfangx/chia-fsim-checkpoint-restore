@@ -41,7 +41,10 @@ module CheckpointCaptureTransport #(
     output wire dma_valid,
     input wire dma_ready,
     output reg [511:0] dma_data,
-    output wire dma_last, dma_abort
+    output wire dma_last, dma_abort,
+    // All sequential transport/cut state, without new observer storage.
+    // This live vector needs a separate atomic capture/restore owner.
+    output wire [410:0] control_state
 );
     localparam [3:0] IDLE=0, WAIT_CUT=1, HEADER=2, DESCRIPTOR=3,
         REQUEST=4, RESPONSE=5, DATA=6, TRAILER=7, WAIT_PUBLISH=8,
@@ -59,6 +62,11 @@ module CheckpointCaptureTransport #(
     wire cut_ready, read_enable, cut_complete, cut_failed;
     wire [63:0] cut_cycle;
     wire [4:0] cut_error;
+    wire [71:0] cut_control_state;
+    assign control_state = {cut_control_state, address, descriptor_entry,
+        mmio_response_error, mmio_rdata, mmio_response_valid, transport_error,
+        outstanding, stream_crc, words, saved_data, saved_depth, saved_width,
+        saved_slot, saved_bank, state};
     wire mmio_fire = mmio_valid && mmio_ready;
     wire control = mmio_fire && mmio_write && mmio_address == 0;
     wire idle_ready = state == IDLE && !outstanding && cut_ready;
@@ -93,7 +101,8 @@ module CheckpointCaptureTransport #(
         .capture_complete(stream_fire && state == TRAILER),
         .publish_release(publish), .abort_capture(abort),
         .freeze(freeze), .read_enable(read_enable), .complete(cut_complete),
-        .failed(cut_failed), .cut_cycle(cut_cycle), .error(cut_error)
+        .failed(cut_failed), .cut_cycle(cut_cycle), .error(cut_error),
+        .control_state(cut_control_state)
     );
 
     assign mmio_ready = !reset && (!mmio_response_valid || mmio_response_ready);

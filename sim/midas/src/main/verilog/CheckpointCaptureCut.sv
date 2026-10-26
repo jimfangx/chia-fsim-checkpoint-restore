@@ -27,11 +27,15 @@ module CheckpointCaptureCut #(
     output wire failed,
     output reg  [63:0] cut_cycle,
     // missing owner, owner error, lost freeze, cycle drift, early release
-    output reg  [4:0] error
+    output reg  [4:0] error,
+    // Exact live sequential state, LSB-first layout version 1. Observation
+    // only: the ungated coordinator does not stop with the functional clocks.
+    output wire [71:0] control_state
 );
     localparam [2:0] IDLE=0, FREEZING=1, READING=2, COMPLETE=3, FAILED=4;
     localparam [OWNERS-1:0] ALL_OWNERS = {OWNERS{1'b1}};
     reg [2:0] state;
+    assign control_state = {error, cut_cycle, state};
     wire accept = request_valid && request_ready;
     wire all_present = owner_present == ALL_OWNERS;
     wire all_frozen = owner_frozen == ALL_OWNERS;

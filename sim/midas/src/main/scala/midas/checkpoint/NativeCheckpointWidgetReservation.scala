@@ -175,7 +175,7 @@ object NativeCheckpointWidgetReservation {
       "dma_valid" -> 1, "dma_data" -> 512, "dma_last" -> 1, "dma_abort" -> 1,
       "gate_clock" -> a.gates, "clock_mask" -> 1, "captured_ce" -> a.gates,
       "physical_stopped" -> 1, "physical_read_enable" -> 1, "physical_failed" -> 1,
-      "physical_cut_cycle" -> 64, "physical_error" -> 3), Output)
+      "physical_cut_cycle" -> 64, "physical_error" -> 3, "control_state" -> (481 + a.gates)), Output)
     check(transport.ports.map(_.copy(info = NoInfo)).toSet == expectedTransport.toSet &&
       transport.ports.size == expectedTransport.size, "changed physical transport ABI")
     val raw = connects.filter(_.loc.serialize == widget.name + ".clock")

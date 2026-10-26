@@ -95,7 +95,7 @@ case class CheckpointCaptureWidgetParams(entries: Int, manifestSha256: String,
 /** Flat protocol matches CheckpointCaptureTransport.sv, including its dedicated reset.
   * Owners assert present only after a real binding exists; absent owners fail in the cut controller.
   */
-class CheckpointCaptureTransportIO(owners: Int) extends Bundle {
+class CheckpointCaptureTransportIO(owners: Int, controlStateBits: Int = 411) extends Bundle {
   val clock = Input(Clock())
   val reset = Input(Bool())
   val target_cycle = Input(UInt(64.W))
@@ -132,6 +132,9 @@ class CheckpointCaptureTransportIO(owners: Int) extends Bundle {
   val dma_data = Output(UInt(512.W))
   val dma_last = Output(Bool())
   val dma_abort = Output(Bool())
+  // Observation only. A future explicit atomic owner must retain this state;
+  // exposing the bits cannot waive the strict external inventory rejection.
+  val control_state = Output(UInt(controlStateBits.W))
 }
 
 class CheckpointCaptureTransportBlackBox(cfg: CheckpointCaptureWidgetParams)
@@ -147,7 +150,7 @@ class CheckpointCaptureTransportBlackBox(cfg: CheckpointCaptureWidgetParams)
   * Instantiating a second set here would freeze the wrong simulator clocks.
   */
 class CheckpointPhysicalCaptureTransportIO(owners: Int, gates: Int)
-    extends CheckpointCaptureTransportIO(owners) {
+    extends CheckpointCaptureTransportIO(owners, 481 + gates) {
   val ce = Input(UInt(gates.W))
   val root_clock = Output(Clock())
   val gate_clock = Output(UInt(gates.W))
