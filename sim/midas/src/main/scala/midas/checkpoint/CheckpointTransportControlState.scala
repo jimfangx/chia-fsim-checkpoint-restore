@@ -16,8 +16,8 @@ object CheckpointTransportControlState {
     require(ok, "checkpoint transport control state: " + why)
   // A schema revision must audit changed RTL, not silently bless new resources.
   val sources: Map[String, String] = Map(
-    "CheckpointCaptureCut.sv" -> "192b2f250ef28327b6ada3a70b75947ce8cce6d1bfeeda4292068c1464fbed91",
-    "CheckpointCaptureTransport.sv" -> "39c4718c59a895e6bf9b589cd0e14c54bce09c71043a685d7cf388bed81f74fc",
+    "CheckpointCaptureCut.sv" -> "7b0225a8c29f2911a308e4ed0da706a6614e23d4dbff6b4cd7696d91ea3488b0",
+    "CheckpointCaptureTransport.sv" -> "d7c21c12b30a837fa69c4d0cbb5e920cadbcc265132c8ed0196e03456b918d45",
     "CheckpointPhysicalClockCut.sv" -> "e5522bde552d9507c715e87dc5b0c86c0a1183b85c0664d7a5e48197103b450a",
     "CheckpointPhysicalCaptureTransport.sv" -> "bd0d4dddd470cc07a53a75bb146b8c77ae8cac58bdcbc160f4382a8777547881")
 

@@ -50,7 +50,9 @@ module CheckpointCaptureTransport #(
         REQUEST=4, RESPONSE=5, DATA=6, TRAILER=7, WAIT_PUBLISH=8,
         FAILED=9, DRAIN=10;
     localparam [63:0] MAGIC = 64'h3154504b434d5346; // bytes "FSMCKPT1"
-    reg [3:0] state;
+    // Checkpoint ABI stores the source encoding. Extra inferred FSM storage
+    // cannot be reconstructed from that vector during a zero-edge restore.
+    (* fsm_encoding = "none" *) reg [3:0] state;
     reg [7:0] saved_bank;
     reg [15:0] saved_slot, saved_width;
     reg [31:0] saved_depth;

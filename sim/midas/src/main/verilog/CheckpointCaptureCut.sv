@@ -34,7 +34,9 @@ module CheckpointCaptureCut #(
 );
     localparam [2:0] IDLE=0, FREEZING=1, READING=2, COMPLETE=3, FAILED=4;
     localparam [OWNERS-1:0] ALL_OWNERS = {OWNERS{1'b1}};
-    reg [2:0] state;
+    // Checkpoint ABI stores the source encoding. Extra inferred FSM storage
+    // cannot be reconstructed from that vector during a zero-edge restore.
+    (* fsm_encoding = "none" *) reg [2:0] state;
     assign control_state = {error, cut_cycle, state};
     wire accept = request_valid && request_ready;
     wire all_present = owner_present == ALL_OWNERS;
