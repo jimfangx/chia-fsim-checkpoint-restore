@@ -16,6 +16,15 @@ class CheckpointCaptureWidgetSpec extends AnyFlatSpec {
     .getOrElse(Files.createTempDirectory("checkpoint-widget-"))
   Files.createDirectories(out)
 
+  private def requireZeroRestoreInput(rtl: String, port: String, width: Int): Unit = {
+    val connections = ("\\." + port + "\\(([A-Za-z_][A-Za-z0-9_$]*)\\)").r
+      .findAllMatchIn(rtl).map(_.group(1)).toSeq
+    assert(connections.size == 1, s"expected one concrete $port connection")
+    val drivers = ("(?m)^\\s*assign\\s+" + java.util.regex.Pattern.quote(connections.head) +
+      "\\s*=\\s*([^;]+);").r.findAllMatchIn(rtl).map(_.group(1).trim).toSeq
+    assert(drivers == Seq(s"${width}'h0"), s"$port must have one explicit $width-bit zero driver")
+  }
+
   behavior.of("Global checkpoint widget")
 
   it should "reject missing manifests, descriptor networks and unnamed or duplicate owners" in {
@@ -63,6 +72,10 @@ class CheckpointCaptureWidgetSpec extends AnyFlatSpec {
     assert("(?s)CheckpointCaptureTransport\\s+#\\(".r.findFirstIn(rtl).nonEmpty)
     assert(rtl.contains("streamToHostCPU_bits") && rtl.contains("capture_ownerPresent"))
     assert(rtl.contains("capture_controllerReset"))
+    assert(rtl.contains(".RESTORE_ENABLE(0)"))
+    requireZeroRestoreInput(rtl, "restore_hold", 1)
+    requireZeroRestoreInput(rtl, "restore_load_pos", 1)
+    requireZeroRestoreInput(rtl, "restore_state", 411)
     assert(!rtl.contains("hPort"))
     val in = getClass.getResourceAsStream("/checkpoint/checkpoint_capture_widget_tb.sv")
     require(in != null)
@@ -81,6 +94,11 @@ class CheckpointCaptureWidgetSpec extends AnyFlatSpec {
     val rtl = (new ChiselStage).emitVerilog(widget.module, Array("--target-dir", destination.toString))
     assert("(?s)CheckpointPhysicalCaptureTransport\\s+#\\(".r.findFirstIn(rtl).nonEmpty)
     assert(rtl.contains(".EXTERNAL_CLOCK_NETWORK(1)"))
+    assert(rtl.contains(".RESTORE_ENABLE(0)"))
+    requireZeroRestoreInput(rtl, "restore_hold", 1)
+    requireZeroRestoreInput(rtl, "restore_load_pos", 1)
+    requireZeroRestoreInput(rtl, "restore_load_neg", 1)
+    requireZeroRestoreInput(rtl, "restore_state", 484)
     assert(rtl.contains("capture_physical_logicalCE") && rtl.contains("capture_physical_clockMask"))
     assert(rtl.contains("capture_physical_readEnable") && rtl.contains("capture_physical_capturedCE"))
     assert(!rtl.contains("hPort"))

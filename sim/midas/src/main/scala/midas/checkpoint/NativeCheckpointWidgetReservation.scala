@@ -152,9 +152,10 @@ object NativeCheckpointWidgetReservation {
         case _ => false
       }, "unresolved, duplicated or changed physical transport sources")
     val params = transport.params.collect { case IntParam(n, v) => n -> v }.toMap
-    check(transport.params.size == 5 && params == Map("GATES" -> BigInt(a.gates),
+    check(transport.params.size == 6 && params == Map("GATES" -> BigInt(a.gates),
       "OWNERS" -> BigInt(a.owners.size), "ENTRIES" -> BigInt(a.entries),
-      "EXTERNAL_CLOCK_NETWORK" -> BigInt(1), "MANIFEST_SHA256" -> BigInt(digest, 16)),
+      "EXTERNAL_CLOCK_NETWORK" -> BigInt(1), "RESTORE_ENABLE" -> BigInt(0),
+      "MANIFEST_SHA256" -> BigInt(digest, 16)),
       "changed physical transport reservation parameters")
     // Check exact flattened public ABI against the same Chisel bundle that
     // creates this blackbox. Opaque state remains unsupported, even with ABI.
@@ -168,7 +169,9 @@ object NativeCheckpointWidgetReservation {
       "mmio_response_ready" -> 1, "descriptor_valid" -> 1, "descriptor_bank" -> 8,
       "descriptor_slot" -> 16, "descriptor_width" -> 16, "descriptor_depth" -> 32,
       "bank_request_ready" -> 1, "bank_response_valid" -> 1, "bank_response_data" -> 64,
-      "bank_response_error" -> 1, "dma_ready" -> 1, "ce" -> a.gates), Input) ++ abi(Seq(
+      "bank_response_error" -> 1, "dma_ready" -> 1, "ce" -> a.gates,
+      "restore_hold" -> 1, "restore_load_pos" -> 1, "restore_load_neg" -> 1,
+      "restore_state" -> (481 + a.gates)), Input) ++ abi(Seq(
       "freeze" -> 1, "mmio_ready" -> 1, "mmio_response_valid" -> 1, "mmio_rdata" -> 32,
       "mmio_response_error" -> 1, "descriptor_entry" -> 32, "bank_request_valid" -> 1,
       "bank" -> 8, "slot" -> 16, "address" -> 32, "bank_response_ready" -> 1,

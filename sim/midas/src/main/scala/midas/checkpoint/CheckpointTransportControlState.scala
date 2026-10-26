@@ -16,10 +16,10 @@ object CheckpointTransportControlState {
     require(ok, "checkpoint transport control state: " + why)
   // A schema revision must audit changed RTL, not silently bless new resources.
   val sources: Map[String, String] = Map(
-    "CheckpointCaptureCut.sv" -> "776c4b5d9bed98948e37c31e261841c1059de19a0c3197742ea8b39587d6e257",
-    "CheckpointCaptureTransport.sv" -> "943c2582299db5705bd41e570551f211ab2d2dcc425f20ab52bad4a5722004a6",
-    "CheckpointPhysicalClockCut.sv" -> "e5522bde552d9507c715e87dc5b0c86c0a1183b85c0664d7a5e48197103b450a",
-    "CheckpointPhysicalCaptureTransport.sv" -> "bd0d4dddd470cc07a53a75bb146b8c77ae8cac58bdcbc160f4382a8777547881")
+    "CheckpointCaptureCut.sv" -> "0b7f712c7f3fd72f6c2cdf25a40c5a1d2165ae51430b38b0dff4fe1334f97fa6",
+    "CheckpointCaptureTransport.sv" -> "1e48ab970687d7bd503f539cb84970bbed60210380ff4d5add30c9a97b391fd8",
+    "CheckpointPhysicalClockCut.sv" -> "3231634af06e694716d7858ee79ccd50185df64d19ddf54756eafb54a3f928c3",
+    "CheckpointPhysicalCaptureTransport.sv" -> "b36cf58377a48e40e455d73602dcb0999a7146b15f3a82167286dc6ef91d434d")
 
   case class Field(path: String, width: Int, offset: Int, edge: String, reset: BigInt)
   def fields(gates: Int): Seq[Field] = {
@@ -71,8 +71,9 @@ endmodule
     check(transports.size == 1, "one concrete physical transport required")
     val (path, module) = transports.head
     val params = module.params.collect { case IntParam(n, v) => n -> v }.toMap
-    check(module.params.size == 5 && params.size == 5 && params.keySet ==
-      Set("GATES", "OWNERS", "ENTRIES", "EXTERNAL_CLOCK_NETWORK", "MANIFEST_SHA256"), "unknown parameters")
+    check(module.params.size == 6 && params.size == 6 && params.keySet ==
+      Set("GATES", "OWNERS", "ENTRIES", "EXTERNAL_CLOCK_NETWORK", "RESTORE_ENABLE", "MANIFEST_SHA256"),
+      "unknown parameters")
     check(params("GATES").isValidInt, "invalid physical gate count")
     val gates = params("GATES").toInt
     val layout = fields(gates)
@@ -80,6 +81,7 @@ endmodule
     check(params("OWNERS") > 0 && params("OWNERS") <= 65535 &&
       params("ENTRIES") > 0 && params("ENTRIES") <= 65535 &&
       Set(BigInt(0), BigInt(1))(params("EXTERNAL_CLOCK_NETWORK")) &&
+      params("RESTORE_ENABLE") == 0 &&
       params("MANIFEST_SHA256") >= 0 && params("MANIFEST_SHA256").bitLength <= 256, "invalid specialization")
     check(module.ports.count(_.name == "control_state") == 1 && module.ports.exists(p =>
       p.name == "control_state" && p.direction == Output && p.tpe == UIntType(IntWidth(bits))), "changed state ABI")

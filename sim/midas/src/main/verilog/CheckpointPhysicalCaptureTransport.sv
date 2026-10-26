@@ -12,9 +12,15 @@ module CheckpointPhysicalCaptureTransport #(
     // Use the compiler's hierarchy-preserving native gate network. Control,
     // transport and the network's source clock must remain ungated.
     parameter integer EXTERNAL_CLOCK_NETWORK = 0,
+    parameter integer RESTORE_ENABLE = 0,
     parameter [255:0] MANIFEST_SHA256 = 256'b0
 ) (
     input wire clock, reset,
+    // Opt-in physical register loading for a permanently parked destination.
+    // The dedicated supervisor asserts hold before clocks and retains it
+    // permanently; production leaves this disabled. No release is implemented.
+    input wire restore_hold, restore_load_pos, restore_load_neg,
+    input wire [GATES+480:0] restore_state,
     input wire [GATES-1:0] ce,
     output wire root_clock,
     output wire [GATES-1:0] gate_clock,
@@ -61,6 +67,11 @@ module CheckpointPhysicalCaptureTransport #(
     output wire [GATES+480:0] control_state
 );
     wire transport_freeze;
+    wire restoring = RESTORE_ENABLE != 0 && restore_hold;
+    wire transport_mmio_response_valid;
+    // Preserve the restored response register in control_state while preventing
+    // an external response handshake from consuming it in the parked mode.
+    assign mmio_response_valid = transport_mmio_response_valid && !restoring;
     wire [410:0] transport_control_state;
     wire [GATES+69:0] physical_control_state;
     assign control_state = {physical_control_state, transport_control_state};
@@ -70,8 +81,12 @@ module CheckpointPhysicalCaptureTransport #(
     // hold back into freeze_request would deadlock release.
     assign freeze = transport_freeze || physical_stopped;
     CheckpointPhysicalClockCut #(.GATES(GATES), .OWNERS(OWNERS),
-        .EXTERNAL_CLOCK_NETWORK(EXTERNAL_CLOCK_NETWORK)) physical (
-        .clock(clock), .reset(reset), .freeze_request(transport_freeze), .ce(ce),
+        .EXTERNAL_CLOCK_NETWORK(EXTERNAL_CLOCK_NETWORK),
+        .RESTORE_ENABLE(RESTORE_ENABLE)) physical (
+        .clock(clock), .reset(reset),
+        .restore_hold(restore_hold), .restore_load_pos(restore_load_pos),
+        .restore_load_neg(restore_load_neg), .restore_state(restore_state[GATES+480:411]),
+        .freeze_request(transport_freeze), .ce(ce),
         .target_cycle(target_cycle), .owner_present(owner_present),
         .root_clock(root_clock), .gate_clock(gate_clock),
         .clock_mask(clock_mask),
@@ -88,12 +103,15 @@ module CheckpointPhysicalCaptureTransport #(
     wire physical_owner_error = physical_failed ||
         (physical_read_enable && target_cycle != physical_cut_cycle);
     CheckpointCaptureTransport #(.OWNERS(OWNERS+1), .ENTRIES(ENTRIES),
-        .DEFERRED_CUT(1), .MANIFEST_SHA256(MANIFEST_SHA256)) transport (
+        .DEFERRED_CUT(1), .RESTORE_ENABLE(RESTORE_ENABLE),
+        .MANIFEST_SHA256(MANIFEST_SHA256)) transport (
         .owner_present({1'b1, owner_present}),
         .owner_frozen({physical_read_enable, owner_frozen}),
         .owner_error({physical_owner_error, owner_error}),
         .clock(clock),
         .reset(reset),
+        .restore_hold(restore_hold), .restore_load_pos(restore_load_pos),
+        .restore_state(restore_state[410:0]),
         .target_cycle(target_cycle),
         .freeze(transport_freeze),
         .mmio_valid(mmio_valid),
@@ -101,7 +119,7 @@ module CheckpointPhysicalCaptureTransport #(
         .mmio_ready(mmio_ready),
         .mmio_address(mmio_address),
         .mmio_wdata(mmio_wdata),
-        .mmio_response_valid(mmio_response_valid),
+        .mmio_response_valid(transport_mmio_response_valid),
         .mmio_response_ready(mmio_response_ready),
         .mmio_rdata(mmio_rdata),
         .mmio_response_error(mmio_response_error),

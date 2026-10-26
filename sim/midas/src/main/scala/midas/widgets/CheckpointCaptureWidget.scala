@@ -98,6 +98,9 @@ case class CheckpointCaptureWidgetParams(entries: Int, manifestSha256: String,
 class CheckpointCaptureTransportIO(owners: Int, controlStateBits: Int = 411) extends Bundle {
   val clock = Input(Clock())
   val reset = Input(Bool())
+  val restore_hold = Input(Bool())
+  val restore_load_pos = Input(Bool())
+  val restore_state = Input(UInt(controlStateBits.W))
   val target_cycle = Input(UInt(64.W))
   val owner_present = Input(UInt(owners.W))
   val owner_frozen = Input(UInt(owners.W))
@@ -139,7 +142,7 @@ class CheckpointCaptureTransportIO(owners: Int, controlStateBits: Int = 411) ext
 
 class CheckpointCaptureTransportBlackBox(cfg: CheckpointCaptureWidgetParams)
     extends BlackBox(Map("OWNERS" -> cfg.ownerNames.size, "ENTRIES" -> cfg.entries,
-      "MANIFEST_SHA256" -> BigInt(cfg.manifestSha256, 16))) with HasBlackBoxResource {
+      "RESTORE_ENABLE" -> 0, "MANIFEST_SHA256" -> BigInt(cfg.manifestSha256, 16))) with HasBlackBoxResource {
   override def desiredName = "CheckpointCaptureTransport"
   val io = IO(new CheckpointCaptureTransportIO(cfg.ownerNames.size))
   addResource("/CheckpointCaptureTransport.sv")
@@ -151,6 +154,7 @@ class CheckpointCaptureTransportBlackBox(cfg: CheckpointCaptureWidgetParams)
   */
 class CheckpointPhysicalCaptureTransportIO(owners: Int, gates: Int)
     extends CheckpointCaptureTransportIO(owners, 481 + gates) {
+  val restore_load_neg = Input(Bool())
   val ce = Input(UInt(gates.W))
   val root_clock = Output(Clock())
   val gate_clock = Output(UInt(gates.W))
@@ -165,7 +169,7 @@ class CheckpointPhysicalCaptureTransportIO(owners: Int, gates: Int)
 
 class CheckpointPhysicalCaptureTransportBlackBox(cfg: CheckpointCaptureWidgetParams)
     extends BlackBox(Map("GATES" -> cfg.physicalClockGates, "OWNERS" -> cfg.ownerNames.size,
-      "ENTRIES" -> cfg.entries, "EXTERNAL_CLOCK_NETWORK" -> 1,
+      "ENTRIES" -> cfg.entries, "EXTERNAL_CLOCK_NETWORK" -> 1, "RESTORE_ENABLE" -> 0,
       "MANIFEST_SHA256" -> BigInt(cfg.manifestSha256, 16))) with HasBlackBoxResource {
   require(cfg.physicalClockGates > 0)
   override def desiredName = "CheckpointPhysicalCaptureTransport"
@@ -303,6 +307,7 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
     val capture = capturePort.getWrappedValue
     val transport: CheckpointCaptureTransportIO = if (cfg.physicalClockGates > 0) {
       val physicalTransport = Module(new CheckpointPhysicalCaptureTransportBlackBox(cfg))
+      physicalTransport.io.restore_load_neg := false.B
       capture.physical.get.connect(physicalTransport.io)
       physicalTransport.io
     } else Module(new CheckpointCaptureTransportBlackBox(cfg)).io
@@ -310,6 +315,11 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
     adapter.io.ctrl <> io.ctrl
     transport.clock := clock
     transport.reset := reset.asBool
+    // The component restore supervisor is parked outside this production
+    // widget. Its inputs are inactive and the RTL restore mux is disabled.
+    transport.restore_hold := false.B
+    transport.restore_load_pos := false.B
+    transport.restore_state := 0.U
     capture.connect(transport)
     cfg.descriptors.foreach { descriptors =>
       val rom = Module(new CheckpointCaptureDescriptorROM(descriptors))

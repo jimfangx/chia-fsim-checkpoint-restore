@@ -6,9 +6,12 @@ module CheckpointCaptureTransport #(
     parameter integer OWNERS = 1,
     parameter integer ENTRIES = 1,
     parameter integer DEFERRED_CUT = 0,
+    parameter integer RESTORE_ENABLE = 0,
     parameter [255:0] MANIFEST_SHA256 = 256'b0
 ) (
     input wire clock, reset,
+    input wire restore_hold, restore_load_pos,
+    input wire [410:0] restore_state,
     input wire [63:0] target_cycle,
     input wire [OWNERS-1:0] owner_present, owner_frozen, owner_error,
     output wire freeze,
@@ -69,6 +72,7 @@ module CheckpointCaptureTransport #(
         mmio_response_error, mmio_rdata, mmio_response_valid, transport_error,
         outstanding, stream_crc, words, saved_data, saved_depth, saved_width,
         saved_slot, saved_bank, state};
+    wire restoring = RESTORE_ENABLE != 0 && restore_hold;
     wire mmio_fire = mmio_valid && mmio_ready;
     wire control = mmio_fire && mmio_write && mmio_address == 0;
     wire idle_ready = state == IDLE && !outstanding && cut_ready;
@@ -94,8 +98,11 @@ module CheckpointCaptureTransport #(
         end
     endfunction
 
-    CheckpointCaptureCut #(.OWNERS(OWNERS+1), .DEFERRED_CUT(DEFERRED_CUT)) cut (
-        .clock(clock), .reset(reset), .request_valid(start),
+    CheckpointCaptureCut #(.OWNERS(OWNERS+1), .DEFERRED_CUT(DEFERRED_CUT),
+        .RESTORE_ENABLE(RESTORE_ENABLE)) cut (
+        .clock(clock), .reset(reset),
+        .restore_hold(restore_hold), .restore_load_pos(restore_load_pos),
+        .restore_state(restore_state[410:339]), .request_valid(start),
         .request_ready(cut_ready), .target_cycle(target_cycle),
         .owner_present({1'b1, owner_present}),
         .owner_frozen({1'b1, owner_frozen}),
@@ -107,20 +114,20 @@ module CheckpointCaptureTransport #(
         .control_state(cut_control_state)
     );
 
-    assign mmio_ready = !reset && (!mmio_response_valid || mmio_response_ready);
+    assign mmio_ready = !reset && !restoring && (!mmio_response_valid || mmio_response_ready);
     assign bank = saved_bank;
     assign slot = saved_slot;
-    assign bank_request_valid = state == REQUEST && read_enable && !abort && !reset;
+    assign bank_request_valid = state == REQUEST && read_enable && !abort && !reset && !restoring;
     // Fault/abort cannot orphan an already accepted read. Drain it before a new
     // command, even if owners have resumed. No stale response enters a new cut.
-    assign bank_response_ready = outstanding && !reset;
+    assign bank_response_ready = outstanding && !reset && !restoring;
     assign dma_valid = (state == HEADER || state == DATA || state == TRAILER)
-                       && read_enable && !abort && !reset;
+                       && read_enable && !abort && !reset && !restoring;
     assign dma_last = state == TRAILER;
     // Reset invalidates even a complete trailer waiting for publication. Do
     // not depend on freeze: the coordinator drops freeze immediately on reset.
     // The downstream DMA adapter must discard its unpublished stream on abort.
-    assign dma_abort = reset || abort || fault || (freeze && !read_enable &&
+    assign dma_abort = restoring || reset || abort || fault || (freeze && !read_enable &&
                        state != WAIT_CUT && state != WAIT_PUBLISH && state != IDLE);
 
     always @* begin
@@ -149,7 +156,11 @@ module CheckpointCaptureTransport #(
             mmio_response_valid <= 0;
             mmio_rdata <= 0;
             mmio_response_error <= 0;
-        end else begin
+        end else if (restoring && restore_load_pos) begin
+            mmio_response_valid <= restore_state[241];
+            mmio_rdata <= restore_state[273:242];
+            mmio_response_error <= restore_state[274];
+        end else if (!restoring) begin
             if (mmio_response_ready) mmio_response_valid <= 0;
             if (mmio_fire) begin
                 mmio_response_valid <= 1;
@@ -194,7 +205,20 @@ module CheckpointCaptureTransport #(
             words <= 0;
             transport_error <= 0;
             stream_crc <= 32'hffffffff;
-        end else begin
+        end else if (restoring && restore_load_pos) begin
+            state <= restore_state[3:0];
+            saved_bank <= restore_state[11:4];
+            saved_slot <= restore_state[27:12];
+            saved_width <= restore_state[43:28];
+            saved_depth <= restore_state[75:44];
+            saved_data <= restore_state[139:76];
+            words <= restore_state[203:140];
+            stream_crc <= restore_state[235:204];
+            outstanding <= restore_state[236];
+            transport_error <= restore_state[240:237];
+            descriptor_entry <= restore_state[306:275];
+            address <= restore_state[338:307];
+        end else if (!restoring) begin
             if (stream_fire && state != TRAILER)
                 stream_crc <= crc32c_frame(stream_crc, dma_data);
             if (request_fire) outstanding <= 1;

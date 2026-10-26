@@ -8,10 +8,14 @@ module CheckpointCaptureCut #(
     // A physical gate can stop AFTER request acceptance. In this mode the
     // complete owner_frozen vector is the post-stop acknowledgement; capture
     // its settled label, rather than the MMIO/request accepting-edge label.
-    parameter integer DEFERRED_CUT = 0
+    parameter integer DEFERRED_CUT = 0,
+    parameter integer RESTORE_ENABLE = 0
 ) (
     input  wire clock,
     input  wire reset,
+    // Parked destination only. Disabled in the production capture path.
+    input wire restore_hold, restore_load_pos,
+    input wire [71:0] restore_state,
     input  wire request_valid,
     output wire request_ready,
     input  wire [63:0] target_cycle,
@@ -38,6 +42,7 @@ module CheckpointCaptureCut #(
     // cannot be reconstructed from that vector during a zero-edge restore.
     (* fsm_encoding = "none", dont_touch = "true" *) reg [2:0] state;
     assign control_state = {error, cut_cycle, state};
+    wire restoring = RESTORE_ENABLE != 0 && restore_hold;
     wire accept = request_valid && request_ready;
     wire all_present = owner_present == ALL_OWNERS;
     wire all_frozen = owner_frozen == ALL_OWNERS;
@@ -50,12 +55,12 @@ module CheckpointCaptureCut #(
         !all_present
     };
 
-    assign request_ready = state == IDLE && !reset;
+    assign request_ready = state == IDLE && !reset && !restoring;
     // Include the accepting edge, before the state register changes.
-    assign freeze = !reset && (active || accept);
+    assign freeze = !reset && (restoring || active || accept);
     // No read or publication may succeed on an edge with a new fault.
-    assign read_enable = state == READING && !(|faults) && !abort_capture && !reset;
-    assign complete = state == COMPLETE && !(|faults) && !abort_capture && !reset;
+    assign read_enable = state == READING && !(|faults) && !abort_capture && !reset && !restoring;
+    assign complete = state == COMPLETE && !(|faults) && !abort_capture && !reset && !restoring;
     assign failed = state == FAILED;
 
     always @(posedge clock) begin
@@ -63,6 +68,12 @@ module CheckpointCaptureCut #(
             state <= IDLE;
             cut_cycle <= 0;
             error <= 0;
+        end else if (restoring && restore_load_pos) begin
+            state <= restore_state[2:0];
+            cut_cycle <= restore_state[66:3];
+            error <= restore_state[71:67];
+        end else if (restoring) begin
+            // Retain every raw register while the parked adapter applies.
         end else if (abort_capture) begin
             // Host discards this incomplete transfer. Previously published
             // snapshots are owned by the host and are never overwritten here.

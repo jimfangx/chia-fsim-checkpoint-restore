@@ -71,6 +71,10 @@ class CheckpointTransportControlStateSpec extends AnyFlatSpec {
     })))
     reject(change(m => m.copy(params = m.params :+ IntParam("UNKNOWN", 1))))
     reject(change(m => m.copy(params = m.params.map {
+      case IntParam("RESTORE_ENABLE", _) => IntParam("RESTORE_ENABLE", 1)
+      case p => p
+    })))
+    reject(change(m => m.copy(params = m.params.map {
       case IntParam("OWNERS", _) => IntParam("OWNERS", 0)
       case p => p
     })))

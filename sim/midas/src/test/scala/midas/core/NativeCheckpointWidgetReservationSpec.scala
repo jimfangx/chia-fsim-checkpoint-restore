@@ -98,6 +98,14 @@ class NativeCheckpointWidgetReservationSpec extends AnyFlatSpec {
         m.copy(ports = m.ports.filterNot(_.name == "dma_abort"))
       case m => m
     })))
+    reject(withHeader.copy(circuit = withHeader.circuit.copy(modules = withHeader.circuit.modules.map {
+      case m: ExtModule if m.defname == "CheckpointPhysicalCaptureTransport" =>
+        m.copy(params = m.params.map {
+          case IntParam("RESTORE_ENABLE", _) => IntParam("RESTORE_ENABLE", 1)
+          case p => p
+        })
+      case m => m
+    })))
     def change(f: firrtl.ir.Statement => firrtl.ir.Statement): CircuitState = withHeader.copy(
       circuit = withHeader.circuit.copy(modules = withHeader.circuit.modules.map {
         case m: FirrtlModule =>
