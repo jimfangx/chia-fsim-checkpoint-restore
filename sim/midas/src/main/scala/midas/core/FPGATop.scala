@@ -154,7 +154,7 @@ class FPGATop(implicit p: Parameters) extends LazyModule with HasWidgets {
   val checkpointCaptureBinding = p(CheckpointCaptureTopKey)
   val checkpointCapture = checkpointCaptureBinding.map { binding =>
     val cfg = binding.params
-    require(cfg.descriptors.nonEmpty,
+    require(cfg.descriptors.nonEmpty || (cfg.deferredGraft && binding.isInstanceOf[NativeCheckpointWidgetReservationBinding]),
       "FPGATop checkpoint capture requires a generated manifest-bound descriptor ROM")
     addWidget(new CheckpointCaptureWidget(cfg))
   }

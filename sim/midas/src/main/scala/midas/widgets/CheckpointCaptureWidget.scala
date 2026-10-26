@@ -21,6 +21,7 @@ object CheckpointCaptureABI {
       "HOST_DRAINED_FRAMES_LO" -> 0x70, "HOST_DRAINED_FRAMES_HI" -> 0x74)
 
   def header(prefix: String, base: BigInt, cfg: CheckpointCaptureWidgetParams, stream: Int): String = {
+    require(!cfg.deferredGraft, "unbound checkpoint reservation cannot emit a descriptor-bound driver header")
     val sb = new StringBuilder
     sb.append(s"// Global checkpoint transport; no complete CPU/host ownership claim.\n")
     sb.append(s"#define ${prefix}_BASE ${base}ULL\n")
@@ -61,7 +62,11 @@ object CheckpointCaptureABI {
 
 case class CheckpointCaptureWidgetParams(entries: Int, manifestSha256: String,
     ownerNames: Seq[String], queueDepth: Int = 64,
-    descriptors: Option[CheckpointCaptureDescriptors] = None, physicalClockGates: Int = 0) {
+    descriptors: Option[CheckpointCaptureDescriptors] = None, physicalClockGates: Int = 0,
+    deferredGraft: Boolean = false) {
+  require(!deferredGraft || (descriptors.isEmpty && physicalClockGates > 0 &&
+    manifestSha256 == midas.checkpoint.NativeCheckpointWidgetReservation.digest),
+    "checkpoint deferred graft requires the exact unbound reservation contract")
   require(entries > 0 && entries <= 65535, "checkpoint descriptor network is missing or too large")
   require(manifestSha256.matches("[0-9a-f]{64}") && BigInt(manifestSha256, 16) != 0,
     "checkpoint requires a nonzero generated manifest SHA256")
@@ -367,14 +372,18 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
     transport.mmio_response_ready := adapter.io.response.ready && !localValid
     when(localValid && adapter.io.response.ready) { localValid := false.B }
     override def genHeader(base: BigInt, memoryRegions: Map[String, BigInt], sb: StringBuilder): Unit = {
-      sb.append(CheckpointCaptureABI.header(getWName.toUpperCase, base, cfg, toHostStreamIdx))
-      // Unlike target bridge constructors, this global driver has no target
-      // bridge id/plusargs. Emit the actual constructor signature explicitly.
-      cfg.descriptors.foreach { descriptors =>
-        sb.append("#ifdef GET_INCLUDES\n#include \"bridges/checkpoint_capture.h\"\n#endif\n")
-        sb.append("#ifdef GET_BRIDGE_CONSTRUCTOR\n")
-        sb.append(s"registry.add_widget(new checkpoint_capture_t(simif, *registry.get_stream_engine(), ${base}ULL, ${toHostStreamIdx}U,\n")
-        sb.append(s"  ${descriptors.cppManifest}));\n#endif\n")
+      if (cfg.deferredGraft) {
+        sb.append(midas.checkpoint.NativeCheckpointWidgetReservation.header(base, toHostStreamIdx))
+      } else {
+        sb.append(CheckpointCaptureABI.header(getWName.toUpperCase, base, cfg, toHostStreamIdx))
+        // Unlike target bridge constructors, this global driver has no target
+        // bridge id/plusargs. Emit the actual constructor signature explicitly.
+        cfg.descriptors.foreach { descriptors =>
+          sb.append("#ifdef GET_INCLUDES\n#include \"bridges/checkpoint_capture.h\"\n#endif\n")
+          sb.append("#ifdef GET_BRIDGE_CONSTRUCTOR\n")
+          sb.append(s"registry.add_widget(new checkpoint_capture_t(simif, *registry.get_stream_engine(), ${base}ULL, ${toHostStreamIdx}U,\n")
+          sb.append(s"  ${descriptors.cppManifest}));\n#endif\n")
+        }
       }
     }
   }

@@ -114,6 +114,18 @@ class GoldenGateHostPipelineSpec extends AnyFlatSpec {
 
   behavior.of("Golden Gate production host-to-FPGA pipeline")
 
+  it should "reject unbound widget reservations before ordinary FPGA emission without an inventory request" in {
+    val pin = midas.checkpoint.NativeCheckpointWidgetPinAnnotation(
+      ReferenceTarget("HostPipeline", "HostPipeline", Nil, "count", Nil), "response_data")
+    val header = GoldenGateOutputFileAnnotation(
+      midas.checkpoint.NativeCheckpointWidgetReservation.header(BigInt(0), 1), ".const.h")
+    Seq(pin, header).foreach { marker =>
+      val error = intercept[IllegalArgumentException](compile(inventory = false, extra = Seq(marker)))
+      assert(error.getMessage.contains("unbound lowered readout") &&
+        error.getMessage.contains("external transport state owner"))
+    }
+  }
+
   it should "consume post-mapping wrapper inline requests before discovering and specializing banks" in {
     val request = firrtl.stage.RunFirrtlTransformAnnotation(new firrtl.passes.InlineInstances)
     val target = firrtl.passes.InlineAnnotation(firrtl.annotations.ModuleName("HostConsumer",

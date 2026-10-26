@@ -139,6 +139,7 @@ class GoldenGateCompilerPhase extends Phase {
     val dedupRetiredSimulator = midas.passes.GoldenGateDedupGroups.retire(backendSimulator.copy(form = firrtl.LowForm))
     val inlinedSimulator = midas.passes.ResolveSimulationInline(dedupRetiredSimulator)
     val fpgaConstants = midas.checkpoint.SimulatorFPGASynthesisConstants(inlinedSimulator)
+    midas.checkpoint.NativeCheckpointWidgetReservation.requireBound(fpgaConstants)
     val nativeBankCompanion = midas.checkpoint.NativeFunctionalBankProbe(fpgaConstants)
     val postLoweredSimulator = midas.checkpoint.SimulatorBankProbe(nativeBankCompanion)
 
