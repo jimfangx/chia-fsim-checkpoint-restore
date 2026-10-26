@@ -60,7 +60,7 @@ object NativeCheckpointInPlace {
     // every reachable leaf definition. Same interface or a rehashed manifest
     // cannot substitute a different implementation.
     val referenceLive = GeneratedExternalOwners.instances(reference, reference.circuit.main)
-    referenceLive.map(_._2).distinct.foreach { m =>
+    referenceLive.map(_._2).distinctBy(_.name).foreach { m =>
       check(modules.get(m.name).contains(m), "stale or different executing definition " + m.name)
     }
     val banks = GeneratedStateBankAccess.generatePhysicalCompanion(reference, manifest, plan, dependencies)

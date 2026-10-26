@@ -45,7 +45,7 @@ object NativeCheckpointIdentity {
     check(live.values.count(_.name == reference.circuit.main) == 1, "ambiguous selected execution")
     val definitions = host.circuit.modules.map(m => m.name -> m).toMap
     check(definitions.size == host.circuit.modules.size, "duplicate enclosing definition")
-    GeneratedExternalOwners.instances(reference, reference.circuit.main).map(_._2).distinct.foreach { m =>
+    GeneratedExternalOwners.instances(reference, reference.circuit.main).map(_._2).distinctBy(_.name).foreach { m =>
       check(definitions.get(m.name).contains(m), "stale executing definition " + m.name)
     }
     val selectedRoot = reference.circuit.main

@@ -27,7 +27,7 @@ object PhysicalClockCutDependencies {
     val live = GeneratedExternalOwners.instances(state, state.circuit.main)
     val modules = state.circuit.modules.map(m => m.name -> m).toMap
     val scopes = live.map { case (p, m) => p -> m.name }.toMap
-    val definitions = live.map(_._2).distinct.collect { case m: Module =>
+    val definitions = live.map(_._2).distinctBy(_.name).collect { case m: Module =>
       val drivers = mutable.Map.empty[String, Expression]
       val instances = mutable.Map.empty[String, String]
       val registers = mutable.Set.empty[String]
