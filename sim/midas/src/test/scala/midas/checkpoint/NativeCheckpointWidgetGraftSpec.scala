@@ -340,6 +340,18 @@ class NativeCheckpointWidgetGraftSpec extends AnyFlatSpec {
     NativeCheckpointInPlaceContext.generate(source.host.copy(annotations = source.host.annotations ++ annotations),
       ModuleTarget("SimWrapper", "SimWrapper").instOf("network", "NativeStorage"))
 
+  private lazy val sourceCompilerContext: firrtl.AnnotationSeq = Seq(
+    midas.stage.ConfigPackageAnnotation("checkpoint_fixture"),
+    midas.stage.ConfigStringAnnotation("NativeWidgetFixture"),
+    midas.stage.GoldenGateOutputFileAnnotation("`define CHECKPOINT_FIXTURE_WIDTH 130\n", ".defines.vh"),
+    midas.passes.ChannelClockInfoAnnotation(Map("native_channel" ->
+      firesim.lib.bridgeutils.RationalClock("native_core", 2, 4))),
+    chisel3.experimental.EnumAnnotations.EnumDefAnnotation("CheckpointFixtureState", Map("idle" -> BigInt(0))),
+    midas.stage.GoldenGateInputCircuitAnnotation(source.host.circuit.main,
+      sha256(source.host.circuit.serialize), source.host.circuit.modules.map(_.name)),
+    firrtl.annotations.DeletedAnnotation("firrtl.stage.phases.AddCircuit",
+      firrtl.stage.FirrtlFileAnnotation("fixture/selected.fir")))
+
   private lazy val policySource = sourceWith(Seq(
     firrtl.annotations.MemoryNoSynthInit,
     firrtl.transforms.DontTouchAnnotation(ModuleTarget("SimWrapper", "Leaf").ref("value")),
@@ -348,16 +360,27 @@ class NativeCheckpointWidgetGraftSpec extends AnyFlatSpec {
       .instOf("left_", "Leaf")),
     midas.targetutils.xdc.XDCAnnotation(midas.targetutils.xdc.XDCFiles.Implementation,
       "set checkpoint_pins [get_pins [list {} {}]]; if {[llength $checkpoint_pins] != 2} {error \"missing_native_pin_pair\"}; set_property DONT_TOUCH true [get_cells -of_objects $checkpoint_pins]",
-      ModuleTarget("SimWrapper", "Native").ref("CE"), ModuleTarget("SimWrapper", "Native").ref("O"))))
+      ModuleTarget("SimWrapper", "Native").ref("CE"), ModuleTarget("SimWrapper", "Native").ref("O"))) ++
+    sourceCompilerContext)
+
+  private def sourcePolicyHost: CircuitState = before.copy(annotations = before.annotations ++ Seq(
+    firrtl.annotations.MemoryNoSynthInit,
+    firrtl.transforms.DontTouchAnnotation(ModuleTarget("FPGATop", "SimWrapper").ref("channelPorts_clock_ready"))) ++
+    sourceCompilerContext)
 
   it should "merge independently reconstructed typed source contracts without broadening their original executions" in {
-    val input = before.copy(annotations = before.annotations ++ Seq(firrtl.annotations.MemoryNoSynthInit,
-      firrtl.transforms.DontTouchAnnotation(ModuleTarget("FPGATop", "SimWrapper").ref("channelPorts_clock_ready"))))
+    val input = sourcePolicyHost
     val post = ResolveSimulationInline(input)
     val result = NativeCheckpointWidgetGraft.connectProjected(input, post, policySource)
     val receipt = result.sourceAnnotationProjection.get
     assert((parse(result.binding) \ "source_annotation_projection_sha256") == JString(sha256(receipt)))
     assert((parse(receipt) \ "scope") == JString("typed_selected_source_contract_merge_only"))
+    val context = parse(receipt) \ "compiler_context"
+    assert((context \ "policy") == JString("exact_existing_host_context_only_no_rebase_or_insertion"))
+    assert((context \ "source_snapshot" \ "annotations").asInstanceOf[JArray].arr.size == 7)
+    assert(sourceCompilerContext.forall(a => result.state.annotations.count(_ == a) == 1))
+    assert(policySource.host.annotations.filter(SimulatorBankProbeContext.accepts) ==
+      result.graft.state.annotations.filter(SimulatorBankProbeContext.accepts))
     val live = GeneratedExternalOwners.instances(result.state, result.state.circuit.main).toMap
     val touches = result.state.annotations.collect { case a: firrtl.transforms.DontTouchAnnotation => a.target }
     assert(touches.filter(_.ref == "value").map(_.module).toSet == Set(
@@ -426,6 +449,59 @@ class NativeCheckpointWidgetGraftSpec extends AnyFlatSpec {
     val inline = sourceWith(Seq(firrtl.passes.InlineAnnotation(firrtl.annotations.CircuitName("SimWrapper"))))
     bad(before, inline, "broaden outside selected execution")
     intercept[IllegalArgumentException](NativeCheckpointWidgetGraft.connect(before, after, policySource))
+  }
+
+  it should "reject missing changed duplicate and foreign source compiler context without replacing host metadata" in {
+    val errors = scala.collection.mutable.ArrayBuffer.empty[String]
+    def bad(input: CircuitState, fragment: String): Unit = {
+      val error = intercept[IllegalArgumentException](NativeCheckpointWidgetGraft.connectProjected(
+        input, ResolveSimulationInline(input), policySource))
+      assert(error.getMessage.contains(fragment), error.getMessage)
+      errors += error.getMessage
+    }
+    sourceCompilerContext.foreach { context =>
+      withClue(context.serialize + ": ") {
+        bad(sourcePolicyHost.copy(annotations = sourcePolicyHost.annotations.filterNot(_ == context)),
+          "compiler context absent or ambiguous")
+      }
+    }
+    sourceCompilerContext.foreach { context =>
+      withClue(context.serialize + ": ") {
+        bad(sourcePolicyHost.copy(annotations = sourcePolicyHost.annotations :+ context),
+          if (context.isInstanceOf[chisel3.experimental.EnumAnnotations.EnumDefAnnotation])
+            "compiler context absent or ambiguous" else "Simulator bank context:")
+      }
+    }
+    val changed = Seq(
+      midas.stage.ConfigStringAnnotation("ChangedConfig"),
+      midas.stage.GoldenGateOutputFileAnnotation("`define CHECKPOINT_FIXTURE_WIDTH 129\n", ".defines.vh"),
+      midas.passes.ChannelClockInfoAnnotation(Map("native_channel" ->
+        firesim.lib.bridgeutils.RationalClock("native_core", 1, 2))))
+    changed.foreach { replacement =>
+      val input = sourcePolicyHost.copy(annotations = sourcePolicyHost.annotations.map(a =>
+        if (a.getClass == replacement.getClass && (a match {
+          case file: midas.stage.GoldenGateOutputFileAnnotation => file.fileSuffix == ".defines.vh"
+          case _ => true
+        })) replacement else a))
+      bad(input, "compiler context absent or ambiguous")
+    }
+    // A passive source header cannot displace the real enclosing driver header.
+    val header = midas.stage.GoldenGateOutputFileAnnotation("// foreign source driver\n", ".const.h")
+    val foreign = sourceWith(Seq(header))
+    val error = intercept[IllegalArgumentException](NativeCheckpointWidgetGraft.connectProjected(
+      before, after, foreign))
+    assert(error.getMessage.contains("compiler context absent or ambiguous"), error.getMessage)
+    errors += error.getMessage
+    // Unrecognized annotations remain unsupported even with the parser option.
+    val hidden = policySource.copy(host = policySource.host.copy(annotations = policySource.host.annotations :+
+      firrtl.stage.AllowUnrecognizedAnnotations :+
+      UnsupportedWidgetOwner(ModuleTarget("SimWrapper", "Leaf").ref("value"))))
+    intercept[IllegalArgumentException](NativeCheckpointWidgetGraft.connectProjected(
+      sourcePolicyHost, ResolveSimulationInline(sourcePolicyHost), hidden))
+    val directory = out.resolveSibling("widget-source-policy")
+    Files.write(directory.resolve("source-context-negative-tests.json"), canonical(JObject(List(
+      "rejections" -> JArray(errors.map(JString(_)).toList), "physical_fpga_capture" -> JBool(false))))
+      .getBytes(UTF_8))
   }
 
 }

@@ -55,7 +55,8 @@ object NativeCheckpointWidgetGraft {
     val sourcePolicy = source.host.annotations.toVector != Vector(firrtl.transforms.NoCircuitDedupAnnotation)
     check(!sourcePolicy || (projectAnnotations &&
       source.host.annotations.count(_ == firrtl.transforms.NoCircuitDedupAnnotation) == 1 &&
-      source.host.annotations.forall(GeneratedStateBankAnnotations.supported)),
+      source.host.annotations.forall(a => GeneratedStateBankAnnotations.supported(a) ||
+        SimulatorBankProbeContext.accepts(a))),
       "source annotation projection unsupported; exact NoCircuitDedup policy required")
     val originals = source.host.circuit.modules.map(m => m.name -> m).toMap
     val originalLive = GeneratedExternalOwners.instances(source.host, selectedModule).map(_._2.name).toSet
@@ -132,6 +133,16 @@ object NativeCheckpointWidgetGraft {
     val sourceProjection = if (sourcePolicy) Some(NativeCheckpointWidgetAnnotations.mergeSource(
       source.host, graft.state, projected)) else None
     val result = sourceProjection.map(_.state).getOrElse(projected)
+    val sourceContext = source.host.annotations.filter(SimulatorBankProbeContext.accepts)
+    if (sourceContext.nonEmpty) {
+      // InlineInstances may coalesce identical annotations. Check the actual
+      // pre-inline input as well, so a duplicated option/history cannot become
+      // admissible merely because a compiler pass discarded its multiplicity.
+      val originalContext = before.annotations.filter(SimulatorBankProbeContext.accepts)
+      SimulatorBankProbeContext.snapshot(originalContext, before.circuit.serialize, before.circuit.serialize)
+      check(sourceContext.forall(a => originalContext.count(_ == a) == 1),
+        "compiler context absent or ambiguous in enclosing host")
+    }
     val rows = expected.sortBy(_.name).map { p =>
       val role = p.name.stripPrefix("capture_")
       JObject(List("role" -> JString(role), "peer" -> JString(byRole(role)),

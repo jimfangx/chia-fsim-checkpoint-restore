@@ -25,14 +25,24 @@ private[checkpoint] object NativeCheckpointWidgetAnnotations {
     * mask gate was inserted, so they cannot acquire that new execution here.
     */
   def mergeSource(source: CircuitState, graft: CircuitState, host: CircuitState): Result = {
+    val (sourceContext, sourceStorage) = source.annotations.partition(SimulatorBankProbeContext.accepts)
+    val (graftContext, graftStorage) = graft.annotations.partition(SimulatorBankProbeContext.accepts)
     require(source.annotations.count(_ == firrtl.transforms.NoCircuitDedupAnnotation) == 1 &&
-      source.annotations.forall(GeneratedStateBankAnnotations.supported),
+      sourceStorage.forall(GeneratedStateBankAnnotations.supported),
       "checkpoint widget source annotations: explicit typed NoCircuitDedup policy required")
-    GeneratedStateBankAnnotations.preflight(source)
-    require(graft.annotations.forall(GeneratedStateBankAnnotations.supported),
+    GeneratedStateBankAnnotations.preflight(source.copy(annotations = sourceStorage))
+    require(graftStorage.forall(GeneratedStateBankAnnotations.supported),
       "checkpoint widget source annotations: unsupported generated policy")
+    // Compiler history is not a target and must never undergo a circuit rename.
+    // A selected source may only retain context from this enclosing compiler
+    // invocation. In particular it cannot install a different output header,
+    // parser policy, channel ratio or consumed-input history in the host.
+    require(graftContext == sourceContext,
+      "checkpoint widget source annotations: generated compiler context changed")
+    val sourceSnapshot = SimulatorBankProbeContext.snapshot(sourceContext,
+      source.circuit.serialize, graft.circuit.serialize)
     val renames = firrtl.RenameMap(Map(CircuitName(source.circuit.main) -> Seq(CircuitName(host.circuit.main))))
-    val rebased = graft.annotations.flatMap(_.update(renames))
+    val rebased = graftStorage.flatMap(_.update(renames))
     val live = GeneratedExternalOwners.instances(host, host.circuit.main)
     val selected = live.filter(_._2.name == source.circuit.main).map(_._1)
     require(selected.size == 1, "checkpoint widget source annotations: ambiguous selected execution")
@@ -61,6 +71,23 @@ private[checkpoint] object NativeCheckpointWidgetAnnotations {
       "checkpoint widget source annotations: merged targets changed during validation")
     require(rebased.filter(_.getTargets.isEmpty).forall(host.annotations.contains),
       "checkpoint widget source annotations: global source policy absent from enclosing host")
+    val contextBinding = if (sourceContext.nonEmpty) {
+      val hostContext = host.annotations.filter(SimulatorBankProbeContext.accepts)
+      // Validate the complete enclosing context, including conflicting singleton
+      // options and output suffixes that an individual equality check can miss.
+      val hostSnapshot = SimulatorBankProbeContext.snapshot(hostContext,
+        host.circuit.serialize, result.circuit.serialize)
+      require(sourceContext.forall(a => hostContext.count(_ == a) == 1),
+        "checkpoint widget source annotations: compiler context absent or ambiguous in enclosing host")
+      List("compiler_context" -> JObject(List(
+        "context_merge_version" -> JInt(1),
+        "policy" -> JString("exact_existing_host_context_only_no_rebase_or_insertion"),
+        "source_snapshot" -> org.json4s.native.JsonMethods.parse(sourceSnapshot),
+        "host_snapshot" -> org.json4s.native.JsonMethods.parse(hostSnapshot),
+        "source_annotations_sha256" -> JString(sha256(json(sourceContext))),
+        "graft_annotations_sha256" -> JString(sha256(json(graftContext))),
+        "host_annotations_sha256" -> JString(sha256(json(hostContext))))))
+    } else Nil
     val binding = canonical(JObject(List(
       "source_policy_version" -> JInt(1), "scope" -> JString("typed_selected_source_contract_merge_only"),
       "source_sha256" -> JString(sha256(source.circuit.serialize)),
@@ -73,7 +100,7 @@ private[checkpoint] object NativeCheckpointWidgetAnnotations {
       "merged_annotations_sha256" -> JString(sha256(json(result.annotations))),
       "rebased_annotations" -> JArray(rebased.map(a => JString(a.serialize)).toList),
       "complete_fpga_capture" -> JBool(false), "production_annotations_translated" -> JBool(false),
-      "deployable_capture_image" -> JBool(false), "production_freeze_owners_bound" -> JBool(false))))
+      "deployable_capture_image" -> JBool(false), "production_freeze_owners_bound" -> JBool(false)) ++ contextBinding))
     Result(result, binding)
   }
 
