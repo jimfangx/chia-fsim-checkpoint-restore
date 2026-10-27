@@ -31,7 +31,7 @@ class NativeCheckpointRegionWidgetGraftSpec extends AnyFlatSpec {
   private val out = Paths.get(sys.props.getOrElse("checkpoint.region.widget.out",
     Paths.get(sys.env("CHECKPOINT_TEST_ARTIFACT_DIR")).resolve("native-region-widget").toString))
   private def save(name: String, text: String): Unit = {
-    Files.createDirectories(out); Files.write(out.resolve(name), text.getBytes(UTF_8))
+    Files.createDirectories(out.resolve(name).getParent); Files.write(out.resolve(name), text.getBytes(UTF_8))
   }
   private def resolved(c: Circuit): Circuit = firrtl.passes.ResolveFlows.run(
     firrtl.passes.InferTypes.run(firrtl.passes.ResolveKinds.run(firrtl.passes.ToWorkingIR.run(c))))
@@ -162,6 +162,68 @@ class NativeCheckpointRegionWidgetGraftSpec extends AnyFlatSpec {
         .foreach(a => save(n + a.suffix.get, a.fileBody))
     }
     println(s"NATIVE_REGION_WIDGET out=$out entries=14 gates=4 routes=20 guards_retained=true")
+  }
+  it should "bind the combined identity to actual transport and host while keeping all image and restore guards" in {
+    val bound = NativeCheckpointWidgetIdentity.bindRegions(before, after, source)
+    assert(bound.connection.state.circuit.serialize == connected.state.circuit.serialize)
+    assert(JsonProtocol.serialize(bound.connection.state.annotations) == JsonProtocol.serialize(connected.state.annotations))
+    assert(bound.connection.binding == connected.binding)
+    val doc = parse(bound.binding)
+    assert((doc \ "descriptor_identity_bound") == JBool(true))
+    assert((doc \ "descriptor_manifest_sha256") == JString(source.descriptors.manifestSha256))
+    Seq("production_freeze_owners_bound", "complete_fpga_capture", "deployable_capture_image",
+      "metasim_restore_supported", "production_annotations_translated").foreach(k => assert((doc \ k) == JBool(false)))
+    val oldModules = connected.state.circuit.modules.map(m => m.name -> m).toMap
+    val changed = bound.state.circuit.modules.filter(m => oldModules(m.name) != m)
+    assert(changed.size == 1)
+    val transport = changed.head.asInstanceOf[ExtModule]
+    assert(transport.params.collect { case IntParam("MANIFEST_SHA256", n) => n } ==
+      Seq(BigInt(source.descriptors.manifestSha256, 16)))
+    assert(transport.copy(params = oldModules(transport.name).asInstanceOf[ExtModule].params) == oldModules(transport.name))
+    val header = bound.state.annotations.collect {
+      case a: GoldenGateOutputFileAnnotation if a.fileSuffix == ".const.h" => a.body
+    }.head
+    assert(header.contains(NativeCheckpointWidgetIdentity.incomplete) &&
+      !header.contains("Unbound_checkpoint_widget_reservation"))
+    source.descriptors.entries.foreach(e => assert(header.contains(e.stateID)))
+    Seq(bound.state, bound.state.copy(annotations = Nil)).foreach { state =>
+      intercept[IllegalArgumentException](NativeCheckpointWidgetReservation.requireBound(state))
+      intercept[IllegalArgumentException](PhysicalClockGateContract.requireCaptureOwner(state))
+    }
+    // Keep the full unbound compiler output independently auditable. Only the
+    // executable manifest parameter, registered header and its annotation change.
+    val files = Files.list(out)
+    try {
+      val iterator = files.iterator()
+      while (iterator.hasNext) {
+        val file = iterator.next()
+        if (Files.isRegularFile(file)) {
+          save("identity/" + file.getFileName, new String(Files.readAllBytes(file), UTF_8))
+          save("identity/unbound/" + file.getFileName, new String(Files.readAllBytes(file), UTF_8))
+        }
+      }
+    } finally files.close()
+    save("identity/connected.fir", bound.state.circuit.serialize)
+    save("identity/connected-annotations.json", JsonProtocol.serialize(bound.state.annotations))
+    save("identity/identity.json", bound.binding)
+    save("identity/reserved.h", header)
+    val emitter = new Compiler(Seq(firrtl.options.Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm)
+    save("identity/connected.sv", emitter.execute(bound.state.copy(annotations = bound.state.annotations.filterNot(
+      _.isInstanceOf[firrtl.EmitCircuitAnnotation]) :+ firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter]))).getEmittedCircuit.value)
+    println(s"NATIVE_REGION_WIDGET_IDENTITY out=$out/identity entries=14 guards_retained=true")
+  }
+  it should "reconstruct regional descriptor identities instead of trusting rehashed sidecars" in {
+    intercept[IllegalArgumentException](NativeCheckpointWidgetIdentity.bindRegions(before, after,
+      source.copy(descriptors = NativeCheckpointInPlaceAccess.descriptors(source.regions.head))))
+    intercept[IllegalArgumentException](NativeCheckpointWidgetIdentity.bindRegions(before, after,
+      source.copy(descriptors = CheckpointCaptureDescriptors.fromNativeRegions(source.regions.reverse.map(NativeCheckpointInPlaceAccess.descriptors))._1)))
+    intercept[IllegalArgumentException](NativeCheckpointWidgetIdentity.bindRegions(before, after,
+      source.copy(targets = source.targets.reverse)))
+    val header = after.annotations.collectFirst {
+      case a: GoldenGateOutputFileAnnotation if a.fileSuffix == ".const.h" => a
+    }.get
+    intercept[IllegalArgumentException](NativeCheckpointWidgetIdentity.bindRegions(before,
+      after.copy(annotations = after.annotations :+ header), source))
   }
   it should "reject changed host, source policy, metadata, reservation counts and reconstructed region ownership" in {
     intercept[IllegalArgumentException](NativeCheckpointRegionWidgetGraft.connect(before,

@@ -4,7 +4,7 @@ package midas.checkpoint
 import firrtl.CircuitState
 import firrtl.ir._
 import midas.stage.GoldenGateOutputFileAnnotation
-import midas.widgets.{CheckpointCaptureABI, CheckpointCaptureWidgetParams}
+import midas.widgets.{CheckpointCaptureABI, CheckpointCaptureDescriptors, CheckpointCaptureWidgetParams}
 import org.json4s._
 import org.json4s.native.JsonMethods.parse
 
@@ -17,6 +17,7 @@ object NativeCheckpointWidgetIdentity {
   val incomplete = "#error Incomplete_checkpoint_hardware_coverage"
   val prefix = "CHECKPOINT_CAPTURE"
   case class Result(state: CircuitState, connection: NativeCheckpointWidgetGraft.Result, binding: String)
+  case class RegionsResult(state: CircuitState, connection: NativeCheckpointRegionWidgetGraft.Result, binding: String)
   private def check(ok: Boolean, why: String): Unit =
     require(ok, "checkpoint widget identity: " + why)
 
@@ -26,13 +27,31 @@ object NativeCheckpointWidgetIdentity {
     // caller-provided connected circuit or descriptor sidecar is trusted.
     val connection = NativeCheckpointWidgetGraft.connect(before, after, source)
     val descriptors = NativeCheckpointInPlaceAccess.descriptors(source)
+    val (state, binding) = bindConnected(before, after, connection.state, connection.binding, descriptors,
+      "selected_readout_transport_and_host_identity_only")
+    Result(state, connection, binding)
+  }
+
+  /** Reconstruct every disjoint bank, selector and route before binding the
+    * single real widget. Coverage deficits and image guards remain explicit.
+    */
+  def bindRegions(before: CircuitState, after: CircuitState,
+      source: NativeCheckpointRegions.Result): RegionsResult = {
+    val connection = NativeCheckpointRegionWidgetGraft.connect(before, after, source)
+    val (state, binding) = bindConnected(before, after, connection.state, connection.binding, source.descriptors,
+      "disjoint_regions_transport_and_host_identity_only")
+    RegionsResult(state, connection, binding)
+  }
+
+  private def bindConnected(before: CircuitState, after: CircuitState, connected: CircuitState,
+      connectionBinding: String, descriptors: CheckpointCaptureDescriptors, scope: String): (CircuitState, String) = {
     val execution = after.annotations.collect { case a: NativeCheckpointWidgetExecutionAnnotation => a }.head
     val peer = parse(NativeCheckpointWidgetPeerRouting.inspect(before, after))
     val JString(transportPath) = peer \ "transport"
-    val live = GeneratedExternalOwners.instances(connection.state, connection.state.circuit.main)
+    val live = GeneratedExternalOwners.instances(connected, connected.circuit.main)
     val transport = live.find(_._1 == transportPath).get._2.asInstanceOf[ExtModule]
     check(live.count(_._2.name == transport.name) == 1, "transport definition is shared")
-    val headers = connection.state.annotations.collect {
+    val headers = connected.annotations.collect {
       case a: GoldenGateOutputFileAnnotation if a.fileSuffix == ".const.h" => a
     }
     check(headers.size == 1, "one actual registered host header required")
@@ -71,13 +90,13 @@ object NativeCheckpointWidgetIdentity {
     })
     check(descriptors.manifestSha256 != NativeCheckpointWidgetReservation.digest,
       "reconstructed identity aliases unbound sentinel")
-    val result = connection.state.copy(circuit = connection.state.circuit.copy(modules =
-      connection.state.circuit.modules.map(m => if (m.name == transport.name) boundTransport else m)),
-      annotations = connection.state.annotations.map(a => if (a == header) boundHeader else a))
+    val result = connected.copy(circuit = connected.circuit.copy(modules =
+      connected.circuit.modules.map(m => if (m.name == transport.name) boundTransport else m)),
+      annotations = connected.annotations.map(a => if (a == header) boundHeader else a))
     val binding = canonical(JObject(List(
-      "identity_version" -> JInt(1), "scope" -> JString("selected_readout_transport_and_host_identity_only"),
-      "connection_sha256" -> JString(sha256(connection.binding)),
-      "unbound_sha256" -> JString(sha256(connection.state.circuit.serialize)),
+      "identity_version" -> JInt(1), "scope" -> JString(scope),
+      "connection_sha256" -> JString(sha256(connectionBinding)),
+      "unbound_sha256" -> JString(sha256(connected.circuit.serialize)),
       "bound_sha256" -> JString(sha256(result.circuit.serialize)),
       "descriptor_manifest_sha256" -> JString(descriptors.manifestSha256),
       "descriptor_binding_sha256" -> JString(descriptors.bindingSha256),
@@ -93,6 +112,6 @@ object NativeCheckpointWidgetIdentity {
       "external_transport_state_owner" -> JString("unsupported_no_state_adapter"),
       "production_freeze_owners_bound" -> JBool(false), "complete_fpga_capture" -> JBool(false),
       "deployable_capture_image" -> JBool(false), "metasim_restore_supported" -> JBool(false))))
-    Result(result, connection, binding)
+    (result, binding)
   }
 }
