@@ -28,12 +28,11 @@ object NativeCheckpointRegionWidgetGraft {
     val peerText = NativeCheckpointWidgetPeerRouting.inspect(before, after)
     check(source.host.form == LowForm && source.host.circuit == after.circuit,
       "original region host differs from actual lowered host")
-    check(source.host.annotations.toVector == Vector(firrtl.transforms.NoCircuitDedupAnnotation),
-      "explicit NoCircuitDedup-only source annotation policy required")
     check(after.annotations.count(_ == firrtl.transforms.NoCircuitDedupAnnotation) == 1,
       "source NoCircuitDedup policy absent or ambiguous in actual host")
     check(source.inventory.nonEmpty, "explicit actual-widget external inventory permission required")
     source.inventory.get.validate(before, after)
+    source.inventory.get.validateSource(source.host)
     check(source.inventory.get.unsupportedOwners.arr.nonEmpty, "missing unsupported transport ownership deficit")
     val graft = NativeCheckpointRegionGraft.generate(source)
     val execution = after.annotations.collect { case a: NativeCheckpointWidgetExecutionAnnotation => a }.head
@@ -54,10 +53,16 @@ object NativeCheckpointRegionWidgetGraft {
     }
     val ports = NativeCheckpointInPlaceGraft.capturePorts(execution.gates)
     val pins = after.annotations.collect { case a: NativeCheckpointWidgetPinAnnotation => a.role -> a.target.ref }.toMap
+    val emittedExecutions = GeneratedExternalOwners.instances(graft.state, graft.state.circuit.main)
+      .groupBy(_._2.name).view.mapValues(_.map(_._1).toSet).toMap
+    val changedExecutions = live.groupBy(_._2.name).collect { case (name, executions)
+      if emittedExecutions.getOrElse(name, Set.empty[String]) != executions.map(_._1).toSet => name }.toSet
     val changedNames = graft.state.circuit.modules.filter(m => originalModules.get(m.name).exists(_ != m)).map(_.name).toSet ++
-      chain.map(_.name)
+      chain.map(_.name) ++ changedExecutions
     // Typed storage contracts are projected below. Other targeted metadata on
-    // modified definitions needs its own explicit contract, never a text copy.
+    // modified definitions or changed execution sets needs its own contract.
+    // An unchanged shared definition may lose all executions to specialized
+    // banks, or gain mask-gate executions that would broaden a local contract.
     val rawClockSources = after.annotations.collect { case a: midas.passes.HostClockSource => a }
     check(rawClockSources.size == 1 && rawClockSources.head.target.circuit == after.circuit.main &&
       rawClockSources.head.target.module == chain.last.name && rawClockSources.head.target.path.isEmpty &&
@@ -113,7 +118,11 @@ object NativeCheckpointRegionWidgetGraft {
     val flowed = firrtl.passes.ResolveFlows.run(typed)
     firrtl.passes.CheckTypes.run(flowed); firrtl.passes.CheckFlows.run(flowed)
     val projected = NativeCheckpointWidgetAnnotations.project(after, after.copy(circuit = flowed))
-    val generated = graft.state.annotations.filterNot(_ == firrtl.transforms.NoCircuitDedupAnnotation)
+    val sourceContext = source.host.annotations.filter(SimulatorBankProbeContext.accepts)
+    val graftContext = graft.state.annotations.filter(SimulatorBankProbeContext.accepts)
+    check(graftContext.toVector == sourceContext.toVector, "generated compiler context changed")
+    val generated = graft.state.annotations.filterNot(a => a == firrtl.transforms.NoCircuitDedupAnnotation ||
+      SimulatorBankProbeContext.accepts(a))
     check(generated.forall(GeneratedStateBankAnnotations.supported), "unsupported generated storage annotation")
     val result = projected.state.copy(annotations = projected.state.annotations ++
       generated.filterNot(projected.state.annotations.contains))

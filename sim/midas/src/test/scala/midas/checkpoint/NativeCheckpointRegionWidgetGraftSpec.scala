@@ -114,6 +114,112 @@ class NativeCheckpointRegionWidgetGraftSpec extends AnyFlatSpec {
     annotations = Seq(firrtl.transforms.NoCircuitDedupAnnotation)), targets, Some(inventory))
   private lazy val connected = NativeCheckpointRegionWidgetGraft.connect(before, after, source)
 
+  private lazy val policyBefore = before.copy(annotations = before.annotations ++ Seq(
+    firrtl.annotations.MemoryNoSynthInit,
+    firrtl.transforms.DontTouchAnnotation(ModuleTarget("ReservationShell", "Leaf").ref("value")),
+    midas.targetutils.xdc.XDCAnnotation(midas.targetutils.xdc.XDCFiles.Synthesis,
+      midas.targetutils.xdc.RAMStyleHint.propertyTemplate(midas.targetutils.xdc.RAMStyles.DISTRIBUTED),
+      ModuleTarget("ReservationShell", "NativeStorage").ref("ram")),
+    midas.stage.ConfigStringAnnotation("RegionalSourcePolicy"),
+    midas.stage.GoldenGateOutputFileAnnotation("`define REGIONAL_SOURCE_POLICY 1\n", ".defines.vh")))
+  private lazy val policyAfter = ResolveSimulationInline(policyBefore)
+  private lazy val policyInventory = ReservedCheckpointInventory.forReservedWidgetSource(policyBefore, policyAfter)
+  private lazy val policySource = NativeCheckpointRegions.generate(policyInventory.source, targets, Some(policyInventory))
+
+  it should "project whole-host typed source policy and compiler history without dropping the original context" in {
+    val result = NativeCheckpointRegionWidgetGraft.connect(policyBefore, policyAfter, policySource)
+    val approved = policyAfter.annotations.filter(a => GeneratedStateBankAnnotations.supported(a) ||
+      SimulatorBankProbeContext.accepts(a))
+    assert(policyInventory.source.annotations.toVector == approved.toVector)
+    assert(policySource.host.annotations.toVector == approved.toVector)
+    val context = approved.filter(SimulatorBankProbeContext.accepts)
+    assert(result.state.annotations.filter(SimulatorBankProbeContext.accepts).toVector == context.toVector)
+    assert(result.graft.state.annotations.filter(SimulatorBankProbeContext.accepts).toVector == context.toVector)
+    assert((parse(policyInventory.binding) \ "source_policy" \ "scope") ==
+      JString("exact_ordered_whole_host_typed_storage_and_inert_context"))
+    val live = GeneratedExternalOwners.instances(result.state, result.state.circuit.main).toMap
+    val touched = result.state.annotations.collect {
+      case a: firrtl.transforms.DontTouchAnnotation if a.target.ref == "value" => a.target.module
+    }.toSet
+    assert(touched == Seq("top.sim.network.left_", "top.sim.network.right_", "top.peer.left_", "top.peer.right_")
+      .map(p => live("ReservationShell." + p).name).toSet)
+    assert(result.state.annotations.count(_ == firrtl.annotations.MemoryNoSynthInit) == 1)
+    val bound = NativeCheckpointWidgetIdentity.bindRegions(policyBefore, policyAfter, policySource)
+    Seq(result.state, bound.state).foreach { state =>
+      assert(state.annotations.filterNot(GeneratedStateBankAnnotations.supported).filterNot(
+        _.isInstanceOf[GoldenGateOutputFileAnnotation]).toVector == policyAfter.annotations.filterNot(
+        GeneratedStateBankAnnotations.supported).filterNot(_.isInstanceOf[GoldenGateOutputFileAnnotation]).toVector)
+      Seq(state, state.copy(annotations = Nil)).foreach { s =>
+        intercept[IllegalArgumentException](NativeCheckpointWidgetReservation.requireBound(s))
+        intercept[IllegalArgumentException](PhysicalClockGateContract.requireCaptureOwner(s))
+      }
+    }
+    val folder = "source-policy/"
+    Seq("before-reserved" -> policyBefore, "native-inlined" -> policyAfter, "host" -> policySource.host,
+      "instrumented" -> policySource.state, "grafted" -> result.graft.state, "connected" -> result.state).foreach {
+      case (name, state) => save(folder + name + ".fir", state.circuit.serialize)
+        save(folder + name + "-annotations.json", JsonProtocol.serialize(state.annotations))
+    }
+    Seq("connection.json" -> result.binding, "binding.json" -> policySource.binding,
+      "annotation-projection.json" -> result.annotationProjection, "reserved-inventory.json" -> policyInventory.binding,
+      "manifest.json" -> policySource.descriptors.manifest, "descriptors.json" -> policySource.descriptors.manifest,
+      "descriptor-binding.json" -> policySource.descriptors.binding, "routing.json" -> policySource.routing.binding,
+      "peer-routing.json" -> NativeCheckpointWidgetPeerRouting.inspect(policyBefore, policyAfter)).foreach {
+      case (name, text) => save(folder + name, text)
+    }
+    policySource.regions.zipWithIndex.foreach { case (r, i) =>
+      save(folder + s"region-$i.fir", r.state.circuit.serialize)
+      save(folder + s"region-$i-binding.json", r.native.binding)
+    }
+    result.graft.files.foreach { f =>
+      save(folder + "graft" + f.fileSuffix, f.body); save(folder + "FireSim-generated" + f.fileSuffix, f.body)
+    }
+    policyBefore.annotations.collect { case a: GoldenGateOutputFileAnnotation if a.fileSuffix == ".const.h" => a }
+      .foreach(a => save(folder + "reserved.h", a.body))
+    policyBefore.annotations.collect { case a: firrtl.transforms.BlackBoxInlineAnno
+      if Set("CheckpointPhysicalCaptureTransport.sv", "CheckpointPhysicalClockCut.sv", "CheckpointCaptureTransport.sv", "CheckpointCaptureCut.sv")(a.name) => a }
+      .foreach(a => save(folder + a.name, a.text))
+    val emitter = new Compiler(Seq(firrtl.options.Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm)
+    save(folder + "connected.sv", emitter.execute(result.state.copy(annotations = result.state.annotations.filterNot(
+      _.isInstanceOf[firrtl.EmitCircuitAnnotation]) :+ firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter])))
+      .getEmittedCircuit.value)
+    println(s"NATIVE_REGION_WIDGET_SOURCE_POLICY out=$out/source-policy guards_retained=true")
+  }
+
+  it should "reject edited source annotations and pre-inline context defects even when inline coalesces them" in {
+    val errors = scala.collection.mutable.ArrayBuffer.empty[String]
+    val host = policyInventory.source
+    val mutations = Seq(host.annotations.filterNot(_ == firrtl.annotations.MemoryNoSynthInit),
+      host.annotations.reverse, host.annotations :+ host.annotations.head,
+      host.annotations.filterNot(_.isInstanceOf[midas.stage.ConfigStringAnnotation]))
+    mutations.foreach { as =>
+      val error = intercept[IllegalArgumentException](NativeCheckpointRegions.generate(
+        host.copy(annotations = as), targets, Some(policyInventory)))
+      assert(error.getMessage.contains("changed original source policy or compiler context"))
+      errors += error.getMessage
+    }
+    val context = midas.stage.ConfigStringAnnotation("RegionalSourcePolicy")
+    val duplicate = policyBefore.copy(annotations = policyBefore.annotations :+ context)
+    val error = intercept[IllegalArgumentException](ReservedCheckpointInventory.forReservedWidgetSource(
+      duplicate, ResolveSimulationInline(duplicate)))
+    assert(error.getMessage.contains("duplicate compiler option")); errors += error.getMessage
+    val conflict = policyBefore.copy(annotations = policyBefore.annotations :+ firrtl.annotations.MemorySynthInit)
+    val memoryError = intercept[IllegalArgumentException](ReservedCheckpointInventory.forReservedWidgetSource(
+      conflict, ResolveSimulationInline(conflict)))
+    assert(memoryError.getMessage.contains("conflicting memory synthesis initialization")); errors += memoryError.getMessage
+    Seq("FPGATop" -> "reservedCycle", "Leaf" -> "value", "Native" -> "CE").foreach { case (module, ref) =>
+      val unknown = policyBefore.copy(annotations = policyBefore.annotations :+
+        UnsupportedRegionWidgetOwner(ModuleTarget("ReservationShell", module).ref(ref)))
+      val post = ResolveSimulationInline(unknown)
+      val permission = ReservedCheckpointInventory.forReservedWidgetSource(unknown, post)
+      val regions = NativeCheckpointRegions.generate(permission.source, targets, Some(permission))
+      val ownerError = intercept[IllegalArgumentException](NativeCheckpointRegionWidgetGraft.connect(unknown, post, regions))
+      assert(ownerError.getMessage.contains("unknown host annotation targets changed definition")); errors += ownerError.getMessage
+    }
+    save("source-policy/negative-tests.json", SemanticStateInventory.canonical(JObject(List(
+      "rejections" -> JArray(errors.map(JString(_)).toList), "physical_fpga_capture" -> JBool(false)))))
+  }
+
   behavior.of("Existing widget connected to disjoint native regions")
   it should "route twenty signals across the common root and preserve admission guards and original execution" in {
     val result = connected

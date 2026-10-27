@@ -25,6 +25,7 @@ object NativeCheckpointRegions {
   def generate(host: CircuitState, targets: Seq[InstanceTarget],
       inventory: Option[ReservedCheckpointInventory] = None): Result = {
     check(host.form == LowForm, "resolved LowForm required")
+    inventory.foreach(_.validateSource(host))
     check(targets.nonEmpty && targets.size <= 255, "invalid region count")
     val paths = targets.map(_.asPath.map(_._1.value))
     check(!paths.indices.exists(i => paths.indices.exists(j => i != j && paths(i).startsWith(paths(j)))),
