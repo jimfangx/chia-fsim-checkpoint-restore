@@ -31,7 +31,10 @@ object NativeCheckpointInPlace {
   }
 
   def generate(host: CircuitState, target: InstanceTarget, reference: CircuitState,
-      manifest: String, plan: String, dependencies: String): Result = {
+      manifest: String, plan: String, dependencies: String,
+      sidebandPrefix: String = prefix): Result = {
+    check(sidebandPrefix.matches("checkpoint_inplace_[A-Za-z0-9_]*"), "invalid sideband namespace")
+    val prefix = sidebandPrefix
     check(host.form == LowForm && reference.form == LowForm, "resolved LowForm required")
     GeneratedStateBankAnnotations.preflight(host)
     check(target.circuit == host.circuit.main && target.module == host.circuit.main,
