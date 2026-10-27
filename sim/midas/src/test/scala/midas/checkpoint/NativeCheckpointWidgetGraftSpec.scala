@@ -169,4 +169,70 @@ class NativeCheckpointWidgetGraftSpec extends AnyFlatSpec {
     save("negative-tests.json", canonical(JObject(List("rejections" -> JArray(failures.map(JString(_)).toList),
       "physical_fpga_capture" -> JBool(false)))))
   }
+
+  it should "bind reconstructed global identity to the actual transport and host driver while rejecting image emission" in {
+    val bound = NativeCheckpointWidgetIdentity.bind(before, after, source)
+    val descriptors = NativeCheckpointInPlaceAccess.descriptors(source)
+    val doc = parse(bound.binding)
+    assert((doc \ "descriptor_identity_bound") == JBool(true))
+    assert((doc \ "descriptor_manifest_sha256") == JString(descriptors.manifestSha256))
+    assert((doc \ "deployable_capture_image") == JBool(false))
+    val oldModules = connected.state.circuit.modules.map(m => m.name -> m).toMap
+    val changed = bound.state.circuit.modules.filter(m => oldModules(m.name) != m)
+    assert(changed.size == 1 && changed.head.isInstanceOf[ExtModule])
+    val transport = changed.head.asInstanceOf[ExtModule]
+    assert(transport.params.contains(IntParam("MANIFEST_SHA256", BigInt(descriptors.manifestSha256, 16))))
+    assert(transport.params.contains(IntParam("RESTORE_ENABLE", 0)))
+    val header = bound.state.annotations.collect {
+      case a: midas.stage.GoldenGateOutputFileAnnotation if a.fileSuffix == ".const.h" => a.body
+    }.head
+    assert(header.contains(NativeCheckpointWidgetIdentity.incomplete))
+    assert(header.contains(descriptors.manifestSha256) && header.contains(descriptors.bindingSha256))
+    assert(header.contains(descriptors.cppManifest))
+    assert(header.contains("checkpoint_capture_t(simif, *registry.get_stream_engine(), 0ULL, 1U,"))
+    assert(!header.contains("Unbound_checkpoint_widget_reservation"))
+    Seq(bound.state, bound.state.copy(annotations = Nil)).foreach(s =>
+      intercept[IllegalArgumentException](NativeCheckpointWidgetReservation.requireBound(s)))
+    // Guard-only headers must also fail, independently of the transport or markers.
+    intercept[IllegalArgumentException](NativeCheckpointWidgetReservation.requireBound(bound.state.copy(
+      circuit = bound.state.circuit.copy(modules = Nil), annotations = Seq(
+        midas.stage.GoldenGateOutputFileAnnotation(header, ".const.h")))))
+    val directory = out.resolveSibling("widget-identity")
+    Files.createDirectories(directory)
+    Files.createDirectories(directory.resolve("unbound"))
+    val stream = Files.list(out)
+    try stream.forEach(p => if (Files.isRegularFile(p)) {
+      Files.copy(p, directory.resolve(p.getFileName), StandardCopyOption.REPLACE_EXISTING)
+      Files.copy(p, directory.resolve("unbound").resolve(p.getFileName), StandardCopyOption.REPLACE_EXISTING)
+    }) finally stream.close()
+    def write(name: String, text: String): Unit = Files.write(directory.resolve(name), text.getBytes(UTF_8))
+    write("identity.json", bound.binding)
+    write("connected.fir", bound.state.circuit.serialize)
+    write("connected-annotations.json", JsonProtocol.serialize(bound.state.annotations))
+    write("reserved.h", header)
+    val emitter = new Compiler(Seq(firrtl.options.Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm)
+    write("connected.sv", emitter.execute(bound.state.copy(annotations = bound.state.annotations.filterNot(
+      _.isInstanceOf[firrtl.EmitCircuitAnnotation]) :+ firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter])))
+      .getEmittedCircuit.value)
+    println(s"NATIVE_WIDGET_IDENTITY out=$directory manifest=${descriptors.manifestSha256} image_guard_retained=true")
+  }
+
+  it should "reject stale identity inputs and ambiguous missing or conflicting registered headers" in {
+    def bad(s: CircuitState): Unit = intercept[IllegalArgumentException](
+      NativeCheckpointWidgetIdentity.bind(s, ResolveSimulationInline(s), source))
+    val header = before.annotations.collect {
+      case a: midas.stage.GoldenGateOutputFileAnnotation if a.fileSuffix == ".const.h" => a
+    }.head
+    bad(before.copy(annotations = before.annotations.filterNot(_ == header)))
+    bad(before.copy(annotations = before.annotations :+ header))
+    Seq(header.body.replace("Unbound_checkpoint_widget_reservation", "Invented_admission"),
+      header.body + NativeCheckpointWidgetReservation.header(0, 1),
+      header.body + "#define CHECKPOINT_CAPTURE_BASE 42ULL\n",
+      header.body.replace("stream=1", "stream=2147483648"),
+      header.body.replace("base=0", "base=18446744073709551616")).foreach { text =>
+      bad(before.copy(annotations = before.annotations.map(a => if (a == header) header.copy(body = text) else a)))
+    }
+    intercept[IllegalArgumentException](NativeCheckpointWidgetIdentity.bind(before,
+      after.copy(circuit = after.circuit.copy(info = FileInfo("stale"))), source))
+  }
 }

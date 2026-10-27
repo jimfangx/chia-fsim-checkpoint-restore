@@ -203,16 +203,21 @@ object NativeCheckpointWidgetReservation {
 
   /** Fail even if someone deletes a marker annotation or bypasses the normal
     * reservation API. An unbound digest/header can never become a real image.
+    * The external clock network still has no complete owner adapter: binding
+    * its selected descriptor identity cannot authorize production emission,
+    * including when every annotation/header has been stripped.
     */
   def requireBound(state: CircuitState): Unit = {
     val markers = state.annotations.exists {
       case _: NativeCheckpointWidgetExecutionAnnotation | _: NativeCheckpointWidgetPinAnnotation => true
-      case a: GoldenGateOutputFileAnnotation => a.body.contains("Unbound_checkpoint_widget_reservation")
+      case a: GoldenGateOutputFileAnnotation => a.body.contains("Unbound_checkpoint_widget_reservation") ||
+        a.body.contains(NativeCheckpointWidgetIdentity.incomplete)
       case _ => false
     }
     val sentinel = state.circuit.modules.exists {
       case m: ExtModule if m.defname == "CheckpointPhysicalCaptureTransport" =>
-        m.params.contains(IntParam("MANIFEST_SHA256", BigInt(digest, 16)))
+        m.params.contains(IntParam("MANIFEST_SHA256", BigInt(digest, 16))) ||
+          m.params.contains(IntParam("EXTERNAL_CLOCK_NETWORK", BigInt(1)))
       case _ => false
     }
     check(!markers && !sentinel,
