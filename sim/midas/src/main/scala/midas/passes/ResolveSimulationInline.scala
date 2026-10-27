@@ -45,6 +45,8 @@ private class RecordedSimulationInline extends InlineInstances {
   * machinery. A post-bank inline pass would invalidate its hierarchy binding.
   */
 object ResolveSimulationInline {
+  private val regionalPasses = Seq("ToWorkingIR", "ResolveKinds", "InferTypes", "ResolveFlows", "CheckTypes", "CheckFlows")
+  private val regionalScope = "regional_inline_output_metadata_normalization_only"
   private def fail(why: String): Nothing =
     throw new IllegalArgumentException(s"Simulation inline unsupported: $why")
 
@@ -86,14 +88,54 @@ object ResolveSimulationInline {
   def context(a: SimulationInlineResultAnnotation): JValue = {
     val doc = parse(a.body)
     def hash(k: String): Boolean = (doc \ k) match { case JString(s) => s.matches("[0-9a-f]{64}"); case _ => false }
+    val regional = (doc \ "version") == JInt(3)
     val keys = Set("version", "producer", "circuit", "request", "inline_annotations", "input_sha256",
-      "output_sha256", "input_annotations_sha256", "output_annotations_sha256", "renames", "storage", "no_dedup")
+      "output_sha256", "input_annotations_sha256", "output_annotations_sha256", "renames", "storage", "no_dedup") ++
+      (if (regional) Set("regional_normalization") else Set.empty[String])
     val fields = doc match { case JObject(xs) => xs.map(_._1); case _ => fail("invalid receipt") }
     if (fields.toSet != keys || fields.distinct.size != fields.size || canonical(doc) != a.body ||
-        (doc \ "version") != JInt(2) || (doc \ "producer") != JString("midas.passes.ResolveSimulationInline") ||
+        (!regional && (doc \ "version") != JInt(2)) || (doc \ "producer") != JString("midas.passes.ResolveSimulationInline") ||
         !Seq("input_sha256", "output_sha256", "input_annotations_sha256", "output_annotations_sha256").forall(hash) ||
         (doc \ "request") != parse(JsonProtocol.serialize(Seq(RunFirrtlTransformAnnotation(new InlineInstances)))))
       fail("invalid consumed request receipt")
+    if (regional) {
+      val normalization = doc \ "regional_normalization"
+      val expected = Set("normalization_version", "scope", "passes", "input_sha256", "output_sha256",
+        "input_annotations_sha256", "output_annotations_sha256", "changed_modules", "complete_fpga_capture",
+        "deployable_capture_image", "production_freeze_owners_bound", "metasim_restore_supported")
+      val names = normalization match { case JObject(xs) => xs.map(_._1); case _ => fail("missing regional normalization") }
+      if (names.toSet != expected || names.distinct.size != names.size ||
+          (normalization \ "normalization_version") != JInt(1) || (normalization \ "scope") != JString(regionalScope) ||
+          (normalization \ "passes") != JArray(regionalPasses.map(JString(_)).toList) ||
+          Seq("complete_fpga_capture", "deployable_capture_image", "production_freeze_owners_bound", "metasim_restore_supported")
+            .exists(k => (normalization \ k) != JBool(false)) ||
+          Seq("input_sha256", "output_sha256").exists(k => (normalization \ k) != (doc \ "output_sha256")) ||
+          Seq("input_annotations_sha256", "output_annotations_sha256")
+            .exists(k => (normalization \ k) != (doc \ "output_annotations_sha256")))
+        fail("invalid regional normalization contract")
+      val changes = normalization \ "changed_modules" match {
+        case JArray(xs) => xs
+        case _ => fail("missing regional normalization changes")
+      }
+      val modules = changes.map { row =>
+        val keys = row match { case JObject(xs) => xs.map(_._1); case _ => fail("invalid regional module normalization") }
+        if (keys.toSet != Set("module", "input_top_level_statements", "output_top_level_statements", "serialized_sha256") ||
+            keys.distinct.size != keys.size) fail("invalid regional module normalization schema")
+        Seq("input_top_level_statements", "output_top_level_statements").foreach(k => row \ k match {
+          case JInt(n) if n >= 0 && n.isValidInt => ()
+          case _ => fail("invalid regional statement count")
+        })
+        row \ "serialized_sha256" match {
+          case JString(s) if s.matches("[0-9a-f]{64}") => ()
+          case _ => fail("invalid regional module hash")
+        }
+        row \ "module" match {
+          case JString(s) if s.matches("[A-Za-z_][A-Za-z0-9_$]*") => s
+          case _ => fail("invalid regional module name")
+        }
+      }
+      if (modules != modules.distinct.sorted) fail("duplicate or unordered regional module normalization")
+    }
     val circuit = (doc \ "circuit") match {
       case JString(s) if s.matches("[A-Za-z_][A-Za-z0-9_$]*") => s
       case _ => fail("invalid receipt circuit")
@@ -161,7 +203,43 @@ object ResolveSimulationInline {
     doc
   }
 
-  def apply(state: CircuitState): CircuitState = {
+  def apply(state: CircuitState): CircuitState = consume(state, regional = false)
+
+  /** Narrow opt-in producer: finalize inline-generated Block/type/flow
+    * metadata BEFORE recording its immutable output history. Ordinary inline
+    * consumption and its v2 receipt remain unchanged.
+    */
+  def forCheckpointRegions(state: CircuitState): CircuitState = consume(state, regional = true)
+
+  private def normalizeRegionalOutput(input: CircuitState): (CircuitState, JValue) = {
+    val working = firrtl.passes.ToWorkingIR.run(input.circuit)
+    val typed = firrtl.passes.InferTypes.run(firrtl.passes.ResolveKinds.run(working))
+    val flowed = firrtl.passes.ResolveFlows.run(typed)
+    firrtl.passes.CheckTypes.run(flowed); firrtl.passes.CheckFlows.run(flowed)
+    if (input.circuit.serialize != flowed.serialize) fail("regional normalization changed serialized inline output")
+    def count(m: DefModule): Int = m match {
+      case m: Module => m.body match { case Block(xs) => xs.size; case _ => 1 }
+      case _ => 0
+    }
+    val changes = input.circuit.modules.zip(flowed.modules).collect { case (before, after) if before != after =>
+      JObject(List("module" -> JString(before.name), "input_top_level_statements" -> JInt(count(before)),
+        "output_top_level_statements" -> JInt(count(after)), "serialized_sha256" -> JString(sha256(before.serialize))))
+    }.sortBy(row => (row \ "module").asInstanceOf[JString].s)
+    val output = input.copy(circuit = flowed)
+    if (output.annotations.toVector != input.annotations.toVector || storage(output) != storage(input))
+      fail("regional normalization changed original annotations or storage")
+    val annotationsHash = sha256(JsonProtocol.serialize(input.annotations))
+    val body = JObject(List("normalization_version" -> JInt(1), "scope" -> JString(regionalScope),
+      "passes" -> JArray(regionalPasses.map(JString(_)).toList),
+      "input_sha256" -> JString(sha256(input.circuit.serialize)), "output_sha256" -> JString(sha256(flowed.serialize)),
+      "input_annotations_sha256" -> JString(annotationsHash), "output_annotations_sha256" -> JString(annotationsHash),
+      "changed_modules" -> JArray(changes.toList), "complete_fpga_capture" -> JBool(false),
+      "deployable_capture_image" -> JBool(false), "production_freeze_owners_bound" -> JBool(false),
+      "metasim_restore_supported" -> JBool(false)))
+    (output, body)
+  }
+
+  private def consume(state: CircuitState, regional: Boolean): CircuitState = {
     if (state.annotations.exists(_.isInstanceOf[SimulationInlineStorage])) fail("unexpected storage tracking input")
     val requests = state.annotations.collect {
       case a: RunFirrtlTransformAnnotation if a.transform.getClass == classOf[InlineInstances] => a
@@ -214,9 +292,13 @@ object ResolveSimulationInline {
     }
     if (tracked.map(_.target.serialize).distinct.sorted != after.keys.toSeq.sorted)
       fail("incomplete or aliased output storage coverage")
-    val clean = result.copy(annotations = result.annotations.filterNot(_.isInstanceOf[SimulationInlineStorage]))
+    val nativeClean = result.copy(annotations = result.annotations.filterNot(_.isInstanceOf[SimulationInlineStorage]))
+    val (clean, normalization) = if (regional) {
+      val (normalized, body) = normalizeRegionalOutput(nativeClean)
+      (normalized, List("regional_normalization" -> body))
+    } else (nativeClean, Nil)
     val receipt = SimulationInlineResultAnnotation(canonical(JObject(List(
-      "version" -> JInt(2), "producer" -> JString("midas.passes.ResolveSimulationInline"),
+      "version" -> JInt(if (regional) 3 else 2), "producer" -> JString("midas.passes.ResolveSimulationInline"),
       "circuit" -> JString(state.circuit.main), "request" -> parse(JsonProtocol.serialize(requests)),
       "inline_annotations" -> parse(JsonProtocol.serialize(targets)),
       "input_sha256" -> JString(sha256(state.circuit.serialize)),
@@ -225,7 +307,7 @@ object ResolveSimulationInline {
       "output_annotations_sha256" -> JString(sha256(JsonProtocol.serialize(clean.annotations))),
       "renames" -> JString(pass.renameHistory),
       "no_dedup" -> JArray(noDedupRows.toList),
-      "storage" -> JArray(rows.toList)))))
+      "storage" -> JArray(rows.toList)) ++ normalization)))
     context(receipt)
     clean.copy(annotations = clean.annotations :+ receipt)
   }

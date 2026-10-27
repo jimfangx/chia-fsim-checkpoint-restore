@@ -90,6 +90,83 @@ class ResolveSimulationInlineSpec extends AnyFlatSpec {
 
   behavior.of("Post-mapping simulator inline request consumption")
 
+  it should "normalize regional inline output inside its producer while preserving default v2 text storage and annotation order" in {
+    val original = input
+    val ordinary = ResolveSimulationInline(original)
+    val regional = ResolveSimulationInline.forCheckpointRegions(original)
+    val ordinaryReceipt = ordinary.annotations.collectFirst { case a: SimulationInlineResultAnnotation => a }.get
+    val regionalReceipt = regional.annotations.collectFirst { case a: SimulationInlineResultAnnotation => a }.get
+    val v2 = ResolveSimulationInline.context(ordinaryReceipt)
+    val v3 = ResolveSimulationInline.context(regionalReceipt)
+    assert((v2 \ "version") == JInt(2) && (v2 \ "regional_normalization") == JNothing)
+    assert((v3 \ "version") == JInt(3))
+    assert(ordinary.circuit.serialize == regional.circuit.serialize)
+    val expected = firrtl.passes.ResolveFlows.run(firrtl.passes.InferTypes.run(firrtl.passes.ResolveKinds.run(
+      firrtl.passes.ToWorkingIR.run(ordinary.circuit))))
+    assert(regional.circuit == expected)
+    assert(ordinary.annotations.filterNot(_ == ordinaryReceipt).toVector ==
+      regional.annotations.filterNot(_ == regionalReceipt).toVector)
+    Seq("storage", "no_dedup", "renames", "request", "inline_annotations", "input_sha256",
+      "input_annotations_sha256", "output_sha256", "output_annotations_sha256").foreach(k => assert((v2 \ k) == (v3 \ k)))
+    val normalization = v3 \ "regional_normalization"
+    assert((normalization \ "input_sha256") == (normalization \ "output_sha256"))
+    assert((normalization \ "output_sha256") == (v3 \ "output_sha256"))
+    val changes = (normalization \ "changed_modules").asInstanceOf[JArray].arr
+    assert(changes.nonEmpty)
+    assert(changes.exists(r => (r \ "input_top_level_statements") != (r \ "output_top_level_statements")))
+    assert(ResolveSimulationInline.forCheckpointRegions(regional) eq regional)
+    save("regional-v3-output.fir", regional.circuit.serialize)
+    save("regional-v3-output-annotations.json", JsonProtocol.serialize(regional.annotations.filterNot(_ == regionalReceipt)))
+    save("regional-v3-receipt.json", regionalReceipt.body)
+  }
+
+  it should "reject mixed-version malformed or false regional normalization receipts without loosening v2" in {
+    val regional = ResolveSimulationInline.forCheckpointRegions(input)
+    val receipt = regional.annotations.collectFirst { case a: SimulationInlineResultAnnotation => a }.get
+    val doc = parse(receipt.body)
+    val normalization = doc \ "regional_normalization"
+    val changes = (normalization \ "changed_modules").asInstanceOf[JArray].arr
+    def normalized(value: JValue): JValue = doc transformField {
+      case ("regional_normalization", _) => "regional_normalization" -> value
+    }
+    def changed(key: String, value: JValue): JValue =
+      JObject(normalization.asInstanceOf[JObject].obj.filterNot(_._1 == key) :+ (key -> value))
+    val invalidNormalizations = Seq(
+      changed("normalization_version", JInt(2)),
+      changed("scope", JString("complete_capture")),
+      changed("input_sha256", JString("a" * 64)),
+      changed("input_annotations_sha256", JString("b" * 64)),
+      changed("passes", JArray(Nil)),
+      changed("complete_fpga_capture", JBool(true)),
+      changed("extra", JBool(false)),
+      changed("changed_modules", JArray(changes :+ changes.head)),
+      changed("changed_modules", JArray(List(changes.head merge JObject(List("input_top_level_statements" -> JInt(-1)))))),
+      changed("changed_modules", JArray(List(changes.head merge JObject(List("module" -> JString("~Other|Module")))))),
+      changed("changed_modules", JArray(List(changes.head merge JObject(List("serialized_sha256" -> JString("bad")))))))
+    val mixed = Seq(doc transformField { case ("version", _) => "version" -> JInt(2) },
+      JObject(doc.asInstanceOf[JObject].obj.filterNot(_._1 == "regional_normalization")))
+    (invalidNormalizations.map(normalized) ++ mixed).zipWithIndex.foreach { case (value, index) =>
+      withClue(s"regional mutation $index: ") {
+        intercept[IllegalArgumentException](ResolveSimulationInline.context(SimulationInlineResultAnnotation(canonical(value))))
+      }
+    }
+    val ordinary = parse(ResolveSimulationInline(input).annotations.collectFirst {
+      case a: SimulationInlineResultAnnotation => a.body
+    }.get)
+    intercept[IllegalArgumentException](ResolveSimulationInline.context(SimulationInlineResultAnnotation(canonical(
+      ordinary transformField { case ("version", _) => "version" -> JInt(3) }))))
+  }
+
+  it should "retain native storage and ownership rejection before regional normalization" in {
+    val partial = input.copy(annotations = input.annotations.filterNot(_.isInstanceOf[InlineAnnotation]) :+
+      InlineAnnotation(ComponentName("left", ModuleName("InlineFixture", CircuitName("InlineFixture")))))
+    assert(intercept[IllegalArgumentException](ResolveSimulationInline.forCheckpointRegions(partial))
+      .getMessage.contains("missing or reshaped inline storage"))
+    Seq(input.copy(form = ChirrtlForm), input.copy(annotations = input.annotations :+ request),
+      input.copy(annotations = input.annotations :+ NoDedupAnnotation(ModuleTarget("Other", "Leaf")))).foreach(bad =>
+      intercept[IllegalArgumentException](ResolveSimulationInline.forCheckpointRegions(bad)))
+  }
+
   it should "execute the native pass before banking with complete repeated-instance register and memory mappings" in {
     val original = input
     val result = ResolveSimulationInline(original)

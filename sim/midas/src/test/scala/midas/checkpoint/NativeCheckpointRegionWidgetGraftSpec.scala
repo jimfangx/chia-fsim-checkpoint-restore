@@ -2,7 +2,7 @@
 package midas.checkpoint
 
 import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.{Files, Paths}
+import java.nio.file.{Files, Path, Paths}
 import chisel3._
 import chisel3.stage.ChiselStage
 import firrtl.{CircuitState, LowForm, Parser, WDefInstance, WRef, WSubField}
@@ -28,8 +28,9 @@ private case class UnsupportedRegionWidgetOwner(target: ReferenceTarget)
 }
 
 class NativeCheckpointRegionWidgetGraftSpec extends AnyFlatSpec {
-  private val out = Paths.get(sys.props.getOrElse("checkpoint.region.widget.out",
+  protected def fixtureOutput: Path = Paths.get(sys.props.getOrElse("checkpoint.region.widget.out",
     Paths.get(sys.env("CHECKPOINT_TEST_ARTIFACT_DIR")).resolve("native-region-widget").toString))
+  private lazy val out = fixtureOutput
   private def save(name: String, text: String): Unit = {
     Files.createDirectories(out.resolve(name).getParent); Files.write(out.resolve(name), text.getBytes(UTF_8))
   }
@@ -125,6 +126,11 @@ class NativeCheckpointRegionWidgetGraftSpec extends AnyFlatSpec {
   private lazy val policyAfter = ResolveSimulationInline(policyBefore)
   private lazy val policyInventory = ReservedCheckpointInventory.forReservedWidgetSource(policyBefore, policyAfter)
   private lazy val policySource = NativeCheckpointRegions.generate(policyInventory.source, targets, Some(policyInventory))
+
+  // Reuse the actual registered-widget fixture at the compiler phase boundary.
+  // Tests add requests BEFORE native inline records its immutable history.
+  private[checkpoint] def compilerProbeBefore(extra: firrtl.AnnotationSeq): CircuitState =
+    policyBefore.copy(annotations = policyBefore.annotations ++ extra)
 
   it should "project whole-host typed source policy and compiler history without dropping the original context" in {
     val result = NativeCheckpointRegionWidgetGraft.connect(policyBefore, policyAfter, policySource)

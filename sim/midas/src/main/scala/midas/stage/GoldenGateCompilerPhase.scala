@@ -23,6 +23,24 @@ case class GoldenGateInputCircuitAnnotation(
 ) extends firrtl.annotations.NoTargetAnnotation
 
 object GoldenGateCompilerPhase {
+  /** The regional diagnostic must bind the exact native inline phase pair.
+    * Only its opt-in branch prepares FPGA constants before recording inline
+    * history. Keep the ordinary compiler path and its image guard unchanged.
+    */
+  private[midas] def prepareCheckpointBoundary(input: CircuitState): CircuitState = {
+    val prepared = if (midas.checkpoint.NativeCheckpointRegionCompilerProbe.requested(input.annotations)) {
+      val constants = midas.checkpoint.SimulatorFPGASynthesisConstants(input)
+      val before = midas.checkpoint.NativeCheckpointRegionCompilerProbe.normalizeMetadata(constants)
+      val after = midas.passes.ResolveSimulationInline.forCheckpointRegions(before)
+      midas.checkpoint.NativeCheckpointRegionCompilerProbe(before, after)
+    } else {
+      val inlined = midas.passes.ResolveSimulationInline(input)
+      midas.checkpoint.SimulatorFPGASynthesisConstants(inlined)
+    }
+    midas.checkpoint.NativeCheckpointWidgetReservation.requireBound(prepared)
+    prepared
+  }
+
   private[midas] def consumeInputCircuit(annotations: AnnotationSeq): (firrtl.ir.Circuit, AnnotationSeq) = {
     val circuits = annotations.collect { case FirrtlCircuitAnnotation(c) => c }
     require(circuits.size == 1, "Golden Gate can only process a single Firrtl Circuit at a time.")
@@ -51,6 +69,7 @@ class GoldenGateCompilerPhase extends Phase {
     val (inputCircuit, consumedAnnotations) = GoldenGateCompilerPhase.consumeInputCircuit(emitterAnnotations)
     midas.checkpoint.SimulatorFPGASynthesisConstants.validateCardinality(annotations)
     midas.checkpoint.PhysicalClockCutPlan.validateCardinality(annotations)
+    midas.checkpoint.NativeCheckpointRegionCompilerProbe.validateCardinality(annotations)
 
     implicit val p = annotations.collectFirst({ case ConfigParametersAnnotation(p) => p }).get
 
@@ -102,6 +121,7 @@ class GoldenGateCompilerPhase extends Phase {
     midas.checkpoint.SimulatorBankProbe.validateRequest(simulator)
     midas.checkpoint.SimulatorFPGASynthesisConstants.validateRequest(simulator)
     midas.checkpoint.PhysicalClockCutPlan.validateRequest(simulator)
+    midas.checkpoint.NativeCheckpointRegionCompilerProbe.validateCardinality(simulator.annotations)
     // Note: the final lowering to Verilog is broken up into multiple firrtl.Compiler steps
     // to avoid breakages that can emerge from "legal" but unsound pass orderings
     // due to underspecified pass constraints + invalidations
@@ -109,7 +129,9 @@ class GoldenGateCompilerPhase extends Phase {
     val loweringCompiler = new Compiler(
       targets      = Seq(
         Dependency(midas.passes.AutoILATransform),
-        Dependency(midas.passes.HostClockWiring),
+        (if (midas.checkpoint.NativeCheckpointRegionCompilerProbe.requested(simulator.annotations))
+          Dependency(midas.passes.CheckpointRegionHostClockWiring)
+        else Dependency(midas.passes.HostClockWiring)),
       ) ++
         Forms.LowForm ++
         p(HostTransforms),
@@ -137,9 +159,7 @@ class GoldenGateCompilerPhase extends Phase {
         "Simulator bank probe cannot surround its own live capture transport")
     }
     val dedupRetiredSimulator = midas.passes.GoldenGateDedupGroups.retire(backendSimulator.copy(form = firrtl.LowForm))
-    val inlinedSimulator = midas.passes.ResolveSimulationInline(dedupRetiredSimulator)
-    val fpgaConstants = midas.checkpoint.SimulatorFPGASynthesisConstants(inlinedSimulator)
-    midas.checkpoint.NativeCheckpointWidgetReservation.requireBound(fpgaConstants)
+    val fpgaConstants = GoldenGateCompilerPhase.prepareCheckpointBoundary(dedupRetiredSimulator)
     val nativeBankCompanion = midas.checkpoint.NativeFunctionalBankProbe(fpgaConstants)
     val postLoweredSimulator = midas.checkpoint.SimulatorBankProbe(nativeBankCompanion)
 

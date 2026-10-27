@@ -22,6 +22,31 @@ object NativeCheckpointRegions {
   private def check(ok: Boolean, why: String): Unit = require(ok, "native checkpoint regions: " + why)
   private def json(as: firrtl.AnnotationSeq): String = JsonProtocol.serialize(as.distinct.sortBy(_.serialize))
 
+  /** FIRRTL text omits expression types, kinds and flows. Report the first
+    * concrete AST difference without treating equal text as equal typed IR.
+    */
+  private[checkpoint] def firstStructuralDifference(original: Any, generated: Any): String = {
+    def value(x: Any): String = if (x == null) "null" else
+      x.getClass.getSimpleName.stripSuffix("$") + ":" + x.toString.take(180)
+    def first(a: Any, b: Any, path: String): String = {
+      if (a == b) path + ": equal"
+      else (a, b) match {
+        case (left: Seq[_], right: Seq[_]) =>
+          if (left.size != right.size) s"$path.size: ${left.size} -> ${right.size}"
+          else {
+            val i = left.indices.find(i => left(i) != right(i)).get
+            first(left(i), right(i), s"$path[$i]")
+          }
+        case (left: Product, right: Product) if left.getClass == right.getClass && left.productArity == right.productArity =>
+          val i = (0 until left.productArity).find(i => left.productElement(i) != right.productElement(i))
+          i.map(index => first(left.productElement(index), right.productElement(index),
+            path + "." + left.productElementName(index))).getOrElse(s"$path: ${value(a)} -> ${value(b)}")
+        case _ => s"$path: ${value(a)} -> ${value(b)}"
+      }
+    }
+    first(original, generated, "module")
+  }
+
   def generate(host: CircuitState, targets: Seq[InstanceTarget],
       inventory: Option[ReservedCheckpointInventory] = None): Result = {
     check(host.form == LowForm, "resolved LowForm required")
@@ -82,7 +107,8 @@ object NativeCheckpointRegions {
       } else {
         val m = original.asInstanceOf[Module]
         val additions = changed.map { case (i, definition) =>
-          check(ancestors(i)(m.name), "changed unrelated original definition " + m.name)
+          if (!ancestors(i)(m.name)) check(false, "changed unrelated original definition " + m.name +
+            s" in region $i; " + firstStructuralDifference(m, definition))
           val next = definition.asInstanceOf[Module]
           check(next.ports.take(m.ports.size) == m.ports &&
             next.ports.drop(m.ports.size).forall(_.name.startsWith(prefix(i))), "changed original interface")
