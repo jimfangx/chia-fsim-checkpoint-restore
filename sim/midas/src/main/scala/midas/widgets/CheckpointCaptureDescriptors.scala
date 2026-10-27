@@ -24,6 +24,73 @@ final class CheckpointCaptureDescriptors private (
 }
 
 object CheckpointCaptureDescriptors {
+  /** Compose independently reconstructed regions of the SAME original host.
+    * The returned ROM uses router-global selectors and enclosing StateIDs.
+    * Missing owners remain explicit; this does not bind the shared freeze,
+    * concatenate the physical CE wires, or authorize a checkpoint image.
+    */
+  def fromNativeRegions(regions: Seq[CheckpointCaptureDescriptors]):
+      (CheckpointCaptureDescriptors, midas.checkpoint.CheckpointRegionRouting.Result) = {
+    def check(ok: Boolean, why: String): Unit = require(ok, "checkpoint region descriptors: " + why)
+    check(regions.nonEmpty, "no selected regions")
+    val manifests = regions.map(r => parse(r.manifest))
+    val bindings = regions.map(r => parse(r.binding))
+    check(manifests.forall(m => (m \ "scope") == JString("selected_inplace_global_identities_only")),
+      "regions must use independently reconstructed enclosing identities")
+    Seq("host_sha256", "global_simulator_manifest_sha256", "global_clock_plan_sha256",
+      "global_dependencies_sha256").foreach { key =>
+      check((bindings.head \ key).isInstanceOf[JString] && bindings.map(_ \ key).distinct.size == 1,
+        "different original host or common clock cut: " + key)
+    }
+    val scopes = manifests.map(m => (m \ "selected_scope").asInstanceOf[JString].s)
+    check(!scopes.indices.exists(i => scopes.indices.exists(j => i != j &&
+      (scopes(i) == scopes(j) || scopes(i).startsWith(scopes(j) + ".")))), "overlapping selected executions")
+    val routing = midas.checkpoint.CheckpointRegionRouting.allocate(regions.map(_.entries))
+    def rows(m: JValue, key: String): List[JValue] = (m \ key).asInstanceOf[JArray].arr
+    val originalRows = manifests.flatMap(rows(_, "state"))
+    val covered = originalRows.map(r => r \ "state_id").toSet
+    val localRows = manifests.zip(routing.regions).flatMap { case (m, r) => rows(m, "state").map { row =>
+      val JInt(bank) = row \ "bank"; val JInt(slot) = row \ "slot"
+      val physical = if (bank != 255) Nil else List("local_ce_bit" -> (row \ "ce_bit"),
+        "ce_bit" -> JInt(slot + r.ceBase))
+      row merge JObject(List("region" -> JInt(scopes.indexOf((m \ "selected_scope").asInstanceOf[JString].s)),
+        "local_ordinal" -> (row \ "ordinal"),
+        "local_bank" -> JInt(bank), "local_slot" -> JInt(slot),
+        "bank" -> JInt(if (bank == 255) bank else bank + r.bankBase),
+        "slot" -> JInt(if (bank == 255) slot + r.ceBase else slot)) ++ physical)
+    }}
+    val byID = localRows.map(row => (row \ "state_id") -> row).toMap
+    check(byID.size == routing.entries.size, "duplicate or missing region identity")
+    val state = routing.entries.zipWithIndex.map { case (e, index) =>
+      val row = byID(JString(e.stateID))
+      check((row \ "bank") == JInt(e.bank) && (row \ "slot") == JInt(e.slot) &&
+        (row \ "width") == JInt(e.width) && (row \ "depth") == JInt(e.depth), "routed descriptor mismatch")
+      row merge JObject(List("ordinal" -> JInt(index)))
+    }
+    val physical = manifests.flatMap(rows(_, "uncovered_physical_gates")).distinct.filterNot(r =>
+      covered(r \ "logical_latch_state_id"))
+    val functional = manifests.flatMap(rows(_, "uncovered_functional_state")).distinct.filterNot(r =>
+      covered(r \ "state_id"))
+    val flags = List("complete_fpga_capture", "deployable_capture_image", "production_freeze_owners_bound",
+      "metasim_restore_supported").map(_ -> JBool(false))
+    val manifest = SemanticStateInventory.canonical(JObject(List(
+      "descriptor_version" -> JInt(1), "scope" -> JString("selected_native_regions_only"),
+      "state" -> JArray(state.toList), "uncovered_functional_state" -> JArray(functional.toList),
+      "uncovered_physical_gates" -> JArray(physical.toList),
+      "physical_ce_order" -> JArray(scopes.zip(routing.regions).map { case (s, r) =>
+        JObject(List("selected_scope" -> JString(s), "base" -> JInt(r.ceBase), "count" -> JInt(r.ceCount)))
+      }.toList), "routing" -> parse(routing.binding)) ++ flags))
+    val binding = SemanticStateInventory.canonical(JObject(List(
+      "binding_version" -> JInt(1), "scope" -> JString("same_host_native_region_composition_only"),
+      "manifest_sha256" -> JString(SemanticStateInventory.sha256(manifest)),
+      "host_sha256" -> (bindings.head \ "host_sha256"),
+      "regions" -> JArray(regions.map(r => JObject(List("manifest" -> parse(r.manifest),
+        "binding" -> parse(r.binding), "manifest_sha256" -> JString(r.manifestSha256),
+        "binding_sha256" -> JString(r.bindingSha256)))).toList)) ++ flags))
+    (new CheckpointCaptureDescriptors(SemanticStateInventory.sha256(manifest), SemanticStateInventory.sha256(binding),
+      routing.entries, manifest, binding, regions.map(_.physicalClockGates).sum), routing)
+  }
+
   /** Use enclosing simulator StateIDs without changing the selected endpoint's
     * selectors, CE bit order or transfer order. Complete global deficits remain
     * in the manifest; this factory never grants capture/restore admission.
