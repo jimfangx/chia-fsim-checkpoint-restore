@@ -33,7 +33,7 @@ private[checkpoint] object GeneratedStateBankAnnotations {
          firrtl.passes.memlib.PassthroughSimpleSyncReadMemsAnnotation => true
     case _ => false
   }
-  private def supported(a: Annotation): Boolean = a match {
+  private[checkpoint] def supported(a: Annotation): Boolean = a match {
     case a if memoryPolicy(a) => true
     case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: firrtl.transforms.CombinationalPath |
          _: firrtl.transforms.NoDedupAnnotation | _: firrtl.passes.InlineAnnotation |

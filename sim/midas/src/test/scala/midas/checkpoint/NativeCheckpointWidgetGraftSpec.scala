@@ -16,6 +16,11 @@ import org.scalatest.flatspec.AnyFlatSpec
 /** Stateful native subtree inside the ACTUAL reserved FPGATop/MMIO/DMA host.
   * The reservation's public ports and all non-selected execution are retained.
   */
+private case class UnsupportedWidgetOwner(target: firrtl.annotations.ReferenceTarget)
+    extends firrtl.annotations.SingleTargetAnnotation[firrtl.annotations.ReferenceTarget] {
+  def duplicate(n: firrtl.annotations.ReferenceTarget) = copy(target = n)
+}
+
 class NativeCheckpointWidgetGraftSpec extends AnyFlatSpec {
   import SemanticStateInventory.{canonical, sha256}
   private lazy val input = Paths.get(sys.props("checkpoint.peer.input"))
@@ -235,4 +240,100 @@ class NativeCheckpointWidgetGraftSpec extends AnyFlatSpec {
     intercept[IllegalArgumentException](NativeCheckpointWidgetIdentity.bind(before,
       after.copy(circuit = after.circuit.copy(info = FileInfo("stale"))), source))
   }
+
+  private lazy val projectedBefore = {
+    val root = before.circuit.main
+    val leaf = ModuleTarget(root, "Leaf")
+    val native = ModuleTarget(root, "Native")
+    before.copy(annotations = before.annotations ++ Seq(
+      firrtl.transforms.DontTouchAnnotation(leaf.ref("value")),
+      firrtl.transforms.DontTouchAnnotation(ModuleTarget(root, "SimWrapper").ref("channelPorts_clock_ready")),
+      midas.targetutils.FirrtlMemModelAnnotation(ModuleTarget(root, "NativeStorage").ref("ram")),
+      midas.core.TargetBoxAnnotation(ModuleTarget(root, "SimWrapper").instOf("network", "NativeStorage")
+        .instOf("left_", "Leaf")),
+      midas.targetutils.xdc.XDCAnnotation(midas.targetutils.xdc.XDCFiles.Implementation,
+        "set checkpoint_pins [get_pins [list {} {}]]; if {[llength $checkpoint_pins] != 2} {error \"missing_native_pin_pair\"}; set_property DONT_TOUCH true [get_cells -of_objects $checkpoint_pins]", native.ref("CE"), native.ref("O")),
+      midas.InternalXDCAnnotation(midas.targetutils.xdc.XDCFiles.Implementation,
+        "set checkpoint_pins [get_pins [list {} {}]]; if {[llength $checkpoint_pins] != 2} {error \"missing_native_pin_pair\"}; set_property DONT_TOUCH true [get_cells -of_objects $checkpoint_pins]", leaf.ref("gate").field("CE"), leaf.ref("gate").field("O"))))
+  }
+
+  it should "project typed host storage contracts across the existing execution without broadening native pin constraints" in {
+    val post = ResolveSimulationInline(projectedBefore)
+    Files.createDirectories(out.resolveSibling("projection-input"))
+    Files.write(out.resolveSibling("projection-input").resolve("before.fir"), post.circuit.serialize.getBytes(UTF_8))
+    Files.write(out.resolveSibling("projection-input").resolve("before-annotations.json"), JsonProtocol.serialize(post.annotations).getBytes(UTF_8))
+    val result = NativeCheckpointWidgetGraft.connectProjected(projectedBefore, post, source)
+    val annotation = result.annotationProjection.get
+    val binding = parse(annotation)
+    assert((binding \ "scope") == JString("enclosing_host_typed_storage_annotations_only"))
+    assert((parse(result.binding) \ "host_annotation_projection_sha256") == JString(sha256(annotation)))
+    val live = GeneratedExternalOwners.instances(result.state, result.state.circuit.main).toMap
+    val touches = result.state.annotations.collect { case a: firrtl.transforms.DontTouchAnnotation => a.target }
+    val values = touches.filter(_.ref == "value")
+    assert(values.size == 2 && values.map(_.module).toSet == Set(
+      live("FPGATop.sim.network.left_").name, live("FPGATop.sim.network.right_").name))
+    val constraints = result.state.annotations.collect {
+      case a: midas.targetutils.xdc.XDCAnnotation if a.formatString.startsWith("set checkpoint_pins") => a
+    }
+    assert(constraints.size == 2)
+    val paths = constraints.map(_.argumentList.map(_.serialize))
+    assert(paths.forall(p => p.size == 2 && p.head.stripSuffix(">CE") == p.last.stripSuffix(">O")))
+    assert(paths.flatten.forall(t => t.startsWith("~FPGATop|FPGATop/sim:SimWrapper/network:") &&
+      !t.contains("checkpoint_native_root_gate")))
+    val correlated = result.state.annotations.collect { case a: midas.InternalXDCAnnotation => a }
+    assert(correlated.size == 2 && correlated.forall(a =>
+      a.argumentList.map(_.module).distinct.size == 1))
+    assert(!result.state.annotations.exists(_.isInstanceOf[firrtl.transforms.CombinationalPath]))
+    assert(result.state.annotations.contains(firrtl.transforms.NoCircuitDedupAnnotation))
+    val retained = post.annotations.filterNot(GeneratedStateBankAnnotations.supported)
+    assert(result.state.annotations.filterNot(GeneratedStateBankAnnotations.supported) == retained)
+    intercept[IllegalArgumentException](NativeCheckpointWidgetReservation.requireBound(result.state.copy(annotations = Nil)))
+    val directory = out.resolveSibling("widget-projection")
+    Files.createDirectories(directory)
+    val stream = Files.list(out)
+    try stream.forEach(p => if (Files.isRegularFile(p)) Files.copy(p, directory.resolve(p.getFileName),
+      StandardCopyOption.REPLACE_EXISTING)) finally stream.close()
+    def write(name: String, text: String): Unit = Files.write(directory.resolve(name), text.getBytes(UTF_8))
+    Seq("before-reserved" -> projectedBefore, "native-inlined" -> post, "connected" -> result.state).foreach {
+      case (name, state) => write(name + ".fir", state.circuit.serialize)
+        write(name + "-annotations.json", JsonProtocol.serialize(state.annotations))
+    }
+    write("annotation-projection.json", annotation)
+    write("connection.json", result.binding)
+    write("peer-routing.json", NativeCheckpointWidgetPeerRouting.inspect(projectedBefore, post))
+    val xdc = midas.passes.WriteXDCFile.execute(result.state.copy(annotations = result.state.annotations :+
+      midas.targetutils.xdc.XDCPathToCircuitAnnotation(None, None)))
+    xdc.annotations.collect { case a: midas.passes.XDCOutputAnnotation => a }.foreach(a =>
+      write("projected" + a.suffix.get, a.fileBody))
+    // Consume the typed XDC through its real downstream pass before Verilog
+    // emission; InternalXDC's DontTouchAllTargets is a pre-consumption policy.
+    val emitter = new Compiler(Seq(firrtl.options.Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm)
+    write("connected.sv", emitter.execute(xdc.copy(annotations = xdc.annotations.filterNot(
+      _.isInstanceOf[firrtl.EmitCircuitAnnotation]) :+ firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter])))
+      .getEmittedCircuit.value)
+    println(s"NATIVE_WIDGET_PROJECTION out=$directory targets_checked=true image_guard_retained=true")
+  }
+
+  it should "reject foreign stale opaque and unsupported changed-owner contracts on the projected path" in {
+    val root = before.circuit.main
+    val invalid = Seq(
+      firrtl.transforms.DontTouchAnnotation(ModuleTarget("foreign", "Leaf").ref("value")),
+      firrtl.transforms.DontTouchAnnotation(ModuleTarget(root, "Leaf").ref("missing")),
+      firrtl.transforms.DontTouchAnnotation(ModuleTarget(root, "Native").ref("CE")),
+      firrtl.annotations.MemoryFileInlineAnnotation(ModuleTarget(root, "Leaf").ref("value"), "wrong-kind.hex"),
+      UnsupportedWidgetOwner(ModuleTarget(root, "Leaf").ref("value")))
+    invalid.foreach { a =>
+      val modified = before.copy(annotations = before.annotations :+ a)
+      withClue(a.serialize + ": ") {
+        intercept[IllegalArgumentException](NativeCheckpointWidgetGraft.connectProjected(
+          modified, ResolveSimulationInline(modified), source))
+      }
+    }
+    val changed = source.copy(state = source.state.copy(circuit = source.state.circuit.copy(info = FileInfo("changed"))))
+    intercept[IllegalArgumentException](NativeCheckpointWidgetGraft.connectProjected(before, after, changed))
+    // The original strict API still refuses a target on a changed definition.
+    intercept[IllegalArgumentException](NativeCheckpointWidgetGraft.connect(
+      projectedBefore, ResolveSimulationInline(projectedBefore), source))
+  }
+
 }

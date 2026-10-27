@@ -14,12 +14,27 @@ import org.json4s.native.JsonMethods.parse
   */
 object NativeCheckpointWidgetGraft {
   import SemanticStateInventory.{canonical, sha256}
-  case class Result(state: CircuitState, graft: NativeCheckpointInPlaceGraft.Result, binding: String)
+  case class Result(state: CircuitState, graft: NativeCheckpointInPlaceGraft.Result, binding: String,
+      annotationProjection: Option[String] = None)
   private def check(ok: Boolean, why: String): Unit =
     require(ok, "checkpoint widget graft: " + why)
 
   def connect(before: CircuitState, after: CircuitState,
       source: NativeCheckpointInPlaceContext.Result): Result = {
+    connectImpl(before, after, source, projectAnnotations = false)
+  }
+
+  /** Explicit opt-in for the bank compiler's typed host-storage annotation
+    * contracts. Other host metadata remains unchanged; unsupported targets on
+    * changed definitions still reject. This does not admit complete production
+    * annotations, source policies or freeze ownership.
+    */
+  def connectProjected(before: CircuitState, after: CircuitState,
+      source: NativeCheckpointInPlaceContext.Result): Result =
+    connectImpl(before, after, source, projectAnnotations = true)
+
+  private def connectImpl(before: CircuitState, after: CircuitState,
+      source: NativeCheckpointInPlaceContext.Result, projectAnnotations: Boolean): Result = {
     val peerText = NativeCheckpointWidgetPeerRouting.inspect(before, after)
     val peer = parse(peerText)
     def text(doc: JValue, key: String): String = (doc \ key).asInstanceOf[JString].s
@@ -53,8 +68,12 @@ object NativeCheckpointWidgetGraft {
     check(graft.state.annotations.toVector == Vector(firrtl.transforms.NoCircuitDedupAnnotation),
       "generated annotation projection unsupported")
     val replacements = graft.state.circuit.modules.filter(m => originals.get(m.name).exists(_ != m))
-    val changedNames = replacements.map(_.name).toSet
-    after.annotations.filterNot(_.isInstanceOf[NativeCheckpointWidgetExecutionAnnotation]).foreach { a =>
+    // Original shared leaf definitions can remain in the module list even
+    // when their executing instances now use bank-specialized definitions.
+    // Unknown contracts on those originals must reject as well.
+    val changedNames = replacements.map(_.name).toSet ++ originals.keySet
+    after.annotations.filterNot(a => a.isInstanceOf[NativeCheckpointWidgetExecutionAnnotation] ||
+      (projectAnnotations && GeneratedStateBankAnnotations.supported(a))).foreach { a =>
       check(!a.getTargets.exists(t => changedNames.exists(n =>
         ("(?:\\||:)" + java.util.regex.Pattern.quote(n) + "(?=[/>]|$)").r.findFirstIn(t.serialize).nonEmpty)),
         "host annotation targets changed selected definition; projection unsupported: " + a.getClass.getName)
@@ -101,16 +120,16 @@ object NativeCheckpointWidgetGraft {
     val typed = firrtl.passes.InferTypes.run(firrtl.passes.ResolveKinds.run(working))
     val flowed = firrtl.passes.ResolveFlows.run(typed)
     firrtl.passes.CheckTypes.run(flowed); firrtl.passes.CheckFlows.run(flowed)
-    // Retain every original annotation byte-for-byte. The source has no
-    // target-bearing annotations, so there is no inferred rebasing exemption.
-    val result = after.copy(circuit = flowed)
+    val unprojected = after.copy(circuit = flowed)
+    val projection = if (projectAnnotations) Some(NativeCheckpointWidgetAnnotations.project(after, unprojected)) else None
+    val result = projection.map(_.state).getOrElse(unprojected)
     val rows = expected.sortBy(_.name).map { p =>
       val role = p.name.stripPrefix("capture_")
       JObject(List("role" -> JString(role), "peer" -> JString(byRole(role)),
         "selected_pin" -> JString(instance + "." + p.name), "type" -> JString(p.tpe.serialize),
         "direction" -> JString(if (p.direction == Input) "from_transport" else "to_transport")))
     }
-    val binding = canonical(JObject(List(
+    val fields = List(
       "connection_version" -> JInt(1), "scope" -> JString("reserved_widget_to_existing_selected_graft_routes_only"),
       "peer_routing_sha256" -> JString(sha256(peerText)), "source_sha256" -> JString(sha256(after.circuit.serialize)),
       "original_selected_sha256" -> JString(sha256(source.host.circuit.serialize)),
@@ -128,7 +147,9 @@ object NativeCheckpointWidgetGraft {
       "external_transport_state_owner" -> JString("unsupported_no_state_adapter"),
       "production_annotations_translated" -> JBool(false), "production_freeze_owners_bound" -> JBool(false),
       "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
-      "metasim_restore_supported" -> JBool(false))))
-    Result(result, graft, binding)
+      "metasim_restore_supported" -> JBool(false))
+    val binding = canonical(JObject(fields ++ projection.toList.map(p =>
+      "host_annotation_projection_sha256" -> JString(sha256(p.binding)))))
+    Result(result, graft, binding, projection.map(_.binding))
   }
 }
