@@ -336,4 +336,96 @@ class NativeCheckpointWidgetGraftSpec extends AnyFlatSpec {
       projectedBefore, ResolveSimulationInline(projectedBefore), source))
   }
 
+  private def sourceWith(annotations: firrtl.AnnotationSeq): NativeCheckpointInPlaceContext.Result =
+    NativeCheckpointInPlaceContext.generate(source.host.copy(annotations = source.host.annotations ++ annotations),
+      ModuleTarget("SimWrapper", "SimWrapper").instOf("network", "NativeStorage"))
+
+  private lazy val policySource = sourceWith(Seq(
+    firrtl.annotations.MemoryNoSynthInit,
+    firrtl.transforms.DontTouchAnnotation(ModuleTarget("SimWrapper", "Leaf").ref("value")),
+    midas.targetutils.FirrtlMemModelAnnotation(ModuleTarget("SimWrapper", "NativeStorage").ref("ram")),
+    midas.core.TargetBoxAnnotation(ModuleTarget("SimWrapper", "SimWrapper").instOf("network", "NativeStorage")
+      .instOf("left_", "Leaf")),
+    midas.targetutils.xdc.XDCAnnotation(midas.targetutils.xdc.XDCFiles.Implementation,
+      "set checkpoint_pins [get_pins [list {} {}]]; if {[llength $checkpoint_pins] != 2} {error \"missing_native_pin_pair\"}; set_property DONT_TOUCH true [get_cells -of_objects $checkpoint_pins]",
+      ModuleTarget("SimWrapper", "Native").ref("CE"), ModuleTarget("SimWrapper", "Native").ref("O"))))
+
+  it should "merge independently reconstructed typed source contracts without broadening their original executions" in {
+    val input = before.copy(annotations = before.annotations ++ Seq(firrtl.annotations.MemoryNoSynthInit,
+      firrtl.transforms.DontTouchAnnotation(ModuleTarget("FPGATop", "SimWrapper").ref("channelPorts_clock_ready"))))
+    val post = ResolveSimulationInline(input)
+    val result = NativeCheckpointWidgetGraft.connectProjected(input, post, policySource)
+    val receipt = result.sourceAnnotationProjection.get
+    assert((parse(result.binding) \ "source_annotation_projection_sha256") == JString(sha256(receipt)))
+    assert((parse(receipt) \ "scope") == JString("typed_selected_source_contract_merge_only"))
+    val live = GeneratedExternalOwners.instances(result.state, result.state.circuit.main).toMap
+    val touches = result.state.annotations.collect { case a: firrtl.transforms.DontTouchAnnotation => a.target }
+    assert(touches.filter(_.ref == "value").map(_.module).toSet == Set(
+      live("FPGATop.sim.network.left_").name, live("FPGATop.sim.network.right_").name))
+    val constraints = result.state.annotations.collect {
+      case a: midas.targetutils.xdc.XDCAnnotation if a.formatString.startsWith("set checkpoint_pins") => a
+    }
+    assert(constraints.size == 2 && constraints.forall(a => a.argumentList.size == 2 &&
+      a.argumentList.forall(t => t.circuit == "FPGATop" && t.module == "SimWrapper" &&
+        !t.serialize.contains("checkpoint_native_root_gate"))))
+    assert(result.state.annotations.filterNot(GeneratedStateBankAnnotations.supported) ==
+      post.annotations.filterNot(GeneratedStateBankAnnotations.supported))
+    assert(result.state.annotations.count(_ == firrtl.annotations.MemoryNoSynthInit) == 1)
+    assert(result.state.annotations.exists(_.isInstanceOf[midas.core.TargetBoxAnnotation]))
+    Seq(result.state, result.state.copy(annotations = Nil)).foreach(s =>
+      intercept[IllegalArgumentException](NativeCheckpointWidgetReservation.requireBound(s)))
+    intercept[IllegalArgumentException](PhysicalClockGateContract.requireCaptureOwner(result.state))
+    val directory = out.resolveSibling("widget-source-policy")
+    Files.createDirectories(directory)
+    val stream = Files.list(out)
+    try stream.forEach(p => if (Files.isRegularFile(p)) Files.copy(p, directory.resolve(p.getFileName),
+      StandardCopyOption.REPLACE_EXISTING)) finally stream.close()
+    def write(name: String, text: String): Unit = Files.write(directory.resolve(name), text.getBytes(UTF_8))
+    Seq("before-reserved" -> input, "native-inlined" -> post, "original-selected" -> policySource.host,
+      "graft" -> result.graft.state, "connected" -> result.state).foreach { case (name, state) =>
+      write(name + ".fir", state.circuit.serialize)
+      write(name + "-annotations.json", JsonProtocol.serialize(state.annotations))
+    }
+    write("source-policy.json", receipt)
+    write("source-context.json", policySource.binding)
+    val descriptors = NativeCheckpointInPlaceAccess.descriptors(policySource)
+    write("descriptors.json", descriptors.manifest)
+    write("descriptor-binding.json", descriptors.binding)
+    write("annotation-projection.json", result.annotationProjection.get)
+    write("connection.json", result.binding)
+    write("peer-routing.json", NativeCheckpointWidgetPeerRouting.inspect(input, post))
+    result.graft.files.foreach(f => write("graft" + f.fileSuffix, f.body))
+    val xdc = midas.passes.WriteXDCFile.execute(result.state.copy(annotations = result.state.annotations :+
+      midas.targetutils.xdc.XDCPathToCircuitAnnotation(None, None)))
+    xdc.annotations.collect { case a: midas.passes.XDCOutputAnnotation => a }.foreach(a =>
+      write("projected" + a.suffix.get, a.fileBody))
+    val emitter = new Compiler(Seq(firrtl.options.Dependency[firrtl.SystemVerilogEmitter]), Forms.LowForm)
+    write("connected.sv", emitter.execute(xdc.copy(annotations = xdc.annotations.filterNot(
+      _.isInstanceOf[firrtl.EmitCircuitAnnotation]) :+ firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter])))
+      .getEmittedCircuit.value)
+    println(s"NATIVE_WIDGET_SOURCE_POLICY out=$directory contracts_checked=true image_guard_retained=true")
+  }
+
+  it should "reject missing global policies, conflicting unions and stale source contracts on the projected path" in {
+    def bad(input: CircuitState, selected: NativeCheckpointInPlaceContext.Result, fragment: String): Unit = {
+      val error = intercept[IllegalArgumentException](NativeCheckpointWidgetGraft.connectProjected(
+        input, ResolveSimulationInline(input), selected))
+      assert(error.getMessage.contains(fragment), error.getMessage)
+    }
+    bad(before, policySource, "global source policy absent")
+    bad(before.copy(annotations = before.annotations :+ firrtl.annotations.MemorySynthInit),
+      policySource, "conflicting memory synthesis initialization")
+    val files = sourceWith(Seq(firrtl.annotations.MemoryFileInlineAnnotation(
+      ModuleTarget("SimWrapper", "NativeStorage").ref("ram"), "source.hex")))
+    val hostFile = firrtl.annotations.MemoryFileInlineAnnotation(
+      ModuleTarget("FPGATop", "NativeStorage").ref("ram"), "host.hex")
+    bad(before.copy(annotations = before.annotations :+ hostFile), files, "overlapping memory initialization")
+    bad(before, policySource.copy(host = policySource.host.copy(annotations = policySource.host.annotations :+
+      UnsupportedWidgetOwner(ModuleTarget("SimWrapper", "Leaf").ref("value")))), "source annotation projection")
+    bad(before, policySource.copy(state = policySource.state.copy(annotations = Nil)), "projected annotations changed")
+    val inline = sourceWith(Seq(firrtl.passes.InlineAnnotation(firrtl.annotations.CircuitName("SimWrapper"))))
+    bad(before, inline, "broaden outside selected execution")
+    intercept[IllegalArgumentException](NativeCheckpointWidgetGraft.connect(before, after, policySource))
+  }
+
 }

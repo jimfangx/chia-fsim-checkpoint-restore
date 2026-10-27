@@ -8,14 +8,14 @@ import org.json4s.native.JsonMethods.parse
 
 /** Connect the real reserved widget to a reconstructed graft in its ONE
   * existing selected execution. This bounded connector accepts no source
-  * annotation policy beyond NoCircuitDedup: production annotation projection,
+  * annotation policy unless explicitly projected: complete production projection,
   * immutable identity and complete ownership remain mandatory later work.
   * Reservation markers, sentinel identity and image guards are retained.
   */
 object NativeCheckpointWidgetGraft {
   import SemanticStateInventory.{canonical, sha256}
   case class Result(state: CircuitState, graft: NativeCheckpointInPlaceGraft.Result, binding: String,
-      annotationProjection: Option[String] = None)
+      annotationProjection: Option[String] = None, sourceAnnotationProjection: Option[String] = None)
   private def check(ok: Boolean, why: String): Unit =
     require(ok, "checkpoint widget graft: " + why)
 
@@ -26,8 +26,10 @@ object NativeCheckpointWidgetGraft {
 
   /** Explicit opt-in for the bank compiler's typed host-storage annotation
     * contracts. Other host metadata remains unchanged; unsupported targets on
-    * changed definitions still reject. This does not admit complete production
-    * annotations, source policies or freeze ownership.
+    * changed definitions still reject. Typed selected-source contracts are
+    * rebased and merged only after independent graft reconstruction; conflicting
+    * policies reject. Complete production annotations and freeze ownership are
+    * still required for image admission.
     */
   def connectProjected(before: CircuitState, after: CircuitState,
       source: NativeCheckpointInPlaceContext.Result): Result =
@@ -50,7 +52,10 @@ object NativeCheckpointWidgetGraft {
       "selected execution must be an immediate child of peer host")
     check(source.host.form == LowForm && source.host.circuit.main == selectedModule,
       "graft source root must equal existing selected execution")
-    check(source.host.annotations.toVector == Vector(firrtl.transforms.NoCircuitDedupAnnotation),
+    val sourcePolicy = source.host.annotations.toVector != Vector(firrtl.transforms.NoCircuitDedupAnnotation)
+    check(!sourcePolicy || (projectAnnotations &&
+      source.host.annotations.count(_ == firrtl.transforms.NoCircuitDedupAnnotation) == 1 &&
+      source.host.annotations.forall(GeneratedStateBankAnnotations.supported)),
       "source annotation projection unsupported; exact NoCircuitDedup policy required")
     val originals = source.host.circuit.modules.map(m => m.name -> m).toMap
     val originalLive = GeneratedExternalOwners.instances(source.host, selectedModule).map(_._2.name).toSet
@@ -65,7 +70,8 @@ object NativeCheckpointWidgetGraft {
     val descriptors = NativeCheckpointInPlaceAccess.descriptors(source)
     check(execution.entries == descriptors.entries.size && execution.gates == descriptors.physicalClockGates,
       "reserved entry/gate count differs from reconstructed descriptors")
-    check(graft.state.annotations.toVector == Vector(firrtl.transforms.NoCircuitDedupAnnotation),
+    check((sourcePolicy && projectAnnotations) ||
+      graft.state.annotations.toVector == Vector(firrtl.transforms.NoCircuitDedupAnnotation),
       "generated annotation projection unsupported")
     val replacements = graft.state.circuit.modules.filter(m => originals.get(m.name).exists(_ != m))
     // Original shared leaf definitions can remain in the module list even
@@ -122,7 +128,10 @@ object NativeCheckpointWidgetGraft {
     firrtl.passes.CheckTypes.run(flowed); firrtl.passes.CheckFlows.run(flowed)
     val unprojected = after.copy(circuit = flowed)
     val projection = if (projectAnnotations) Some(NativeCheckpointWidgetAnnotations.project(after, unprojected)) else None
-    val result = projection.map(_.state).getOrElse(unprojected)
+    val projected = projection.map(_.state).getOrElse(unprojected)
+    val sourceProjection = if (sourcePolicy) Some(NativeCheckpointWidgetAnnotations.mergeSource(
+      source.host, graft.state, projected)) else None
+    val result = sourceProjection.map(_.state).getOrElse(projected)
     val rows = expected.sortBy(_.name).map { p =>
       val role = p.name.stripPrefix("capture_")
       JObject(List("role" -> JString(role), "peer" -> JString(byRole(role)),
@@ -149,7 +158,8 @@ object NativeCheckpointWidgetGraft {
       "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
       "metasim_restore_supported" -> JBool(false))
     val binding = canonical(JObject(fields ++ projection.toList.map(p =>
-      "host_annotation_projection_sha256" -> JString(sha256(p.binding)))))
-    Result(result, graft, binding, projection.map(_.binding))
+      "host_annotation_projection_sha256" -> JString(sha256(p.binding))) ++ sourceProjection.toList.map(p =>
+      "source_annotation_projection_sha256" -> JString(sha256(p.binding)))))
+    Result(result, graft, binding, projection.map(_.binding), sourceProjection.map(_.binding))
   }
 }

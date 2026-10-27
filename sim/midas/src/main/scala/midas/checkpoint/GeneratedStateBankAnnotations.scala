@@ -56,10 +56,9 @@ private[checkpoint] object GeneratedStateBankAnnotations {
   // Preserve the root and every instance hop; flattening to a leaf module
   // loses the distinction between repeated instances. Only concrete reachable
   // paths can be specialized: a stale pre-link placeholder must fail closed.
-  private def validateTargetBox(state: CircuitState, target: IsModule, label: String = "target-box"): Unit = {
+  private def validateTargetBox(state: CircuitState, target: IsModule,
+      modules: Map[String, DefModule], reachable: Set[String], label: String = "target-box"): Unit = {
     if (target.circuit != state.circuit.main) fail(s"foreign $label target: ${target.serialize}")
-    val modules = state.circuit.modules.map(m => m.name -> m).toMap
-    val reachable = GeneratedExternalOwners.instances(state, state.circuit.main).map(_._2.name).toSet
     def concrete(name: String): Module = modules.get(name) match {
       case Some(m: Module) if reachable(name) => m
       case _ => fail(s"$label target requires a reachable concrete module: $name")
@@ -169,6 +168,11 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     // A preservation/initialization contract on one must fail here, rather
     // than be deleted by a compiler rename or an invalid-target cleanup pass.
     val reachable = GeneratedExternalOwners.instances(state, state.circuit.main).map(_._2.name).toSet
+    // A production circuit has thousands of deduplication-history targets.
+    // They all refer to this immutable state: rebuilding its complete execution
+    // hierarchy for every target multiplies the audit cost without adding a
+    // check. This map lives only for this preflight, never across circuit edits.
+    val modules = state.circuit.modules.map(m => m.name -> m).toMap
     def moduleTarget(circuit: String, module: String, serialized: String): Unit = {
       if (circuit != state.circuit.main) fail(s"foreign annotation target: $serialized")
       if (!reachable(module)) fail(s"annotation target is unreachable: $serialized")
@@ -184,8 +188,8 @@ private[checkpoint] object GeneratedStateBankAnnotations {
         if (a.original.circuit.isEmpty || a.original.module.isEmpty ||
             !a.index.isFinite || (a.duplicate.nonEmpty && (a.index < 0 || a.index > 1)) ||
             (a.duplicate.isEmpty && a.index != -1)) fail("invalid deduplication history")
-        a.duplicate.foreach(validateTargetBox(state, _, "deduplication"))
-      case a: TargetBoxAnnotation => validateTargetBox(state, a.target)
+        a.duplicate.foreach(validateTargetBox(state, _, modules, reachable, "deduplication"))
+      case a: TargetBoxAnnotation => validateTargetBox(state, a.target, modules, reachable)
       case a: firrtl.transforms.NoDedupAnnotation =>
         moduleTarget(a.target.circuit, a.target.module, a.target.serialize)
       case a: firrtl.passes.InlineAnnotation => a.target match {
