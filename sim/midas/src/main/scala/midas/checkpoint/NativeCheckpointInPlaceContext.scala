@@ -19,7 +19,8 @@ object NativeCheckpointInPlaceContext {
     require(ok, "Native in-place compiler context: " + why)
 
   def generate(host: CircuitState, target: InstanceTarget,
-      sidebandPrefix: String = NativeCheckpointInPlace.prefix): Result = {
+      sidebandPrefix: String = NativeCheckpointInPlace.prefix,
+      inventory: Option[ReservedCheckpointInventory] = None): Result = {
     check(host.form == LowForm, "resolved LowForm required")
     val (context, owners) = host.annotations.partition(SimulatorBankProbeContext.accepts)
     val storage = host.copy(annotations = owners)
@@ -50,7 +51,7 @@ object NativeCheckpointInPlaceContext {
     val manifest = SimulatorStateInventory.discover(reference)
     val plan = PhysicalClockCutPlan.discover(reference, manifest)
     val dependencies = PhysicalClockCutDependencies.discover(reference, manifest, plan)
-    val native = NativeCheckpointInPlace.generate(storage, target, reference, manifest, plan, dependencies, sidebandPrefix)
+    val native = NativeCheckpointInPlace.generate(storage, target, reference, manifest, plan, dependencies, sidebandPrefix, inventory)
     val projected = native.state.copy(annotations = native.state.annotations ++ context)
     val snapshot = SimulatorBankProbeContext.snapshot(context, host.circuit.serialize, projected.circuit.serialize)
     val binding = canonical(JObject(List(

@@ -71,6 +71,12 @@ object CheckpointCaptureDescriptors {
       covered(r \ "logical_latch_state_id"))
     val functional = manifests.flatMap(rows(_, "uncovered_functional_state")).distinct.filterNot(r =>
       covered(r \ "state_id"))
+    val externalRows = manifests.flatMap(m => (m \ "unsupported_external_owners") match {
+      case JArray(xs) => xs
+      case JNothing => Nil
+      case _ => throw new IllegalArgumentException("native regions: malformed external owners")
+    }).distinct
+    val external = if (externalRows.isEmpty) Nil else List("unsupported_external_owners" -> JArray(externalRows.toList))
     val flags = List("complete_fpga_capture", "deployable_capture_image", "production_freeze_owners_bound",
       "metasim_restore_supported").map(_ -> JBool(false))
     val manifest = SemanticStateInventory.canonical(JObject(List(
@@ -79,14 +85,14 @@ object CheckpointCaptureDescriptors {
       "uncovered_physical_gates" -> JArray(physical.toList),
       "physical_ce_order" -> JArray(scopes.zip(routing.regions).map { case (s, r) =>
         JObject(List("selected_scope" -> JString(s), "base" -> JInt(r.ceBase), "count" -> JInt(r.ceCount)))
-      }.toList), "routing" -> parse(routing.binding)) ++ flags))
+      }.toList), "routing" -> parse(routing.binding)) ++ flags ++ external))
     val binding = SemanticStateInventory.canonical(JObject(List(
       "binding_version" -> JInt(1), "scope" -> JString("same_host_native_region_composition_only"),
       "manifest_sha256" -> JString(SemanticStateInventory.sha256(manifest)),
       "host_sha256" -> (bindings.head \ "host_sha256"),
       "regions" -> JArray(regions.map(r => JObject(List("manifest" -> parse(r.manifest),
         "binding" -> parse(r.binding), "manifest_sha256" -> JString(r.manifestSha256),
-        "binding_sha256" -> JString(r.bindingSha256)))).toList)) ++ flags))
+        "binding_sha256" -> JString(r.bindingSha256)))).toList)) ++ flags ++ external))
     (new CheckpointCaptureDescriptors(SemanticStateInventory.sha256(manifest), SemanticStateInventory.sha256(binding),
       routing.entries, manifest, binding, regions.map(_.physicalClockGates).sum), routing)
   }
@@ -97,9 +103,9 @@ object CheckpointCaptureDescriptors {
     */
   def fromNativeInPlace(host: CircuitState, target: firrtl.annotations.InstanceTarget,
       reference: CircuitState, simulatorManifest: String, plan: String,
-      dependencies: String): CheckpointCaptureDescriptors = {
+      dependencies: String, inventory: Option[midas.checkpoint.ReservedCheckpointInventory] = None): CheckpointCaptureDescriptors = {
     val identity = midas.checkpoint.NativeCheckpointIdentity.discover(host, target, reference,
-      simulatorManifest, plan, dependencies)
+      simulatorManifest, plan, dependencies, inventory)
     fromNativeInPlaceIdentity(identity)
   }
 

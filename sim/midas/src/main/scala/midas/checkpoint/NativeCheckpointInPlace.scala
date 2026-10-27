@@ -32,7 +32,7 @@ object NativeCheckpointInPlace {
 
   def generate(host: CircuitState, target: InstanceTarget, reference: CircuitState,
       manifest: String, plan: String, dependencies: String,
-      sidebandPrefix: String = prefix): Result = {
+      sidebandPrefix: String = prefix, inventory: Option[ReservedCheckpointInventory] = None): Result = {
     check(sidebandPrefix.matches("checkpoint_inplace_[A-Za-z0-9_]*"), "invalid sideband namespace")
     val prefix = sidebandPrefix
     check(host.form == LowForm && reference.form == LowForm, "resolved LowForm required")
@@ -173,7 +173,7 @@ object NativeCheckpointInPlace {
         case a: firrtl.transforms.CombinationalPath => JString(a.serialize)
       }.toList),
       "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false))))
-    val identity = NativeCheckpointIdentity.discover(host, target, reference, manifest, plan, dependencies)
+    val identity = NativeCheckpointIdentity.discover(host, target, reference, manifest, plan, dependencies, inventory)
     val binding = canonical(JObject(List(
       "binding_version" -> JInt(3), "scope" -> JString("existing_instance_native_banks_only"),
       "target" -> JString(target.serialize), "host_sha256" -> JString(sha256(host.circuit.serialize)),

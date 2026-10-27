@@ -17,25 +17,26 @@ object NativeCheckpointRegions {
   import SemanticStateInventory.{canonical, sha256}
   case class Result(state: CircuitState, host: CircuitState, targets: Seq[InstanceTarget],
       regions: Seq[NativeCheckpointInPlaceContext.Result], descriptors: CheckpointCaptureDescriptors,
-      routing: CheckpointRegionRouting.Result, binding: String)
+      routing: CheckpointRegionRouting.Result, binding: String, inventory: Option[ReservedCheckpointInventory] = None)
   def prefix(index: Int): String = NativeCheckpointInPlace.prefix + s"region${index}_"
   private def check(ok: Boolean, why: String): Unit = require(ok, "native checkpoint regions: " + why)
   private def json(as: firrtl.AnnotationSeq): String = JsonProtocol.serialize(as.distinct.sortBy(_.serialize))
 
-  def generate(host: CircuitState, targets: Seq[InstanceTarget]): Result = {
+  def generate(host: CircuitState, targets: Seq[InstanceTarget],
+      inventory: Option[ReservedCheckpointInventory] = None): Result = {
     check(host.form == LowForm, "resolved LowForm required")
     check(targets.nonEmpty && targets.size <= 255, "invalid region count")
     val paths = targets.map(_.asPath.map(_._1.value))
     check(!paths.indices.exists(i => paths.indices.exists(j => i != j && paths(i).startsWith(paths(j)))),
       "overlapping selected executions")
     val regions = targets.zipWithIndex.map { case (t, i) =>
-      NativeCheckpointInPlaceContext.generate(host, t, prefix(i))
+      NativeCheckpointInPlaceContext.generate(host, t, prefix(i), inventory)
     }
     val clocks = regions.map(r => parse(r.native.binding) \ "enclosing_raw_clock")
     check(clocks.distinct.size == 1, "selected executions do not share a proven raw clock")
     val descriptors = regions.zip(targets).map { case (r, t) =>
       CheckpointCaptureDescriptors.fromNativeInPlace(host.copy(annotations = host.annotations.filterNot(
-        SimulatorBankProbeContext.accepts)), t, r.reference, r.manifest, r.plan, r.dependencies)
+        SimulatorBankProbeContext.accepts)), t, r.reference, r.manifest, r.plan, r.dependencies, inventory)
     }
     val (combined, routing) = CheckpointCaptureDescriptors.fromNativeRegions(descriptors)
     val originals = host.circuit.modules.map(m => m.name -> m).toMap
@@ -138,14 +139,16 @@ object NativeCheckpointRegions {
         "context_binding_sha256" -> JString(sha256(r.binding)))) }.toList),
       "original_execution_duplicated" -> JBool(false),
       "production_freeze_owners_bound" -> JBool(false), "complete_fpga_capture" -> JBool(false),
-      "deployable_capture_image" -> JBool(false), "metasim_restore_supported" -> JBool(false))))
-    Result(state, host, targets, regions, combined, routing, binding)
+      "deployable_capture_image" -> JBool(false), "metasim_restore_supported" -> JBool(false)) ++
+      inventory.toList.flatMap(i => List("unsupported_external_owners" -> i.unsupportedOwners,
+        "reserved_inventory_binding_sha256" -> JString(sha256(i.binding))))))
+    Result(state, host, targets, regions, combined, routing, binding, inventory)
   }
 
   /** Reconstruct from the original, including annotation/context semantics;
     * caller-rehashed circuits or metadata cannot establish coverage. */
   def validate(result: Result): Unit = {
-    val rebuilt = generate(result.host, result.targets)
+    val rebuilt = generate(result.host, result.targets, result.inventory)
     def sameState(a: CircuitState, b: CircuitState): Boolean = a.form == b.form && a.renames == b.renames &&
       a.circuit == b.circuit && a.annotations.toVector == b.annotations.toVector
     check(sameState(result.state, rebuilt.state) &&

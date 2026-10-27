@@ -30,7 +30,8 @@ object NativeCheckpointIdentity {
   }
 
   def discover(host: CircuitState, target: InstanceTarget, reference: CircuitState,
-      manifest: String, plan: String, dependencies: String): Result = {
+      manifest: String, plan: String, dependencies: String,
+      inventory: Option[ReservedCheckpointInventory] = None): Result = {
     check(host.form == LowForm && reference.form == LowForm, "resolved LowForm required")
     check(target.circuit == host.circuit.main && target.module == host.circuit.main,
       "target must be rooted at enclosing circuit")
@@ -58,9 +59,13 @@ object NativeCheckpointIdentity {
     // CE dependencies. No caller-supplied ID, selector or coverage list is trusted.
     val banks = GeneratedStateBankAccess.generatePhysicalCompanion(reference, manifest, plan, dependencies)
     val descriptors = CheckpointCaptureDescriptors.fromNativeGenerated(banks, reference, manifest, plan, dependencies)
-    val globalManifest = SimulatorStateInventory.discover(host)
-    val globalPlan = PhysicalClockCutPlan.discover(host, globalManifest)
-    val globalDependencies = PhysicalClockCutDependencies.discover(host, globalManifest, globalPlan)
+    val analysis = inventory.map(_.analysisFor(host)).getOrElse(host)
+    val globalManifest = SimulatorStateInventory.discover(analysis)
+    val globalPlan = PhysicalClockCutPlan.discover(analysis, globalManifest)
+    val globalDependencies = PhysicalClockCutDependencies.discover(analysis, globalManifest, globalPlan)
+    val external = inventory.toList.flatMap(i => List(
+      "unsupported_external_owners" -> i.unsupportedOwners,
+      "reserved_inventory_binding_sha256" -> JString(sha256(i.binding))))
     val globalFunctional = rows(globalManifest, "state").filterNot(r =>
       (r \ "adapter") == JString("metasim-bufgce-v1"))
     val globalPhysical = rows(globalPlan, "physical_gates")
@@ -132,7 +137,7 @@ object NativeCheckpointIdentity {
       "global_functional_entries" -> JInt(globalFunctional.size),
       "global_physical_gates" -> JInt(globalPhysical.size),
       "physical_clock_gates" -> JInt(physical.size),
-      "external_runtime_required" -> JBool(true)) ++ flags))
+      "external_runtime_required" -> JBool(true)) ++ flags ++ external))
     val binding = canonical(JObject(List(
       "identity_binding_version" -> JInt(1), "manifest_sha256" -> JString(sha256(projected)),
       "host_sha256" -> JString(sha256(host.circuit.serialize)),
@@ -141,7 +146,7 @@ object NativeCheckpointIdentity {
       "global_clock_plan_sha256" -> JString(sha256(globalPlan)),
       "global_dependencies_sha256" -> JString(sha256(globalDependencies)),
       "selected_descriptor_manifest_sha256" -> JString(descriptors.manifestSha256),
-      "selected_descriptor_binding_sha256" -> JString(descriptors.bindingSha256)) ++ flags))
+      "selected_descriptor_binding_sha256" -> JString(descriptors.bindingSha256)) ++ flags ++ external))
     Result(projected, binding, entries, globalManifest, globalPlan, globalDependencies, physical.size)
   }
 }
