@@ -18,7 +18,8 @@ class WithRocketRegionCompilerProbeReservation extends Config((site, here, up) =
   case CheckpointCaptureTopKey =>
     require(sys.props.get("checkpoint.rocket.region.compiler.probe").contains("true"),
       "Rocket regional reservation is a test-only, nondeployable compiler diagnostic")
-    Some(new NativeCheckpointWidgetReservationBinding(10910, 3,
+    val entries = if (sys.props.get("checkpoint.rocket.shell.compiler.probe").contains("true")) 11093 else 10910
+    Some(new NativeCheckpointWidgetReservationBinding(entries, 3,
       Seq("unsupported.functional-memory", "unsupported.bridge-host", "unsupported.reset-external-writers")) {
       protected def connectOwners(top: FPGATopImp, capture: CheckpointCaptureSideband): Unit = {
         // Explicit missing-owner diagnostics, never default acknowledgements.

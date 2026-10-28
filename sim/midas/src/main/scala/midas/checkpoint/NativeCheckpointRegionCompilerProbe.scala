@@ -11,6 +11,7 @@ import org.json4s._
 import scala.util.control.NonFatal
 
 case class NativeCheckpointRegionCompilerProbeAnnotation(paths: String) extends NoTargetAnnotation with Unserializable
+case class NativeCheckpointShellCompilerProbeAnnotation(paths: String) extends NoTargetAnnotation with Unserializable
 /** Inert metadata-resolution history, never a storage or freeze-owner contract. */
 case class NativeCheckpointRegionCompilerMetadataAnnotation(body: String) extends NoTargetAnnotation
 object NativeCheckpointRegionCompilerProbeAnnotation extends HasShellOptions {
@@ -18,6 +19,13 @@ object NativeCheckpointRegionCompilerProbeAnnotation extends HasShellOptions {
     longOption = "simulator-native-region-compiler-probe",
     toAnnotationSeq = value => Seq(NativeCheckpointRegionCompilerProbeAnnotation(value)),
     helpText = "Diagnose existing regional widget hookup at the actual compiler boundary; comma-separated concrete execution paths, never a deployable image.",
+  ))
+}
+object NativeCheckpointShellCompilerProbeAnnotation extends HasShellOptions {
+  val options = Seq(new ShellOption[String](
+    longOption = "simulator-native-shell-compiler-probe",
+    toAnnotationSeq = value => Seq(NativeCheckpointShellCompilerProbeAnnotation(value)),
+    helpText = "Add local-only root/ancestor banks to the explicit regional compiler diagnostic; comma-separated concrete paths.",
   ))
 }
 
@@ -76,6 +84,9 @@ object NativeCheckpointRegionCompilerProbe {
   }
   def validateCardinality(as: AnnotationSeq): Unit = {
     val requests = as.collect { case a: NativeCheckpointRegionCompilerProbeAnnotation => a }
+    val shells = as.collect { case a: NativeCheckpointShellCompilerProbeAnnotation => a }
+    check(shells.size <= 1 && (shells.isEmpty || requests.size == 1), "local shell diagnostic requires one regional request")
+    shells.foreach(a => shellPaths(a.paths))
     if (requests.isEmpty) return
     check(requests.size == 1, "one explicit request required")
     paths(requests.head.paths)
@@ -84,6 +95,20 @@ object NativeCheckpointRegionCompilerProbe {
            SemanticFAMEStateMapAnnotation => true
       case _ => false
     }, "regional diagnostic conflicts with bank, native companion, clock wiring or semantic-map requests")
+  }
+
+  private def shellPaths(value: String): Seq[Seq[String]] = {
+    val items = value.split(",", -1).toVector.map(_.split("\\.", -1).toVector)
+    check(items.nonEmpty && items.size <= 255 && items.forall(p => p.nonEmpty && p.forall(_.matches(identifier))) &&
+      items.distinct.size == items.size, "invalid local shell executions")
+    items
+  }
+  private def shellTargets(state: CircuitState, value: String): Seq[firrtl.annotations.IsModule] = {
+    shellPaths(value).map { parts =>
+      check(parts.head == state.circuit.main, "local shell execution belongs to another circuit")
+      if (parts.size == 1) ModuleTarget(state.circuit.main, state.circuit.main)
+      else targets(state, parts.mkString(".")).head
+    }
   }
 
   /** Resolve every hop against the actual post-lowering concrete hierarchy. */
@@ -111,6 +136,7 @@ object NativeCheckpointRegionCompilerProbe {
       return after
     }
     val request = before.annotations.collect { case a: NativeCheckpointRegionCompilerProbeAnnotation => a }.head
+    val shellRequest = before.annotations.collect { case a: NativeCheckpointShellCompilerProbeAnnotation => a }
     val dirs = before.annotations.collect { case TargetDirAnnotation(value) => value }
     check(dirs.size == 1 && dirs.head.nonEmpty, "one explicit compiler target directory required")
     val output = Paths.get(dirs.head).resolve(directory)
@@ -132,6 +158,7 @@ object NativeCheckpointRegionCompilerProbe {
       val body = canonical(JObject(List(
         "probe_version" -> JInt(1), "scope" -> JString("actual_compiler_regional_hookup_diagnostic_only"),
         "status" -> JString(stage), "requested_paths" -> JString(request.paths),
+        "requested_local_shells" -> JArray(shellRequest.map(a => JString(a.paths)).toList),
         "pre_inline_sha256" -> JString(sha256(before.circuit.serialize)),
         "post_inline_sha256" -> JString(sha256(after.circuit.serialize)),
         "artifacts" -> JObject(hashes.toList.map { case (name, hash) => name -> JString(hash) }),
@@ -150,12 +177,15 @@ object NativeCheckpointRegionCompilerProbe {
       status("phase_snapshots_saved")
       check(after.annotations.collect { case a: NativeCheckpointRegionCompilerProbeAnnotation => a } == Seq(request),
         "request changed across inline")
+      check(after.annotations.collect { case a: NativeCheckpointShellCompilerProbeAnnotation => a } == shellRequest,
+        "local shell request changed across inline")
       val selected = targets(after, request.paths)
       save("targets.json", canonical(JArray(selected.map(t => JString(t.serialize)).toList)))
       val inventory = ReservedCheckpointInventory.forReservedWidgetSource(before, after)
       state("regional-source", inventory.source)
       save("inventory-permission.json", inventory.binding)
-      val regions = NativeCheckpointRegions.generate(inventory.source, selected, Some(inventory))
+      val localTargets = shellRequest.flatMap(a => shellTargets(after, a.paths))
+      val regions = NativeCheckpointRegions.generate(inventory.source, selected, Some(inventory), localTargets)
       state("regional-instrumented", regions.state)
       save("regions.json", regions.binding)
       save("descriptors.json", regions.descriptors.manifest)
@@ -175,7 +205,17 @@ object NativeCheckpointRegionCompilerProbe {
         save(prefix + "-identity.json", region.native.identity.manifest)
         save(prefix + "-identity-binding.json", region.native.identity.binding)
       }
+      regions.shells.zipWithIndex.foreach { case (shell, index) =>
+        val prefix = s"shell-$index"
+        state(prefix + "-reference", shell.reference)
+        state(prefix + "-instrumented", shell.state)
+        save(prefix + "-binding.json", shell.binding)
+        save(prefix + "-mapping.json", shell.mapping)
+        save(prefix + "-manifest.json", shell.manifest)
+        save(prefix + "-banks-binding.json", shell.banks.binding)
+      }
       status("regional_network_reconstructed_incomplete")
+      save("transport-freeze-conflicts.json", canonical(NativeCheckpointRegionWidgetGraft.liveTransportConflicts(before, after, regions)))
       val bound = NativeCheckpointWidgetIdentity.bindRegions(before, after, regions)
       state("grafted", bound.connection.graft.state)
       bound.connection.graft.files.foreach(f => save("generated" + f.fileSuffix, f.body))

@@ -132,6 +132,19 @@ class NativeCheckpointRegionWidgetGraftSpec extends AnyFlatSpec {
   private[checkpoint] def compilerProbeBefore(extra: firrtl.AnnotationSeq): CircuitState =
     policyBefore.copy(annotations = policyBefore.annotations ++ extra)
 
+  it should "reject freezing inlined widget-local storage needed by the same MMIO DMA transport" in {
+    val mixed = NativeCheckpointRegions.generate(policyInventory.source, targets, Some(policyInventory),
+      Seq(ModuleTarget("ReservationShell", "FPGATop")))
+    val conflicts = NativeCheckpointRegionWidgetGraft.liveTransportConflicts(policyBefore, policyAfter, mixed)
+    assert(conflicts.arr.size == 8)
+    assert(conflicts.arr.forall(r => (r \ "ownership") == JString("unsupported_live_checkpoint_transport_local_storage") &&
+      (r \ "capture_supported") == JBool(false) && (r \ "restore_supported") == JBool(false)))
+    val error = intercept[IllegalArgumentException](NativeCheckpointRegionWidgetGraft.connect(policyBefore, policyAfter, mixed))
+    assert(error.getMessage.contains("local shell freeze would stop live checkpoint MMIO/DMA transport (8 original owners)"))
+    save("transport-local-freeze-conflicts.json", SemanticStateInventory.canonical(conflicts))
+    assert(NativeCheckpointRegionWidgetGraft.liveTransportConflicts(policyBefore, policyAfter, policySource).arr.isEmpty)
+  }
+
   it should "project whole-host typed source policy and compiler history without dropping the original context" in {
     val result = NativeCheckpointRegionWidgetGraft.connect(policyBefore, policyAfter, policySource)
     val approved = policyAfter.annotations.filter(a => GeneratedStateBankAnnotations.supported(a) ||

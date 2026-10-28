@@ -24,6 +24,41 @@ object NativeCheckpointRegionWidgetGraft {
     visit(s); names.toSeq
   }
 
+  /** Original widget storage is required by the live MMIO/DMA transport.
+    * Follow the actual native-inline storage map, rather than guessing flattened
+    * register prefixes. A local bank may read it, but holding these registers
+    * while asking that same widget to drain frames would deadlock capture.
+    * No snapshot/separate-owner protocol is implemented for these words yet.
+    */
+  def liveTransportConflicts(before: CircuitState, after: CircuitState,
+      source: NativeCheckpointRegions.Result): JArray = {
+    if (source.shells.isEmpty) return JArray(Nil)
+    NativeCheckpointWidgetPeerRouting.inspect(before, after)
+    val JString(widget) = parse(NativeCheckpointWidgetReservation.inspect(before)) \ "widget"
+    val history = after.annotations.collect { case a: midas.passes.SimulationInlineResultAnnotation => a }
+    check(history.size == 1, "one actual inline storage history required")
+    def hierarchy(value: JValue): String = value match {
+      case JString(text) => firrtl.annotations.Target.deserialize(text) match {
+        case t: firrtl.annotations.ReferenceTarget =>
+          check(t.circuit == after.circuit.main && t.module == after.circuit.main && t.component.isEmpty,
+            "unrooted inline storage owner")
+          (Seq(t.module) ++ t.path.map(_._1.value) :+ t.ref).mkString(".")
+        case _ => throw new IllegalArgumentException("checkpoint region widget graft: invalid inline storage reference")
+      }
+      case _ => throw new IllegalArgumentException("checkpoint region widget graft: missing inline storage reference")
+    }
+    val local = source.shells.flatMap(s => (parse(s.mapping) \ "state").asInstanceOf[JArray].arr)
+      .map(r => (r \ "hierarchy") -> r).toMap
+    val rows = (midas.passes.ResolveSimulationInline.context(history.head) \ "storage").asInstanceOf[JArray].arr
+      .filter(r => hierarchy(r \ "from").startsWith(widget + ".")).flatMap { row =>
+        local.get(JString(hierarchy(row \ "to"))).map(owner => row merge JObject(List(
+          "state_id" -> (owner \ "state_id"), "hierarchy" -> (owner \ "hierarchy"),
+          "ownership" -> JString("unsupported_live_checkpoint_transport_local_storage"),
+          "capture_supported" -> JBool(false), "restore_supported" -> JBool(false))))
+      }
+    JArray(rows)
+  }
+
   def connect(before: CircuitState, after: CircuitState, source: NativeCheckpointRegions.Result): Result = {
     val peerText = NativeCheckpointWidgetPeerRouting.inspect(before, after)
     check(source.host.form == LowForm && source.host.circuit == after.circuit,
@@ -34,6 +69,9 @@ object NativeCheckpointRegionWidgetGraft {
     source.inventory.get.validate(before, after)
     source.inventory.get.validateSource(source.host)
     check(source.inventory.get.unsupportedOwners.arr.nonEmpty, "missing unsupported transport ownership deficit")
+    val conflicts = liveTransportConflicts(before, after, source)
+    check(conflicts.arr.isEmpty,
+      s"local shell freeze would stop live checkpoint MMIO/DMA transport (${conflicts.arr.size} original owners); separate atomic transport owner required")
     val graft = NativeCheckpointRegionGraft.generate(source)
     val execution = after.annotations.collect { case a: NativeCheckpointWidgetExecutionAnnotation => a }.head
     check(execution.entries == source.descriptors.entries.size && execution.gates == source.descriptors.physicalClockGates,

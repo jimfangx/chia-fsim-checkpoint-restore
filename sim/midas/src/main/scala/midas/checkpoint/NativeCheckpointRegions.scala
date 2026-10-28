@@ -2,7 +2,7 @@
 package midas.checkpoint
 
 import firrtl.{CircuitState, LowForm, WDefInstance}
-import firrtl.annotations.{InstanceTarget, JsonProtocol, ModuleTarget}
+import firrtl.annotations.{IsModule, InstanceTarget, JsonProtocol, ModuleTarget}
 import firrtl.ir._
 import midas.widgets.CheckpointCaptureDescriptors
 import org.json4s._
@@ -17,8 +17,10 @@ object NativeCheckpointRegions {
   import SemanticStateInventory.{canonical, sha256}
   case class Result(state: CircuitState, host: CircuitState, targets: Seq[InstanceTarget],
       regions: Seq[NativeCheckpointInPlaceContext.Result], descriptors: CheckpointCaptureDescriptors,
-      routing: CheckpointRegionRouting.Result, binding: String, inventory: Option[ReservedCheckpointInventory] = None)
+      routing: CheckpointRegionRouting.Result, binding: String, inventory: Option[ReservedCheckpointInventory] = None,
+      shells: Seq[NativeCheckpointShellStateAccess.Result] = Seq.empty)
   def prefix(index: Int): String = NativeCheckpointInPlace.prefix + s"region${index}_"
+  def shellPrefix(index: Int): String = NativeCheckpointShellStateAccess.prefix + s"region${index}_"
   private def check(ok: Boolean, why: String): Unit = require(ok, "native checkpoint regions: " + why)
   private def json(as: firrtl.AnnotationSeq): String = JsonProtocol.serialize(as.distinct.sortBy(_.serialize))
 
@@ -48,22 +50,29 @@ object NativeCheckpointRegions {
   }
 
   def generate(host: CircuitState, targets: Seq[InstanceTarget],
-      inventory: Option[ReservedCheckpointInventory] = None): Result = {
+      inventory: Option[ReservedCheckpointInventory] = None, shellTargets: Seq[IsModule] = Seq.empty): Result = {
     check(host.form == LowForm, "resolved LowForm required")
     inventory.foreach(_.validateSource(host))
-    check(targets.nonEmpty && targets.size <= 255, "invalid region count")
+    check(targets.nonEmpty && targets.size + shellTargets.size <= 255, "invalid region count")
     val paths = targets.map(_.asPath.map(_._1.value))
     check(!paths.indices.exists(i => paths.indices.exists(j => i != j && paths(i).startsWith(paths(j)))),
       "overlapping selected executions")
     val regions = targets.zipWithIndex.map { case (t, i) =>
       NativeCheckpointInPlaceContext.generate(host, t, prefix(i), inventory)
     }
+    val shells = shellTargets.zipWithIndex.map { case (t, i) =>
+      NativeCheckpointShellStateAccess.generate(host, t, shellPrefix(i))
+    }
     val clocks = regions.map(r => parse(r.native.binding) \ "enclosing_raw_clock")
     check(clocks.distinct.size == 1, "selected executions do not share a proven raw clock")
-    val descriptors = regions.zip(targets).map { case (r, t) =>
+    val regionalDescriptors = regions.zip(targets).map { case (r, t) =>
       CheckpointCaptureDescriptors.fromNativeInPlace(host.copy(annotations = host.annotations.filterNot(
         SimulatorBankProbeContext.accepts)), t, r.reference, r.manifest, r.plan, r.dependencies, inventory)
     }
+    val shellDescriptors = shells.map(CheckpointCaptureDescriptors.fromNativeShell(_, inventory))
+    check(shellDescriptors.forall(d => (parse(d.binding) \ "raw_clock") == clocks.head),
+      "local storage and selected executions do not share a proven raw clock")
+    val descriptors = regionalDescriptors ++ shellDescriptors
     val (combined, routing) = CheckpointCaptureDescriptors.fromNativeRegions(descriptors)
     val originals = host.circuit.modules.map(m => m.name -> m).toMap
     check(originals.size == host.circuit.modules.size, "duplicate original definitions")
@@ -94,24 +103,34 @@ object NativeCheckpointRegions {
       generatedAnnotations ++= r.native.generatedAnnotations.flatMap(_.update(renames))
       modules.map(m => m.name -> m).toMap
     }
-    val selected = targets.map(_.asPath.last._2.value).toSet
     val ancestors = targets.map(t => (Seq(host.circuit.main) ++ t.asPath.dropRight(1).map(_._2.value)).toSet)
+    val allSources = namespaced ++ shells.map(_.state.circuit.modules.map(m => m.name -> m).toMap)
+    val bodyOwners = targets.map(_.asPath.last._2.value) ++ shells.map(_.reference.circuit.main)
+    check(bodyOwners.distinct.size == bodyOwners.size, "overlapping selected body owners")
+    val prefixes = targets.indices.map(prefix) ++ shells.indices.map(shellPrefix)
+    val shellAncestors = shells.map { shell =>
+      val JString(path) = parse(shell.mapping) \ "selected_execution"
+      val names = GeneratedExternalOwners.instances(host, host.circuit.main).toMap
+      val parts = path.split("\\.")
+      parts.indices.dropRight(1).map(i => names(parts.take(i + 1).mkString(".")).name).toSet
+    }
+    val allAncestors = ancestors ++ shellAncestors
     val modules = host.circuit.modules.map { original =>
-      val changed = namespaced.zipWithIndex.collect { case (ms, index) if ms(original.name) != original =>
+      val changed = allSources.zipWithIndex.collect { case (ms, index) if ms(original.name) != original =>
         index -> ms(original.name)
       }
       if (changed.isEmpty) original
-      else if (selected(original.name)) {
-        check(changed.size == 1, "selected definition modified by another region")
-        changed.head._2
-      } else {
+      else {
         val m = original.asInstanceOf[Module]
-        val additions = changed.map { case (i, definition) =>
-          if (!ancestors(i)(m.name)) check(false, "changed unrelated original definition " + m.name +
+        val owned = changed.filter { case (i, _) => bodyOwners(i) == m.name }
+        check(owned.size <= 1, "selected definition modified by another owner")
+        val base = owned.headOption.map(_._2.asInstanceOf[Module]).getOrElse(m)
+        val additions = changed.filterNot { case (i, _) => bodyOwners(i) == m.name }.map { case (i, definition) =>
+          if (!allAncestors(i)(m.name)) check(false, "changed unrelated original definition " + m.name +
             s" in region $i; " + firstStructuralDifference(m, definition))
           val next = definition.asInstanceOf[Module]
           check(next.ports.take(m.ports.size) == m.ports &&
-            next.ports.drop(m.ports.size).forall(_.name.startsWith(prefix(i))), "changed original interface")
+            next.ports.drop(m.ports.size).forall(_.name.startsWith(prefixes(i))), "changed original interface")
           def flat(s: Statement): Seq[Statement] = s match {
             case Block(xs) => xs.flatMap(flat)
             case x => Seq(x)
@@ -122,9 +141,9 @@ object NativeCheckpointRegions {
           val extra = after.drop(before.size)
           (next.ports.drop(m.ports.size), extra)
         }
-        val ports = m.ports ++ additions.flatMap(_._1)
+        val ports = base.ports ++ additions.flatMap(_._1)
         check(ports.map(_.name).distinct.size == ports.size, "colliding sideband ports")
-        m.copy(ports = ports, body = Block(Seq(m.body) ++ additions.flatMap(_._2)))
+        if (additions.isEmpty) base else base.copy(ports = ports, body = Block(Seq(base.body) ++ additions.flatMap(_._2)))
       }
     } ++ namespaced.flatMap(_.values.filterNot(m => originals.contains(m.name))).sortBy(_.name)
     val circuit = host.circuit.copy(modules = modules)
@@ -151,6 +170,11 @@ object NativeCheckpointRegions {
     val (validated, _) = GeneratedStateBankAnnotations.translate(state.copy(annotations = annotations), finalClones)
     check(validated.toSet == annotations.toSet, "post-graft annotation targets changed")
     val snapshot = SimulatorBankProbeContext.snapshot(context, host.circuit.serialize, state.circuit.serialize)
+    val shellBindings = if (shells.isEmpty) Nil else List("local_shells" -> JArray(shells.zipWithIndex.map { case (r, i) =>
+      JObject(List("index" -> JInt(targets.size + i), "target" -> JString(r.target.serialize),
+        "sideband_prefix" -> JString(r.sidebandPrefix), "shell_binding_sha256" -> JString(sha256(r.binding)),
+        "identity_binding_sha256" -> JString(shellDescriptors(i).bindingSha256)))
+    }.toList))
     val binding = canonical(JObject(List(
       "regions_version" -> JInt(1), "scope" -> JString("existing_disjoint_native_executions_only"),
       "host_sha256" -> JString(sha256(host.circuit.serialize)),
@@ -168,14 +192,14 @@ object NativeCheckpointRegions {
       "production_freeze_owners_bound" -> JBool(false), "complete_fpga_capture" -> JBool(false),
       "deployable_capture_image" -> JBool(false), "metasim_restore_supported" -> JBool(false)) ++
       inventory.toList.flatMap(i => List("unsupported_external_owners" -> i.unsupportedOwners,
-        "reserved_inventory_binding_sha256" -> JString(sha256(i.binding))))))
-    Result(state, host, targets, regions, combined, routing, binding, inventory)
+        "reserved_inventory_binding_sha256" -> JString(sha256(i.binding)))) ++ shellBindings))
+    Result(state, host, targets, regions, combined, routing, binding, inventory, shells)
   }
 
   /** Reconstruct from the original, including annotation/context semantics;
     * caller-rehashed circuits or metadata cannot establish coverage. */
   def validate(result: Result): Unit = {
-    val rebuilt = generate(result.host, result.targets, result.inventory)
+    val rebuilt = generate(result.host, result.targets, result.inventory, result.shells.map(_.target))
     def sameState(a: CircuitState, b: CircuitState): Boolean = a.form == b.form && a.renames == b.renames &&
       a.circuit == b.circuit && a.annotations.toVector == b.annotations.toVector
     check(sameState(result.state, rebuilt.state) &&
@@ -189,6 +213,11 @@ object NativeCheckpointRegions {
           a.native.binding == b.native.binding && a.native.identity == b.native.identity &&
           a.native.annotationProjection == b.native.annotationProjection && sameState(a.native.state, b.native.state) &&
           a.native.generatedAnnotations.toVector == b.native.generatedAnnotations.toVector
+      } && result.shells.size == rebuilt.shells.size && result.shells.zip(rebuilt.shells).forall { case (a, b) =>
+        a.binding == b.binding && a.mapping == b.mapping && a.entries == b.entries && a.target == b.target &&
+          a.sidebandPrefix == b.sidebandPrefix && a.manifest == b.manifest && a.banks.binding == b.banks.binding &&
+          a.banks.entries == b.banks.entries && sameState(a.banks.state, b.banks.state) &&
+          sameState(a.host, b.host) && sameState(a.state, b.state) && sameState(a.reference, b.reference)
       }, "changed source, network, context or identity")
   }
 }

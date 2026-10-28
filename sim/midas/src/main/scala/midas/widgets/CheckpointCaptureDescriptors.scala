@@ -35,7 +35,8 @@ object CheckpointCaptureDescriptors {
     check(regions.nonEmpty, "no selected regions")
     val manifests = regions.map(r => parse(r.manifest))
     val bindings = regions.map(r => parse(r.binding))
-    check(manifests.forall(m => (m \ "scope") == JString("selected_inplace_global_identities_only")),
+    check(manifests.forall(m => Set[JValue](JString("selected_inplace_global_identities_only"),
+      JString("selected_shell_global_identities_only"))(m \ "scope")),
       "regions must use independently reconstructed enclosing identities")
     Seq("host_sha256", "global_simulator_manifest_sha256", "global_clock_plan_sha256",
       "global_dependencies_sha256").foreach { key =>
@@ -44,7 +45,8 @@ object CheckpointCaptureDescriptors {
     }
     val scopes = manifests.map(m => (m \ "selected_scope").asInstanceOf[JString].s)
     check(!scopes.indices.exists(i => scopes.indices.exists(j => i != j &&
-      (scopes(i) == scopes(j) || scopes(i).startsWith(scopes(j) + ".")))), "overlapping selected executions")
+      (scopes(i) == scopes(j) || (scopes(i).startsWith(scopes(j) + ".") &&
+        (manifests(j) \ "ownership_scope") != JString("local_storage_only"))))), "overlapping selected executions")
     val routing = midas.checkpoint.CheckpointRegionRouting.allocate(regions.map(_.entries))
     def rows(m: JValue, key: String): List[JValue] = (m \ key).asInstanceOf[JArray].arr
     val originalRows = manifests.flatMap(rows(_, "state"))
@@ -107,6 +109,14 @@ object CheckpointCaptureDescriptors {
     val identity = midas.checkpoint.NativeCheckpointIdentity.discover(host, target, reference,
       simulatorManifest, plan, dependencies, inventory)
     fromNativeInPlaceIdentity(identity)
+  }
+
+  /** Rebuild local banks and reconcile their original global identities. */
+  def fromNativeShell(shell: midas.checkpoint.NativeCheckpointShellStateAccess.Result,
+      inventory: Option[midas.checkpoint.ReservedCheckpointInventory] = None): CheckpointCaptureDescriptors = {
+    val identity = midas.checkpoint.NativeCheckpointShellIdentity.discover(shell, inventory)
+    new CheckpointCaptureDescriptors(SemanticStateInventory.sha256(identity.manifest),
+      SemanticStateInventory.sha256(identity.binding), shell.entries, identity.manifest, identity.binding, 0)
   }
 
   private def fromNativeInPlaceIdentity(identity: midas.checkpoint.NativeCheckpointIdentity.Result):

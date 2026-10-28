@@ -30,7 +30,8 @@ object NativeCheckpointRegionGraft {
     val root = state.circuit.modules.find(_.name == state.circuit.main).get.asInstanceOf[Module]
     val access = root.ports.drop(original.ports.size)
     require(root.ports.take(original.ports.size) == original.ports && access.nonEmpty &&
-      access.forall(p => p.name.startsWith(NativeCheckpointInPlace.prefix)), "native region graft: changed interface")
+      access.forall(p => p.name.startsWith(NativeCheckpointInPlace.prefix) ||
+        p.name.startsWith(NativeCheckpointShellStateAccess.prefix)), "native region graft: changed interface")
     val JString(clock) = parse(source.binding) \ "raw_clock"
     val clockPort = original.ports.find(p => p.name == clock && p.direction == Input && p.tpe == ClockType).get
     val name = root.name + "CheckpointRegionReadoutAdapter"
@@ -56,7 +57,7 @@ object NativeCheckpointRegionGraft {
     val flowed = firrtl.passes.ResolveFlows.run(typed)
     firrtl.passes.CheckTypes.run(flowed); firrtl.passes.CheckFlows.run(flowed)
     val files = scala.collection.mutable.ArrayBuffer.empty[GoldenGateOutputFileAnnotation]
-    val endpoints = source.regions.zip(source.routing.regions).zipWithIndex.map { case ((r, allocation), i) =>
+    val nativeEndpoints = source.regions.zip(source.routing.regions).zipWithIndex.map { case ((r, allocation), i) =>
       val prefix = NativeCheckpointRegions.prefix(i)
       val localPorts = Seq(clockPort) ++ adapterPorts.filter(_.name.startsWith(prefix))
       val localName = name + s"Region$i"
@@ -77,12 +78,31 @@ object NativeCheckpointRegionGraft {
         .map(n => s".capture_$n(region_${n}[$i])") ++ Seq("bank", "slot", "address").map(n => s".capture_$n(region_$n)") ++
         Seq(s".capture_response_data(region_response_data[${i*64} +: 64])")
       s"  $localName region$i(\n    ${(pass ++ control ++ transaction).mkString(",\n    ")});"
-    }.mkString("\n")
+    }
+    val shellEndpoints = source.shells.zipWithIndex.map { case (shell, index) =>
+      val i = source.regions.size + index
+      val allocation = source.routing.regions(i)
+      require(allocation.ceCount == 0, "native region graft: shell cannot claim physical CE state")
+      val prefix = shell.sidebandPrefix
+      val local = adapterPorts.filter(_.name.startsWith(prefix))
+      val signals = Seq("ckpt_clock" -> clock, "ckpt_reset" -> "capture_reset", "ckpt_freeze" -> "capture_clock_mask",
+        "ckpt_bank" -> "region_bank", "ckpt_slot" -> "region_slot", "ckpt_address" -> "region_address",
+        "ckpt_req_valid" -> s"region_request_valid[$i]", "ckpt_req_ready" -> s"region_request_ready[$i]",
+        "ckpt_resp_valid" -> s"region_response_valid[$i]", "ckpt_resp_ready" -> s"region_response_ready[$i]",
+        "ckpt_resp_data" -> s"region_response_data[${i*64} +: 64]", "ckpt_resp_error" -> s"region_response_error[$i]")
+      require(local.map(_.name).toSet == (signals.map(x => prefix + x._1) ++
+        Seq(prefix + "ckpt_match", prefix + "ckpt_data")).toSet, "native region graft: unknown shell interface")
+      signals.map { case (pin, wire) =>
+        val p = local.find(_.name == prefix + pin).get
+        if (p.direction == Input) s"  assign $wire = ${p.name};" else s"  assign ${p.name} = $wire;"
+      }.mkString("\n")
+    }
+    val endpoints = (nativeEndpoints ++ shellEndpoints).mkString("\n")
     val cases = source.descriptors.entries.zipWithIndex.map { case (e, i) =>
       s"      32'd$i: begin capture_descriptor_valid=1; capture_descriptor_bank=8'd${e.bank}; " +
         s"capture_descriptor_slot=16'd${e.slot}; capture_descriptor_width=16'd${e.width}; capture_descriptor_depth=32'd${e.depth}; end"
     }.mkString("\n")
-    val n = source.regions.size
+    val n = source.routing.regions.size
     val declarationsRTL = (adapterPorts ++ ports).map { p =>
       val text = port(p)
       if (p.name.startsWith("capture_descriptor_") && p.direction == Output) text.replace("output wire", "output reg") else text

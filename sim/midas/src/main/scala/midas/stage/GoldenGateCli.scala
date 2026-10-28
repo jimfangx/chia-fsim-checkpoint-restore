@@ -26,6 +26,7 @@ trait GoldenGateCli { this: Shell =>
     midas.checkpoint.PhysicalClockCutWiringProbeAnnotation,
     midas.checkpoint.NativeFunctionalBankProbeAnnotation,
     midas.checkpoint.NativeCheckpointRegionCompilerProbeAnnotation,
+    midas.checkpoint.NativeCheckpointShellCompilerProbeAnnotation,
     firrtl.stage.FirrtlFileAnnotation,
     firrtl.stage.FirrtlSourceAnnotation,
     firrtl.transforms.NoCircuitDedupAnnotation,
