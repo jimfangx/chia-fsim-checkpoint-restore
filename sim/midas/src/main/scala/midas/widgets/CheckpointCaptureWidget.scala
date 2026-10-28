@@ -18,7 +18,8 @@ object CheckpointCaptureABI {
     (0 until 8).map(i => s"MANIFEST_$i" -> (0x40 + 4 * i)) ++
     Seq("STREAM_INVALID" -> 0x60, "STREAM_DRAIN_ACK" -> 0x64,
       "PRODUCED_FRAMES_LO" -> 0x68, "PRODUCED_FRAMES_HI" -> 0x6c,
-      "HOST_DRAINED_FRAMES_LO" -> 0x70, "HOST_DRAINED_FRAMES_HI" -> 0x74)
+      "HOST_DRAINED_FRAMES_LO" -> 0x70, "HOST_DRAINED_FRAMES_HI" -> 0x74) ++
+    CheckpointLiveWidgetSnapshot.registers
 
   def header(prefix: String, base: BigInt, cfg: CheckpointCaptureWidgetParams, stream: Int): String = {
     require(!cfg.deferredGraft, "unbound checkpoint reservation cannot emit a descriptor-bound driver header")
@@ -53,6 +54,16 @@ object CheckpointCaptureABI {
     }
     sb.append(s"#define ${prefix}_FRAME_BYTES 64U\n#define ${prefix}_TRANSPORT_VERSION 1U\n")
     sb.append(s"#define ${prefix}_ABORT_REQUIRES_HOST_DRAIN 1U\n")
+    val controlBits = if (cfg.physicalClockGates > 0) 481 + cfg.physicalClockGates else 411
+    sb.append(s"#define ${prefix}_SHADOW_LAYOUT_VERSION 1U\n")
+    sb.append(s"#define ${prefix}_SHADOW_CONTROL_BITS ${controlBits}U\n")
+    sb.append(s"#define ${prefix}_SHADOW_BITS ${controlBits + CheckpointLiveWidgetSnapshot.localBits}U\n")
+    sb.append(s"#define ${prefix}_SHADOW_RESTORE_SUPPORTED 0U\n")
+    var offset = controlBits
+    CheckpointLiveWidgetSnapshot.localFields.foreach { case (name, width) =>
+      sb.append(s"// shadow local $name: bit $offset, width $width\n")
+      offset += width
+    }
     cfg.ownerNames.zipWithIndex.foreach { case (owner, index) =>
       sb.append(s"// owner[$index]: $owner\n")
     }
@@ -135,8 +146,8 @@ class CheckpointCaptureTransportIO(owners: Int, controlStateBits: Int = 411) ext
   val dma_data = Output(UInt(512.W))
   val dma_last = Output(Bool())
   val dma_abort = Output(Bool())
-  // Observation only. A future explicit atomic owner must retain this state;
-  // exposing the bits cannot waive the strict external inventory rejection.
+  // Observation only. The immutable widget shadow copies this vector without
+  // establishing restore ownership or waiving external inventory rejection.
   val control_state = Output(UInt(controlStateBits.W))
 }
 
@@ -354,10 +365,28 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
     val producedHigh = !req.bits.write && req.bits.address === 0x6c.U
     val drainedLow = req.bits.address === 0x70.U
     val drainedHigh = req.bits.address === 0x74.U
-    val local = isStatus || isAck || blockedStart || producedLow || producedHigh || drainedLow || drainedHigh
+    val isShadow = CheckpointLiveWidgetSnapshot.registers.map { case (_, address) =>
+      req.bits.address === address.U }.reduce(_ || _)
+    val local = isStatus || isAck || blockedStart || producedLow || producedHigh || drainedLow || drainedHigh || isShadow
     val localValid = RegInit(false.B)
     val localData = Reg(UInt(32.W))
     val localError = Reg(Bool())
+    val snapshot = Module(new CheckpointLiveWidgetSnapshot(
+      transport.control_state.getWidth + CheckpointLiveWidgetSnapshot.localBits))
+    snapshot.io.live := Cat(localError, localData, localValid, counterOverflow,
+      hostDrainedFrames, producedSnapshot, producedFrames, invalid, transport.control_state)
+    snapshot.io.cycle := capture.targetCycle
+    // A freeze request alone is insufficient: all separately stopped owners
+    // and (when present) the physical post-stop sampler must acknowledge it.
+    snapshot.io.cutValid := transport.freeze && capture.ownerPresent.andR &&
+      capture.ownerFrozen.andR && !capture.ownerError.orR && !transport.dma_abort &&
+      !invalid && !counterOverflow && CheckpointLiveWidgetSnapshot.acknowledgedCut(
+        transport.control_state, capture.targetCycle) && capture.physical.map(p => p.readEnable &&
+        !p.failed && p.cutCycle === capture.targetCycle).getOrElse(true.B)
+    snapshot.io.access := req.fire && isShadow
+    snapshot.io.write := req.bits.write
+    snapshot.io.address := req.bits.address
+    snapshot.io.data := req.bits.data
     val ackAllowed = req.bits.data === 1.U && !transport.dma_abort &&
       !transport.freeze && !transport.dma_valid && !counterOverflow &&
       hostDrainedFrames === producedFrames
@@ -368,15 +397,15 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
     transport.mmio_wdata := req.bits.data
     when(req.fire && local) {
       localValid := true.B
-      localData := MuxCase(0.U, Seq(
+      localData := Mux(isShadow, snapshot.io.response, MuxCase(0.U, Seq(
         isStatus -> Cat(0.U(30.W), counterOverflow, invalid),
         producedLow -> producedFrames(31, 0), producedHigh -> producedSnapshot(63, 32),
         (drainedLow && !req.bits.write) -> hostDrainedFrames(31, 0),
-        (drainedHigh && !req.bits.write) -> hostDrainedFrames(63, 32)))
+        (drainedHigh && !req.bits.write) -> hostDrainedFrames(63, 32))))
       when(producedLow) { producedSnapshot := producedFrames }
       when(drainedLow && req.bits.write) { hostDrainedFrames := Cat(hostDrainedFrames(63, 32), req.bits.data) }
       when(drainedHigh && req.bits.write) { hostDrainedFrames := Cat(req.bits.data, hostDrainedFrames(31, 0)) }
-      localError := blockedStart || (isAck && !ackAllowed)
+      localError := blockedStart || (isAck && !ackAllowed) || (isShadow && snapshot.io.error)
       when(isAck && ackAllowed) { invalid := false.B }
     }
     adapter.io.response.valid := localValid || transport.mmio_response_valid

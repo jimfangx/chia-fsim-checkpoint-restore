@@ -23,6 +23,14 @@ struct checkpoint_capture_manifest_t {
   std::vector<checkpoint_capture_entry_t> entries;
 };
 
+// Observation of the live transport at a held target cut, layout version 1.
+// This is not a canonical Level-1 image or a complete/restore-capable owner.
+struct checkpoint_live_widget_shadow_t {
+  uint32_t bits;
+  uint64_t cut_cycle;
+  std::vector<uint64_t> words;
+};
+
 class checkpoint_capture_io_t {
 public:
   virtual ~checkpoint_capture_io_t() = default;
@@ -50,6 +58,10 @@ public:
   bool poll();
   uint64_t cut_cycle() const;
   const std::vector<uint8_t> &validated_frames() const;
+  // Pass SHADOW_BITS from the exact generated image/driver header. Requires a
+  // validated, still-frozen capture. Failed reads retain freeze and any staging
+  // epoch until explicit abort_and_drain(); no ordinary bridge tick is issued.
+  checkpoint_live_widget_shadow_t capture_live_widget_shadow(uint32_t bits);
   void release_after_publication();
   // May need repeated calls. Invalid shared-stream history is discarded, never
   // interpreted as a later capture. No automatic timeout silently releases it.
@@ -72,6 +84,7 @@ private:
   bool abort_issued = false;
   uint64_t consumed_frames = 0;
   bool stream_accounting_valid = true;
+  bool shadow_may_be_occupied = false;
   uint64_t read_frozen_u64(uint32_t offset);
   size_t pull_counted(void *buffer, size_t capacity);
   void check_frozen();

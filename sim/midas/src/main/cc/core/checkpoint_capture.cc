@@ -230,6 +230,54 @@ const std::vector<uint8_t> &checkpoint_capture_session_t::validated_frames() con
   return frames;
 }
 
+checkpoint_live_widget_shadow_t
+checkpoint_capture_session_t::capture_live_widget_shadow(uint32_t bits) {
+  require_capture(state == phase_t::validated && !shadow_may_be_occupied,
+                  "live widget shadow requires a validated, unoccupied capture");
+  // 411 nonphysical or 481+GATES physical control bits, plus 228 local bits.
+  // Bound allocation before any MMIO mutation; the generated header is the
+  // caller's exact shape authority, not an arbitrary runtime word count.
+  require_capture(bits == 639 || (bits >= 710 && bits <= 66244),
+                  "unsupported live widget shadow shape");
+  checkpoint_live_widget_shadow_t result{bits, cycle,
+                                        std::vector<uint64_t>((bits + 63) / 64)};
+  try {
+    poll();
+    require_capture(io.read_capture_mmio(0x88) == 0,
+                    "existing live widget shadow must not be overwritten");
+    require_capture(io.read_capture_mmio(0x94) == result.words.size(),
+                    "live widget shadow word count differs from generated header");
+    // A failing MMIO call might already have accepted its write. Recovery must
+    // discard this uncertain epoch explicitly, without publishing any result.
+    shadow_may_be_occupied = true;
+    io.write_capture_mmio(0x78, 1);
+    require_capture(io.read_capture_mmio(0x88) == 1 &&
+                        read_frozen_u64(0x8c) == cycle,
+                    "live widget shadow cut was not acknowledged");
+    for (size_t i = 0; i < result.words.size(); ++i) {
+      io.write_capture_mmio(0x7c, static_cast<uint32_t>(i));
+      require_capture(io.read_capture_mmio(0x7c) == i,
+                      "live widget shadow selector readback differs");
+      result.words[i] = read_frozen_u64(0x80);
+    }
+    require_capture(bits % 64 == 0 || (result.words.back() >> (bits % 64)) == 0,
+                    "noncanonical live widget shadow padding");
+    check_frozen();
+    require_capture(io.read_capture_mmio(0x88) == 1 &&
+                        read_frozen_u64(0x8c) == cycle &&
+                        read_frozen_u64(0x10) == cycle,
+                    "live widget shadow changed during readout");
+    io.write_capture_mmio(0x78, 2);
+    require_capture(io.read_capture_mmio(0x88) == 0,
+                    "live widget shadow release was not acknowledged");
+    shadow_may_be_occupied = false;
+    return result;
+  } catch (...) {
+    state = phase_t::failed;
+    throw;
+  }
+}
+
 void checkpoint_capture_session_t::release_after_publication() {
   require_capture(state == phase_t::validated,
                   "cannot release an unpublished/unvalidated capture");
@@ -251,6 +299,12 @@ bool checkpoint_capture_session_t::abort_and_drain() {
   state = phase_t::failed;
   require_capture(stream_accounting_valid,
                   "unknown consumed stream bytes require coordinated reset");
+  if (shadow_may_be_occupied) {
+    io.write_capture_mmio(0x78, 4);
+    require_capture(io.read_capture_mmio(0x88) == 0,
+                    "live widget shadow discard was not acknowledged");
+    shadow_may_be_occupied = false;
+  }
   if (!abort_issued) {
     io.write_capture_mmio(0, 4);
     abort_issued = true;
