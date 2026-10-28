@@ -354,8 +354,6 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
       capture.physical.get.connect(physicalTransport.io)
       physicalTransport.io
     } else Module(new CheckpointCaptureTransportBlackBox(cfg)).io
-    val adapter = Module(new CheckpointNastiAdapter(p(CtrlNastiKey)))
-    adapter.io.ctrl <> io.ctrl
     transport.clock := clock
     transport.reset := reset.asBool
     // The component restore supervisor is parked outside this production
@@ -374,77 +372,11 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
       transport.descriptor_depth := rom.io.depth
     }
     capture.controllerReset := reset.asBool
-    streamEnq.valid := transport.dma_valid
-    streamEnq.bits := transport.dma_data
-    transport.dma_ready := streamEnq.ready
-    val invalid = RegInit(false.B)
-    val producedFrames = RegInit(0.U(64.W))
-    val producedSnapshot = RegInit(0.U(64.W))
-    val hostDrainedFrames = RegInit(0.U(64.W))
-    val counterOverflow = RegInit(false.B)
-    // Cumulative counts cross capture boundaries. Abort cannot flush frames
-    // already in the shared stream engine; the host must account for them all.
-    when(streamEnq.fire) {
-      when(producedFrames.andR) { counterOverflow := true.B; invalid := true.B }
-        .otherwise { producedFrames := producedFrames + 1.U }
-    }
-    when(transport.dma_abort) { invalid := true.B }
-    val req = adapter.io.request
-    val isStatus = !req.bits.write && req.bits.address === 0x60.U
-    val isAck = req.bits.write && req.bits.address === 0x64.U
-    val blockedStart = req.bits.write && req.bits.address === 0.U && req.bits.data === 1.U && (invalid || counterOverflow)
-    val producedLow = !req.bits.write && req.bits.address === 0x68.U
-    val producedHigh = !req.bits.write && req.bits.address === 0x6c.U
-    val drainedLow = req.bits.address === 0x70.U
-    val drainedHigh = req.bits.address === 0x74.U
-    val isShadow = CheckpointLiveWidgetSnapshot.registers.map { case (_, address) =>
-      req.bits.address === address.U }.reduce(_ || _)
-    val local = isStatus || isAck || blockedStart || producedLow || producedHigh || drainedLow || drainedHigh || isShadow
-    val localValid = RegInit(false.B)
-    val localData = Reg(UInt(32.W))
-    val localError = Reg(Bool())
-    val snapshot = Module(new CheckpointLiveWidgetSnapshot(
-      transport.control_state.getWidth + CheckpointLiveWidgetSnapshot.localBits + CheckpointNastiState.bits))
-    snapshot.io.live := Cat(adapter.io.controlState, localError, localData, localValid, counterOverflow,
-      hostDrainedFrames, producedSnapshot, producedFrames, invalid, transport.control_state)
-    snapshot.io.cycle := capture.targetCycle
-    // A freeze request alone is insufficient: all separately stopped owners
-    // and (when present) the physical post-stop sampler must acknowledge it.
-    snapshot.io.cutValid := transport.freeze && capture.ownerPresent.andR &&
-      capture.ownerFrozen.andR && !capture.ownerError.orR && !transport.dma_abort &&
-      !invalid && !counterOverflow && CheckpointLiveWidgetSnapshot.acknowledgedCut(
-        transport.control_state, capture.targetCycle) && capture.physical.map(p => p.readEnable &&
-        !p.failed && p.cutCycle === capture.targetCycle).getOrElse(true.B)
-    snapshot.io.access := req.fire && isShadow
-    snapshot.io.write := req.bits.write
-    snapshot.io.address := req.bits.address
-    snapshot.io.data := req.bits.data
-    val ackAllowed = req.bits.data === 1.U && !transport.dma_abort &&
-      !transport.freeze && !transport.dma_valid && !counterOverflow &&
-      hostDrainedFrames === producedFrames
-    req.ready := Mux(local, !localValid, transport.mmio_ready)
-    transport.mmio_valid := req.valid && !local
-    transport.mmio_write := req.bits.write
-    transport.mmio_address := req.bits.address
-    transport.mmio_wdata := req.bits.data
-    when(req.fire && local) {
-      localValid := true.B
-      localData := Mux(isShadow, snapshot.io.response, MuxCase(0.U, Seq(
-        isStatus -> Cat(0.U(30.W), counterOverflow, invalid),
-        producedLow -> producedFrames(31, 0), producedHigh -> producedSnapshot(63, 32),
-        (drainedLow && !req.bits.write) -> hostDrainedFrames(31, 0),
-        (drainedHigh && !req.bits.write) -> hostDrainedFrames(63, 32))))
-      when(producedLow) { producedSnapshot := producedFrames }
-      when(drainedLow && req.bits.write) { hostDrainedFrames := Cat(hostDrainedFrames(63, 32), req.bits.data) }
-      when(drainedHigh && req.bits.write) { hostDrainedFrames := Cat(req.bits.data, hostDrainedFrames(31, 0)) }
-      localError := blockedStart || (isAck && !ackAllowed) || (isShadow && snapshot.io.error)
-      when(isAck && ackAllowed) { invalid := false.B }
-    }
-    adapter.io.response.valid := localValid || transport.mmio_response_valid
-    adapter.io.response.bits.data := Mux(localValid, localData, transport.mmio_rdata)
-    adapter.io.response.bits.error := Mux(localValid, localError, transport.mmio_response_error)
-    transport.mmio_response_ready := adapter.io.response.ready && !localValid
-    when(localValid && adapter.io.response.ready) { localValid := false.B }
+    CheckpointWidgetEndpoint.build(p(CtrlNastiKey), io.ctrl, transport,
+      streamEnq, capture.targetCycle,
+      transport.freeze && capture.ownerPresent.andR && capture.ownerFrozen.andR &&
+        !capture.ownerError.orR && capture.physical.map(p => p.readEnable &&
+          !p.failed && p.cutCycle === capture.targetCycle).getOrElse(true.B))
     override def genHeader(base: BigInt, memoryRegions: Map[String, BigInt], sb: StringBuilder): Unit = {
       if (cfg.deferredGraft) {
         sb.append(midas.checkpoint.NativeCheckpointWidgetReservation.header(base, toHostStreamIdx))
