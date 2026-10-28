@@ -7,7 +7,8 @@ import chisel3.util._
 /** An immutable observation of the running capture widget, not a restore owner.
   * Low bits contain the original transport's control_state; the eight original
   * widget-local registers follow in the order below, least significant first.
-  * The NASTI adapter, stream engine, vendor FSM encodings and this staging bank
+  * Layout 2 appends the NASTI adapter's canonical register slots. Adapter
+  * restore, the stream engine, vendor FSM encodings and this staging bank
   * still require independent ownership before production checkpoint admission.
   */
 object CheckpointLiveWidgetSnapshot {
@@ -17,7 +18,8 @@ object CheckpointLiveWidgetSnapshot {
   val localBits = localFields.map(_._2).sum
   val registers = Seq("SHADOW_COMMAND" -> 0x78, "SHADOW_INDEX" -> 0x7c,
     "SHADOW_WORD_LO" -> 0x80, "SHADOW_WORD_HI" -> 0x84, "SHADOW_STATUS" -> 0x88,
-    "SHADOW_CUT_LO" -> 0x8c, "SHADOW_CUT_HI" -> 0x90, "SHADOW_WORDS" -> 0x94)
+    "SHADOW_CUT_LO" -> 0x8c, "SHADOW_CUT_HI" -> 0x90, "SHADOW_WORDS" -> 0x94,
+    "SHADOW_LAYOUT_VERSION" -> 0x98, "SHADOW_BITS" -> 0x9c)
 
   /** Use the independently versioned source-register ABI, not a freeze request,
     * to certify that the coordinator has accepted this exact target label.
@@ -74,6 +76,8 @@ class CheckpointLiveWidgetSnapshot(val bits: Int) extends Module {
   val cycleLo = io.address === 0x8c.U
   val cycleHi = io.address === 0x90.U
   val count = io.address === 0x94.U
+  val version = io.address === 0x98.U
+  val bitCount = io.address === 0x9c.U
   val capture = command && io.write && io.data === 1.U
   val release = command && io.write && io.data === 2.U
   val abort = command && io.write && io.data === 4.U
@@ -84,9 +88,10 @@ class CheckpointLiveWidgetSnapshot(val bits: Int) extends Module {
   io.error := reset.asBool || Mux(io.write,
     Mux(command, !(capture && !occupied && io.cutValid || release && occupied || abort),
       !select || io.data >= words.U),
-    !(select || status || count || (lo || hi || cycleLo || cycleHi) && visible))
+    !(select || status || count || version || bitCount || (lo || hi || cycleLo || cycleHi) && visible))
   io.response := MuxCase(0.U, Seq(select -> index, status -> visible.asUInt,
-    count -> words.U, (lo && visible) -> word(31, 0), (hi && visible) -> word(63, 32),
+    count -> words.U, version -> 2.U, bitCount -> bits.U,
+    (lo && visible) -> word(31, 0), (hi && visible) -> word(63, 32),
     (cycleLo && visible) -> label(31, 0), (cycleHi && visible) -> label(63, 32)))
   when(io.access && !io.error && io.write) {
     when(capture) { saved := io.live; label := io.cycle; occupied := true.B; index := 0.U }

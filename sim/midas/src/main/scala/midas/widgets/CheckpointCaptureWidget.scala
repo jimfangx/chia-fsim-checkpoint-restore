@@ -55,13 +55,18 @@ object CheckpointCaptureABI {
     sb.append(s"#define ${prefix}_FRAME_BYTES 64U\n#define ${prefix}_TRANSPORT_VERSION 1U\n")
     sb.append(s"#define ${prefix}_ABORT_REQUIRES_HOST_DRAIN 1U\n")
     val controlBits = if (cfg.physicalClockGates > 0) 481 + cfg.physicalClockGates else 411
-    sb.append(s"#define ${prefix}_SHADOW_LAYOUT_VERSION 1U\n")
+    sb.append(s"#define ${prefix}_SHADOW_LAYOUT_VERSION 2U\n")
     sb.append(s"#define ${prefix}_SHADOW_CONTROL_BITS ${controlBits}U\n")
-    sb.append(s"#define ${prefix}_SHADOW_BITS ${controlBits + CheckpointLiveWidgetSnapshot.localBits}U\n")
+    sb.append(s"#define ${prefix}_SHADOW_BITS ${controlBits + CheckpointLiveWidgetSnapshot.localBits + CheckpointNastiState.bits}U\n")
+    sb.append(s"#define ${prefix}_SHADOW_ADAPTER_BITS ${CheckpointNastiState.bits}U\n")
     sb.append(s"#define ${prefix}_SHADOW_RESTORE_SUPPORTED 0U\n")
     var offset = controlBits
     CheckpointLiveWidgetSnapshot.localFields.foreach { case (name, width) =>
       sb.append(s"// shadow local $name: bit $offset, width $width\n")
+      offset += width
+    }
+    CheckpointNastiState.fields.foreach { case (name, width) =>
+      sb.append(s"// shadow adapter $name: bit $offset, width $width\n")
       offset += width
     }
     cfg.ownerNames.zipWithIndex.foreach { case (owner, index) =>
@@ -211,8 +216,9 @@ class CheckpointPhysicalCaptureSideband(gates: Int) extends Bundle {
   * malformed write burst, W beats are drained through LAST before one SLVERR.
   */
 class CheckpointNastiAdapter(np: NastiParameters) extends Module {
-  require(np.dataBits == 32 && np.addrBits >= 8)
+  require(np.dataBits == 32 && np.addrBits >= 8 && np.addrBits <= 64 && np.idBits > 0 && np.idBits <= 64)
   val io = IO(new Bundle {
+    val controlState = Output(UInt(CheckpointNastiState.bits.W))
     val ctrl = Flipped(new NastiIO(np))
     val request = Decoupled(new Bundle {
       val write = Bool()
@@ -238,6 +244,15 @@ class CheckpointNastiAdapter(np: NastiParameters) extends Module {
   val responseData = Reg(UInt(32.W))
   val responseId = Reg(UInt(np.idBits.W))
   val errorReadRemaining = RegInit(0.U(8.W))
+  io.controlState := CheckpointNastiState.pack(
+    CheckpointNastiState.channel("aw", aw, CheckpointNastiState.addressFields) ++
+    CheckpointNastiState.channel("wd", wd, CheckpointNastiState.dataFields) ++
+    CheckpointNastiState.channel("ar", ar, CheckpointNastiState.addressFields) ++ Seq(
+      "haveAW" -> haveAW.asUInt, "haveW" -> haveW.asUInt, "haveAR" -> haveAR.asUInt,
+      "badW" -> badW.asUInt, "busy" -> busy.asUInt, "writing" -> writing.asUInt,
+      "responseValid" -> responseValid.asUInt, "responseError" -> responseError.asUInt,
+      "responseData" -> responseData, "responseId" -> responseId,
+      "errorReadRemaining" -> errorReadRemaining))
   // No new transaction until its prior response has been consumed. AR may be
   // queued behind a partial write, but may not bypass that write's eventual W.
   // A pending read owns the backend request until it is accepted. An earlier
@@ -372,8 +387,8 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
     val localData = Reg(UInt(32.W))
     val localError = Reg(Bool())
     val snapshot = Module(new CheckpointLiveWidgetSnapshot(
-      transport.control_state.getWidth + CheckpointLiveWidgetSnapshot.localBits))
-    snapshot.io.live := Cat(localError, localData, localValid, counterOverflow,
+      transport.control_state.getWidth + CheckpointLiveWidgetSnapshot.localBits + CheckpointNastiState.bits))
+    snapshot.io.live := Cat(adapter.io.controlState, localError, localData, localValid, counterOverflow,
       hostDrainedFrames, producedSnapshot, producedFrames, invalid, transport.control_state)
     snapshot.io.cycle := capture.targetCycle
     // A freeze request alone is insufficient: all separately stopped owners

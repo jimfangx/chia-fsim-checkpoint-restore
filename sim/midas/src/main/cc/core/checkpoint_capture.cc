@@ -234,15 +234,18 @@ checkpoint_live_widget_shadow_t
 checkpoint_capture_session_t::capture_live_widget_shadow(uint32_t bits) {
   require_capture(state == phase_t::validated && !shadow_may_be_occupied,
                   "live widget shadow requires a validated, unoccupied capture");
-  // 411 nonphysical or 481+GATES physical control bits, plus 228 local bits.
+  // Layout 2: 411 nonphysical or 481+GATES physical control bits, plus 228
+  // local bits and 530 canonical NASTI adapter bits. Layout 1 is incompatible.
   // Bound allocation before any MMIO mutation; the generated header is the
   // caller's exact shape authority, not an arbitrary runtime word count.
-  require_capture(bits == 639 || (bits >= 710 && bits <= 66244),
+  require_capture(bits == 1169 || (bits >= 1240 && bits <= 66774),
                   "unsupported live widget shadow shape");
   checkpoint_live_widget_shadow_t result{bits, cycle,
                                         std::vector<uint64_t>((bits + 63) / 64)};
   try {
     poll();
+    require_capture(io.read_capture_mmio(0x98) == 2 && io.read_capture_mmio(0x9c) == bits,
+                    "live widget shadow layout differs from generated header");
     require_capture(io.read_capture_mmio(0x88) == 0,
                     "existing live widget shadow must not be overwritten");
     require_capture(io.read_capture_mmio(0x94) == result.words.size(),

@@ -29,7 +29,7 @@ module checkpoint_capture_widget_tb;
   reg [63:0] bankResponseData=0;
   integer bankDelay=0, frames=0;
   reg [511:0] heldFrame;
-  reg [638:0] shadowExpected;
+  reg [1168:0] shadowExpected;
   integer shadowCaptures=0, shadowWords=0, sw;
   reg [63:0] expectedWord;
   // Independent original-register oracle. No shadow storage or exported
@@ -38,7 +38,45 @@ module checkpoint_capture_widget_tb;
     if (!reset && dut.adapter.io_request_valid && dut.adapter.io_request_ready &&
         dut.adapter.io_request_bits_write && dut.adapter.io_request_bits_address=='h78 &&
         dut.adapter.io_request_bits_data==1 && !dut.snapshot.io_error) begin
-      shadowExpected = {dut.localError,dut.localData,dut.localValid,dut.counterOverflow,
+      shadowExpected = {dut.adapter.errorReadRemaining,
+        {60'b0,dut.adapter.responseId},
+        dut.adapter.responseData,
+        dut.adapter.responseError,
+        dut.adapter.responseValid,
+        dut.adapter.writing,
+        dut.adapter.busy,
+        dut.adapter.badW,
+        dut.adapter.haveAR,
+        dut.adapter.haveW,
+        dut.adapter.haveAW,
+        dut.adapter.ar_user,
+        {60'b0,dut.adapter.ar_id},
+        dut.adapter.ar_region,
+        dut.adapter.ar_qos,
+        dut.adapter.ar_prot,
+        dut.adapter.ar_cache,
+        dut.adapter.ar_lock,
+        dut.adapter.ar_burst,
+        dut.adapter.ar_size,
+        dut.adapter.ar_len,
+        {32'b0,dut.adapter.ar_addr},
+        dut.adapter.wd_user,
+        dut.adapter.wd_strb,
+        {60'b0,dut.adapter.wd_id},
+        dut.adapter.wd_last,
+        dut.adapter.wd_data,
+        dut.adapter.aw_user,
+        {60'b0,dut.adapter.aw_id},
+        dut.adapter.aw_region,
+        dut.adapter.aw_qos,
+        dut.adapter.aw_prot,
+        dut.adapter.aw_cache,
+        dut.adapter.aw_lock,
+        dut.adapter.aw_burst,
+        dut.adapter.aw_size,
+        dut.adapter.aw_len,
+        {32'b0,dut.adapter.aw_addr},
+        dut.localError,dut.localData,dut.localValid,dut.counterOverflow,
         dut.hostDrainedFrames,dut.producedSnapshot,dut.producedFrames,dut.invalid,
         dut.CheckpointCaptureTransport.cut.error,dut.CheckpointCaptureTransport.cut.cut_cycle,
         dut.CheckpointCaptureTransport.cut.state,dut.CheckpointCaptureTransport.address,
@@ -142,19 +180,21 @@ module checkpoint_capture_widget_tb;
     aw(offset); w(value,1); b(status);
   end endtask
   task readShadow; begin
-    readReg('h88,1); readReg('h8c,42); readReg('h90,0); readReg('h94,10);
-    for(sw=0;sw<10;sw++) begin
+    readReg('h88,1); readReg('h8c,42); readReg('h90,0); readReg('h94,19);
+    for(sw=0;sw<19;sw++) begin
       writeReg('h7c,sw,0); expectedWord=shadowExpected>>(sw*64);
       readReg('h80,expectedWord[31:0]); readReg('h84,expectedWord[63:32]);
       shadowWords++;
     end
-    writeReg('h7c,32'hffffffff,2); readReg('h7c,9);
-    writeReg('h7c,10,2); readReg('h7c,9);
+    writeReg('h7c,32'hffffffff,2); readReg('h7c,18);
+    writeReg('h7c,19,2); readReg('h7c,18);
   end endtask
   initial begin
     $dumpfile("checkpoint-widget.vcd"); $dumpvars(0,checkpoint_capture_widget_tb);
     repeat(3) tick(); @(negedge clock); reset=0;
-    readReg('h88,0); readReg('h94,10);
+    readReg('h98,2); readReg('h9c,1169);
+    writeReg('h98,1,2); writeReg('h9c,1169,2);
+    readReg('h88,0); readReg('h94,19);
     writeReg('h78,1,2); ar('h80); r(2,1,0); // cannot capture an idle, unfrozen source
     writeReg('h78,2,2); writeReg('h78,3,2); // release-empty/invalid command
     command(1,0); check(freeze,"start freezes owners");
@@ -186,10 +226,10 @@ module checkpoint_capture_widget_tb;
     aw('h64); w(1,1); b(2); readReg('h60,1);
     aw('h70); w(5,1); b(0); readReg('h70,5); readReg('h74,0);
     aw('h64); w(1,1); b(0); readReg('h60,0);
-    check(shadowCaptures==1 && shadowWords==30,"complete immutable shadow coverage");
+    check(shadowCaptures==1 && shadowWords==57,"complete immutable shadow coverage");
     writeReg('h78,4,0); readReg('h88,0);
     $display("CHECKPOINT_WIDGET_SHADOW_PASS captures=%0d words=%0d",shadowCaptures,shadowWords);
     $display("CHECKPOINT_WIDGET_PASS checks=%0d frames=%0d",checks,frames); $finish;
   end
-  initial begin #30000; $fatal(1,"watchdog timeout"); end
+  initial begin #50000; $fatal(1,"watchdog timeout"); end
 endmodule

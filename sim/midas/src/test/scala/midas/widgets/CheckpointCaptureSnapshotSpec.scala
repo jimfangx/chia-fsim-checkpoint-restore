@@ -10,7 +10,7 @@ class CheckpointCaptureSnapshotSpec extends AnyFlatSpec {
   it should "emit both concrete control/local widths and reject an empty source" in {
     intercept[IllegalArgumentException] { new ChiselStage().emitVerilog(new CheckpointLiveWidgetSnapshot(0)) }
     val root = Paths.get(sys.props("checkpoint.widget.out")).resolve("live-snapshot")
-    Seq(639, 712).foreach { bits =>
+    Seq(1169, 1242).foreach { bits =>
       val out = root.resolve(bits.toString)
       Files.createDirectories(out)
       val rtl = new ChiselStage().emitVerilog(new CheckpointLiveWidgetSnapshot(bits),

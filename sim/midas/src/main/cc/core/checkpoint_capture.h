@@ -23,7 +23,7 @@ struct checkpoint_capture_manifest_t {
   std::vector<checkpoint_capture_entry_t> entries;
 };
 
-// Observation of the live transport at a held target cut, layout version 1.
+// Observation of the live transport at a held target cut, layout version 2.
 // This is not a canonical Level-1 image or a complete/restore-capable owner.
 struct checkpoint_live_widget_shadow_t {
   uint32_t bits;
