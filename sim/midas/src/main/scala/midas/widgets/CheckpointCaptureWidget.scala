@@ -215,9 +215,18 @@ class CheckpointPhysicalCaptureSideband(gates: Int) extends Bundle {
   * Unsupported AXI bursts are rejected without forwarding any operation. For a
   * malformed write burst, W beats are drained through LAST before one SLVERR.
   */
-class CheckpointNastiAdapter(np: NastiParameters) extends Module {
+class CheckpointNastiAdapter(np: NastiParameters, restoreEnabled: Boolean = false) extends Module {
   require(np.dataBits == 32 && np.addrBits >= 8 && np.addrBits <= 64 && np.idBits > 0 && np.idBits <= 64)
   val io = IO(new Bundle {
+    // Opt-in component port, absent in production. A supervisor must hold the
+    // upstream AXI master and downstream response owner at this same epoch.
+    val restore = if (restoreEnabled) Some(new Bundle {
+      val hold = Input(Bool())
+      val load = Input(Bool())
+      val state = Input(UInt(CheckpointNastiState.bits.W))
+      val accepted = Output(Bool())
+      val error = Output(Bool())
+    }) else None
     val controlState = Output(UInt(CheckpointNastiState.bits.W))
     val ctrl = Flipped(new NastiIO(np))
     val request = Decoupled(new Bundle {
@@ -244,23 +253,26 @@ class CheckpointNastiAdapter(np: NastiParameters) extends Module {
   val responseData = Reg(UInt(32.W))
   val responseId = Reg(UInt(np.idBits.W))
   val errorReadRemaining = RegInit(0.U(8.W))
-  io.controlState := CheckpointNastiState.pack(
+  val originalState =
     CheckpointNastiState.channel("aw", aw, CheckpointNastiState.addressFields) ++
     CheckpointNastiState.channel("wd", wd, CheckpointNastiState.dataFields) ++
     CheckpointNastiState.channel("ar", ar, CheckpointNastiState.addressFields) ++ Seq(
-      "haveAW" -> haveAW.asUInt, "haveW" -> haveW.asUInt, "haveAR" -> haveAR.asUInt,
-      "badW" -> badW.asUInt, "busy" -> busy.asUInt, "writing" -> writing.asUInt,
-      "responseValid" -> responseValid.asUInt, "responseError" -> responseError.asUInt,
+      "haveAW" -> haveAW, "haveW" -> haveW, "haveAR" -> haveAR,
+      "badW" -> badW, "busy" -> busy, "writing" -> writing,
+      "responseValid" -> responseValid, "responseError" -> responseError,
       "responseData" -> responseData, "responseId" -> responseId,
-      "errorReadRemaining" -> errorReadRemaining))
+      "errorReadRemaining" -> errorReadRemaining)
+  io.controlState := CheckpointNastiState.pack(originalState)
+  // Even a malformed load outside hold must not handshake or partially write.
+  val running = io.restore.map(r => !r.hold && !r.load).getOrElse(true.B)
   // No new transaction until its prior response has been consumed. AR may be
   // queued behind a partial write, but may not bypass that write's eventual W.
   // A pending read owns the backend request until it is accepted. An earlier
   // partial write must still be allowed to acquire its missing channel.
   val readOwnsRequest = haveAR && !haveAW && !haveW && !badW
-  io.ctrl.aw.ready := !haveAW && !busy && !responseValid && !readOwnsRequest
-  io.ctrl.w.ready := !haveW && !busy && !responseValid && !readOwnsRequest
-  io.ctrl.ar.ready := !haveAR && !busy && !responseValid
+  io.ctrl.aw.ready := running && !haveAW && !busy && !responseValid && !readOwnsRequest
+  io.ctrl.w.ready := running && !haveW && !busy && !responseValid && !readOwnsRequest
+  io.ctrl.ar.ready := running && !haveAR && !busy && !responseValid
   when(io.ctrl.aw.fire) { aw := io.ctrl.aw.bits; haveAW := true.B }
   when(io.ctrl.ar.fire) { ar := io.ctrl.ar.bits; haveAR := true.B }
   when(io.ctrl.w.fire) {
@@ -274,7 +286,7 @@ class CheckpointNastiAdapter(np: NastiParameters) extends Module {
     aw.addr(1, 0) =/= 0.U || wd.strb =/= 15.U || badW
   val readBad = ar.len =/= 0.U || ar.size =/= 2.U || ar.lock || ar.burst > 1.U ||
     ar.addr(1, 0) =/= 0.U
-  val candidate = !busy && !responseValid && (chooseWrite || chooseRead)
+  val candidate = running && !busy && !responseValid && (chooseWrite || chooseRead)
   val invalid = Mux(chooseWrite, writeBad, readBad)
   io.request.valid := candidate && !invalid
   io.request.bits.write := chooseWrite
@@ -290,18 +302,18 @@ class CheckpointNastiAdapter(np: NastiParameters) extends Module {
       responseValid := true.B; responseError := true.B; responseData := 0.U
     }.otherwise { busy := true.B }
   }
-  io.response.ready := busy && !responseValid
+  io.response.ready := running && busy && !responseValid
   when(io.response.fire) {
     busy := false.B
     responseValid := true.B
     responseError := io.response.bits.error
     responseData := io.response.bits.data
   }
-  io.ctrl.b.valid := responseValid && writing
+  io.ctrl.b.valid := running && responseValid && writing
   io.ctrl.b.bits.id := responseId
   io.ctrl.b.bits.resp := Mux(responseError, 2.U, 0.U)
   io.ctrl.b.bits.user := 0.U
-  io.ctrl.r.valid := responseValid && !writing
+  io.ctrl.r.valid := running && responseValid && !writing
   io.ctrl.r.bits.id := responseId
   io.ctrl.r.bits.data := responseData
   io.ctrl.r.bits.resp := Mux(responseError, 2.U, 0.U)
@@ -309,6 +321,11 @@ class CheckpointNastiAdapter(np: NastiParameters) extends Module {
   io.ctrl.r.bits.user := 0.U
   when(io.ctrl.b.fire || (io.ctrl.r.fire && errorReadRemaining === 0.U)) { responseValid := false.B }
   when(io.ctrl.r.fire && errorReadRemaining =/= 0.U) { errorReadRemaining := errorReadRemaining - 1.U }
+  io.restore.foreach { r =>
+    r.accepted := r.load && r.hold && !reset.asBool && CheckpointNastiState.paddingValid(r.state, originalState)
+    r.error := r.load && !r.accepted
+    CheckpointNastiState.load(r.state, originalState, r.accepted)
+  }
 }
 
 /** This is deliberately a Widget, not a BridgeModule: global state readout must

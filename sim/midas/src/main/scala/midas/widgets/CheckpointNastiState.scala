@@ -31,14 +31,44 @@ object CheckpointNastiState {
     layout.map { case (name, _) => (prefix + "_" + name, value.elements(name).asUInt) }
   }
 
-  def pack(values: Seq[(String, UInt)]): UInt = {
+  private def slices(values: Seq[(String, Bits)]): Seq[(Bits, Int, Int)] = {
     require(values.map(_._1) == fields.map(_._1), "checkpoint NASTI state: changed register schema")
-    Cat(values.zip(fields).reverse.map { case ((name, value), (_, width)) =>
+    var offset = 0
+    values.zip(fields).map { case ((name, value), (_, width)) =>
       require(value.getWidth > 0 && value.getWidth <= width,
         "checkpoint NASTI state: unsupported register width: " + name)
       require(name.endsWith("_addr") || name.endsWith("_id") || name == "responseId" ||
         value.getWidth == width, "checkpoint NASTI state: changed register width: " + name)
-      value.pad(width)
-    })
+      val result = (value, offset, width)
+      offset += width
+      result
+    }
+  }
+
+  def pack(values: Seq[(String, Bits)]): UInt =
+    Cat(slices(values).reverse.map { case (value, _, width) => value.asUInt.pad(width) })
+
+  /** Reject geometry padding before any original register is changed. */
+  def paddingValid(state: UInt, values: Seq[(String, Bits)]): Bool = {
+    require(state.getWidth == bits, "checkpoint NASTI restore: changed canonical width")
+    slices(values).map { case (value, offset, width) =>
+      if (value.getWidth == width) true.B
+      else state(offset + width - 1, offset + value.getWidth) === 0.U
+    }.reduce(_ && _)
+  }
+
+  /** The caller must hold both frontend and backend at the same epoch. */
+  def load(state: UInt, values: Seq[(String, Bits)], accepted: Bool): Unit = {
+    require(state.getWidth == bits, "checkpoint NASTI restore: changed canonical width")
+    when(accepted) {
+      slices(values).foreach { case (value, offset, _) =>
+        val data = state(offset + value.getWidth - 1, offset)
+        value match {
+          case b: Bool => b := data.asBool
+          case u: UInt => u := data
+          case _ => throw new IllegalArgumentException("checkpoint NASTI restore: unsupported register type")
+        }
+      }
+    }
   }
 }

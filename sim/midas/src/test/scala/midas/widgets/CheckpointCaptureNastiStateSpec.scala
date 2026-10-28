@@ -15,9 +15,9 @@ class CheckpointCaptureNastiStateSpec extends AnyFlatSpec {
 
   it should "cover every original register at narrow, concrete and maximum platform widths" in {
     val root = Paths.get(sys.props("checkpoint.widget.out")).resolve("adapter-state")
-    Seq((8, 1), (32, 4), (64, 64)).foreach { case (addr, id) =>
-      val out = root.resolve(s"$addr-$id"); Files.createDirectories(out)
-      new ChiselStage().emitVerilog(new CheckpointNastiAdapter(NastiParameters(32, addr, id)),
+    for ((addr, id) <- Seq((8, 1), (32, 4), (32, 12), (64, 64)); restore <- Seq(false, true)) {
+      val out = root.resolve(s"$addr-$id" + (if (restore) "-restore" else "")); Files.createDirectories(out)
+      new ChiselStage().emitVerilog(new CheckpointNastiAdapter(NastiParameters(32, addr, id), restore),
         Array("--target-dir", out.toString))
       val text = Files.readString(out.resolve("CheckpointNastiAdapter.fir"))
       val low = new Compiler(Forms.LowForm).execute(CircuitState(Parser.parse(text), ChirrtlForm))
@@ -36,6 +36,8 @@ class CheckpointCaptureNastiStateSpec extends AnyFlatSpec {
         assert(registers(name) == expected, s"changed original register shape: $name")
       }
       assert(CheckpointNastiState.bits == 530 && registers.size == 38)
+      assert(module.ports.exists(_.name == "io_restore_hold") == restore,
+        "production adapter must have no restore control ports")
     }
   }
 
