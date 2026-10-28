@@ -10,7 +10,7 @@ import firesim.lib.nasti._
   * upstream master are separately owned and must remain parked at this epoch.
   * This interface cannot admit an image or release any of those owners.
   */
-class CheckpointWidgetEndpointRestore extends Bundle {
+class CheckpointWidgetEndpointRestore(shadowBits: Int = 0) extends Bundle {
   val hold = Input(Bool())
   val load = Input(Bool())
   val state = Input(UInt(CheckpointWidgetEndpoint.bits.W))
@@ -20,6 +20,10 @@ class CheckpointWidgetEndpointRestore extends Bundle {
   val ownerError = Input(Bool())
   val accepted = Output(Bool())
   val error = Output(Bool())
+  val shadow = if (shadowBits > 0) Some(new Bundle {
+    val state = Input(UInt(CheckpointLiveWidgetSnapshot.stateBits(shadowBits).W))
+    val current = Output(UInt(CheckpointLiveWidgetSnapshot.stateBits(shadowBits).W))
+  }) else None
 }
 
 /** Shared elaboration of the real widget equations, in the caller's original
@@ -34,6 +38,11 @@ object CheckpointWidgetEndpoint {
       restore: Option[CheckpointWidgetEndpointRestore] = None, resetActive: Bool = false.B): UInt = noPrefix {
     val adapter = Module(new CheckpointNastiAdapter(np, restore.nonEmpty)).suggestName("adapter")
     adapter.io.ctrl <> ctrl
+    val shadowBits = transport.control_state.getWidth + bits
+    val restoreShadow = restore.exists(_.shadow.nonEmpty)
+    val validShadow = restore.flatMap(_.shadow).map { s =>
+      CheckpointLiveWidgetSnapshot.stateValid(s.state, shadowBits)
+    }.getOrElse(true.B)
     val running = restore.map(r => !r.hold && !r.load && !resetActive).getOrElse(true.B)
     streamEnq.valid := running && transport.dma_valid
     streamEnq.bits := transport.dma_data
@@ -43,8 +52,8 @@ object CheckpointWidgetEndpoint {
       // Any attempted load parks the interface, even when the certificate is
       // invalid; only the shared accepted edge can write either register set.
       a.hold := r.hold || r.load || resetActive
-      a.load := r.load && r.hold && r.ownersQuiescent && !r.ownerError &&
-        r.epoch === r.expectedEpoch
+      a.load := r.load && r.hold && !resetActive && r.ownersQuiescent && !r.ownerError &&
+        r.epoch === r.expectedEpoch && validShadow
       a.state := r.state(bits - 1, CheckpointLiveWidgetSnapshot.localBits)
       r.accepted := a.accepted
       r.error := r.load && !a.accepted
@@ -75,8 +84,15 @@ object CheckpointWidgetEndpoint {
     val localValid = RegInit(false.B).suggestName("localValid")
     val localData = Reg(UInt(32.W)).suggestName("localData")
     val localError = Reg(Bool()).suggestName("localError")
-    val snapshot = Module(new CheckpointLiveWidgetSnapshot(
-      transport.control_state.getWidth + CheckpointLiveWidgetSnapshot.localBits + CheckpointNastiState.bits)).suggestName("snapshot")
+    val snapshot = Module(new CheckpointLiveWidgetSnapshot(shadowBits, restoreShadow)).suggestName("snapshot")
+    restore.filter(_.shadow.nonEmpty).foreach { r =>
+      val s = snapshot.io.restore.get
+      s.hold := r.hold || r.load || resetActive
+      // One shared accepting edge for all locals, adapter and staging bank.
+      s.load := r.accepted
+      s.state := r.shadow.get.state
+      r.shadow.get.current := s.current
+    }
     snapshot.io.live := Cat(adapter.io.controlState, localError, localData, localValid, counterOverflow,
       hostDrainedFrames, producedSnapshot, producedFrames, invalid, transport.control_state)
     snapshot.io.cycle := targetCycle

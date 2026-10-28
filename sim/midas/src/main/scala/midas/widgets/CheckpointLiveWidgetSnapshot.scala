@@ -12,6 +12,13 @@ import chisel3.util._
   * still require independent ownership before production checkpoint admission.
   */
 object CheckpointLiveWidgetSnapshot {
+  // Original staging registers, distinct from the live source ABI. Restore
+  // must preserve an occupied bank even when its source has since changed.
+  def stateBits(bits: Int): Int = { require(bits > 0); bits + 97 }
+  def stateValid(state: UInt, bits: Int): Bool = {
+    require(state.getWidth == stateBits(bits))
+    state(bits + 96, bits + 65) < ((bits + 63) / 64).U
+  }
   val localFields = Seq("invalid" -> 1, "producedFrames" -> 64,
     "producedSnapshot" -> 64, "hostDrainedFrames" -> 64,
     "counterOverflow" -> 1, "localValid" -> 1, "localData" -> 32, "localError" -> 1)
@@ -45,14 +52,24 @@ object CheckpointLiveWidgetSnapshot {
   }
 }
 
+class CheckpointWidgetSnapshotRestore(bits: Int) extends Bundle {
+  val hold = Input(Bool())
+  val load = Input(Bool())
+  val state = Input(UInt(CheckpointLiveWidgetSnapshot.stateBits(bits).W))
+  val current = Output(UInt(CheckpointLiveWidgetSnapshot.stateBits(bits).W))
+  val accepted = Output(Bool())
+  val error = Output(Bool())
+}
+
 /** Uses only the ungated host clock. Capture samples BEFORE the accepting edge,
   * after all caller-certified owners have stopped, without holding the source.
   * Rejected requests preserve an occupied bank and its label/index/payload.
   */
-class CheckpointLiveWidgetSnapshot(val bits: Int) extends Module {
+class CheckpointLiveWidgetSnapshot(val bits: Int, restoreEnabled: Boolean = false) extends Module {
   require(bits > 0)
   val words = (bits + 63) / 64
   val io = IO(new Bundle {
+    val restore = if (restoreEnabled) Some(new CheckpointWidgetSnapshotRestore(bits)) else None
     val live = Input(UInt(bits.W))
     val cycle = Input(UInt(64.W))
     val cutValid = Input(Bool())
@@ -93,9 +110,22 @@ class CheckpointLiveWidgetSnapshot(val bits: Int) extends Module {
     count -> words.U, version -> 2.U, bitCount -> bits.U,
     (lo && visible) -> word(31, 0), (hi && visible) -> word(63, 32),
     (cycleLo && visible) -> label(31, 0), (cycleHi && visible) -> label(63, 32)))
-  when(io.access && !io.error && io.write) {
+  val running = io.restore.map(r => !r.hold && !r.load).getOrElse(true.B)
+  when(running && io.access && !io.error && io.write) {
     when(capture) { saved := io.live; label := io.cycle; occupied := true.B; index := 0.U }
     when(release || abort) { occupied := false.B }
     when(select) { index := io.data }
+  }
+  io.restore.foreach { r =>
+    r.current := Cat(index, label, saved, occupied)
+    r.accepted := r.hold && r.load && !reset.asBool &&
+      CheckpointLiveWidgetSnapshot.stateValid(r.state, bits)
+    r.error := r.load && !r.accepted
+    when(r.accepted) {
+      occupied := r.state(0)
+      saved := r.state(bits, 1)
+      label := r.state(bits + 64, bits + 1)
+      index := r.state(bits + 96, bits + 65)
+    }
   }
 }

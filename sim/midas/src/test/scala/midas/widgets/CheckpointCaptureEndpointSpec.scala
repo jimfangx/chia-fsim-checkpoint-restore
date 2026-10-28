@@ -15,10 +15,15 @@ import org.scalatest.flatspec.AnyFlatSpec
 /** The actual production builder with an explicit environment interface.
   * Transport/controller/shadow/stream-engine state is deliberately not claimed.
   */
-class CheckpointEndpointComponent(restoreEnabled: Boolean, idBits: Int) extends Module {
+class CheckpointEndpointComponent(restoreEnabled: Boolean, idBits: Int,
+    shadowEnabled: Boolean = false, controlBits: Int = 411) extends Module {
+  require(!shadowEnabled || restoreEnabled)
   val io = IO(new Bundle {
     val ctrl = Flipped(new NastiIO(NastiParameters(32, 32, idBits)))
-    val restore = if (restoreEnabled) Some(new CheckpointWidgetEndpointRestore) else None
+    val restore = if (restoreEnabled) Some(new CheckpointWidgetEndpointRestore(
+      if (shadowEnabled) controlBits + CheckpointWidgetEndpoint.bits else 0)) else None
+    val control = if (shadowEnabled) Some(Input(UInt(controlBits.W))) else None
+    val cutValid = if (shadowEnabled) Some(Input(Bool())) else None
     val state = Output(UInt(CheckpointWidgetEndpoint.bits.W))
     val stream = Decoupled(UInt(512.W))
     val dmaValid = Input(Bool())
@@ -36,9 +41,9 @@ class CheckpointEndpointComponent(restoreEnabled: Boolean, idBits: Int) extends 
     val responseData = Input(UInt(32.W))
     val responseError = Input(Bool())
   })
-  val transport = Wire(new CheckpointCaptureTransportIO(1))
+  val transport = Wire(new CheckpointCaptureTransportIO(1, controlBits))
   transport := DontCare
-  transport.control_state := 0.U
+  transport.control_state := io.control.getOrElse(0.U)
   transport.dma_valid := io.dmaValid
   transport.dma_data := io.dmaData
   transport.dma_abort := io.dmaAbort
@@ -48,7 +53,7 @@ class CheckpointEndpointComponent(restoreEnabled: Boolean, idBits: Int) extends 
   transport.mmio_rdata := io.responseData
   transport.mmio_response_error := io.responseError
   io.state := CheckpointWidgetEndpoint.build(NastiParameters(32, 32, idBits), io.ctrl,
-    transport, io.stream, 42.U(64.W), false.B, io.restore, reset.asBool)
+    transport, io.stream, 42.U(64.W), io.cutValid.getOrElse(false.B), io.restore, reset.asBool)
   io.dmaReady := transport.dma_ready
   io.backendValid := transport.mmio_valid
   io.backendWrite := transport.mmio_write
@@ -56,6 +61,9 @@ class CheckpointEndpointComponent(restoreEnabled: Boolean, idBits: Int) extends 
   io.backendData := transport.mmio_wdata
   io.responseReady := transport.mmio_response_ready
 }
+
+class CheckpointEndpointShadowComponent(idBits: Int, controlBits: Int)
+    extends CheckpointEndpointComponent(true, idBits, true, controlBits)
 
 class CheckpointCaptureEndpointSpec extends AnyFlatSpec {
   behavior.of("Original widget endpoint common epoch")
@@ -78,6 +86,26 @@ class CheckpointCaptureEndpointSpec extends AnyFlatSpec {
         "endpoint must contain exactly all eight original local registers")
       assert(module.ports.exists(_.name == "io_restore_hold") == restore)
       assert(CheckpointWidgetEndpoint.bits == 758)
+    }
+  }
+  it should "restore the original shadow bank at the same endpoint epoch without adding storage" in {
+    val root = Paths.get(sys.props("checkpoint.widget.out")).resolve("endpoint-shadow")
+    for ((idBits, controlBits) <- Seq(4 -> 411, 12 -> 487)) {
+      val out = root.resolve(idBits.toString); Files.createDirectories(out)
+      new ChiselStage().emitVerilog(new CheckpointEndpointShadowComponent(idBits, controlBits),
+        Array("--target-dir", out.toString))
+      val low = new Compiler(Forms.LowForm).execute(CircuitState(
+        Parser.parse(Files.readString(out.resolve("CheckpointEndpointShadowComponent.fir"))), ChirrtlForm))
+      val snapshot = low.circuit.modules.collectFirst {
+        case m: firrtl.ir.Module if m.name == "CheckpointLiveWidgetSnapshot" => m }.get
+      val regs = scala.collection.mutable.Map.empty[String, Int]
+      def visit(s: Statement): Unit = {
+        s match { case r: DefRegister => regs += r.name -> r.tpe.asInstanceOf[UIntType].width.asInstanceOf[IntWidth].width.toInt
+          case _ => () }; s.foreachStmt(visit)
+      }
+      visit(snapshot.body)
+      assert(regs.toMap == Map("occupied" -> 1, "saved" -> (controlBits + 758), "label" -> 64, "index" -> 32))
+      assert(snapshot.ports.exists(_.name == "io_restore_state"))
     }
   }
 }
