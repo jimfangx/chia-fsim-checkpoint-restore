@@ -121,6 +121,8 @@ void checkpoint_capture_session_t::begin() {
   frames.assign(total_bytes, 0);
   received = 0;
   abort_issued = false;
+  shadow_retryable = false;
+  shadow_bits = 0;
   try {
     require_capture(io.read_capture_mmio(0x60) == 0 &&
                         io.read_capture_mmio(0x04) == 1,
@@ -248,37 +250,91 @@ checkpoint_capture_session_t::capture_live_widget_shadow(uint32_t bits) {
                     "live widget shadow layout differs from generated header");
     require_capture(io.read_capture_mmio(0x88) == 0,
                     "existing live widget shadow must not be overwritten");
-    require_capture(io.read_capture_mmio(0x94) == result.words.size(),
+    require_capture(io.read_capture_mmio(0x94) == (bits + 63) / 64,
                     "live widget shadow word count differs from generated header");
-    // A failing MMIO call might already have accepted its write. Recovery must
-    // discard this uncertain epoch explicitly, without publishing any result.
+    // A failing MMIO call might already have accepted its write. A retry must
+    // prove the occupied epoch without issuing another capture command.
     shadow_may_be_occupied = true;
+    shadow_retryable = true;
+    shadow_bits = bits;
     io.write_capture_mmio(0x78, 1);
-    require_capture(io.read_capture_mmio(0x88) == 1 &&
-                        read_frozen_u64(0x8c) == cycle,
-                    "live widget shadow cut was not acknowledged");
-    for (size_t i = 0; i < result.words.size(); ++i) {
-      io.write_capture_mmio(0x7c, static_cast<uint32_t>(i));
-      require_capture(io.read_capture_mmio(0x7c) == i,
-                      "live widget shadow selector readback differs");
-      result.words[i] = read_frozen_u64(0x80);
-    }
-    require_capture(bits % 64 == 0 || (result.words.back() >> (bits % 64)) == 0,
-                    "noncanonical live widget shadow padding");
-    check_frozen();
-    require_capture(io.read_capture_mmio(0x88) == 1 &&
-                        read_frozen_u64(0x8c) == cycle &&
-                        read_frozen_u64(0x10) == cycle,
-                    "live widget shadow changed during readout");
-    io.write_capture_mmio(0x78, 2);
-    require_capture(io.read_capture_mmio(0x88) == 0,
-                    "live widget shadow release was not acknowledged");
-    shadow_may_be_occupied = false;
-    return result;
+    return read_live_widget_shadow(std::move(result));
   } catch (...) {
     state = phase_t::failed;
     throw;
   }
+}
+
+void checkpoint_capture_session_t::require_shadow(bool condition, const char *message) {
+  // Only transport exceptions are retryable. Observed invalid state is not
+  // repaired by a later successful MMIO read or by switching driver geometry.
+  if (!condition)
+    shadow_retryable = false;
+  require_capture(condition, message);
+}
+
+checkpoint_live_widget_shadow_t
+checkpoint_capture_session_t::retry_live_widget_shadow(uint32_t bits) {
+  require_capture(state == phase_t::failed && shadow_may_be_occupied &&
+                      shadow_retryable && bits == shadow_bits,
+                  "no retryable live widget shadow owned by this session");
+  checkpoint_live_widget_shadow_t result{bits, cycle,
+                                        std::vector<uint64_t>((bits + 63) / 64)};
+  try {
+    return read_live_widget_shadow(std::move(result));
+  } catch (...) {
+    state = phase_t::failed;
+    throw;
+  }
+}
+
+checkpoint_live_widget_shadow_t
+checkpoint_capture_session_t::read_live_widget_shadow(checkpoint_live_widget_shadow_t result) {
+  const uint32_t bits = result.bits;
+  // The caller allocated a fresh result before any MMIO mutation. An
+  // interrupted read never returns a partial vector or releases its payload.
+  const auto identity = [&]() {
+    const uint32_t status = io.read_capture_mmio(0x04);
+    require_shadow((status & 2) != 0 && (status & 0x30) == 0 &&
+                       io.read_capture_mmio(0x08) == 0 &&
+                       io.read_capture_mmio(0x60) == 0 &&
+                       read_frozen_u64(0x10) == cycle &&
+                       read_frozen_u64(0x68) == consumed_frames,
+                   "live widget shadow lost its validated capture");
+    require_shadow(io.read_capture_mmio(0x98) == 2 &&
+                       io.read_capture_mmio(0x9c) == bits &&
+                       io.read_capture_mmio(0x94) == result.words.size(),
+                   "live widget shadow layout changed during readout");
+    require_shadow(io.read_capture_mmio(0x20) == manifest.entries.size(),
+                   "live widget shadow entry count changed during readout");
+    for (unsigned i = 0; i < 8; ++i)
+      require_shadow(io.read_capture_mmio(0x40 + i * 4) ==
+                         load_le(manifest.wire_hash.data() + i * 4, 4),
+                     "live widget shadow manifest changed during readout");
+    require_shadow(io.read_capture_mmio(0x88) == 1 &&
+                       read_frozen_u64(0x8c) == cycle,
+                   "live widget shadow cut was not acknowledged");
+  };
+  identity();
+  for (size_t i = 0; i < result.words.size(); ++i) {
+    io.write_capture_mmio(0x7c, static_cast<uint32_t>(i));
+    require_shadow(io.read_capture_mmio(0x7c) == i,
+                   "live widget shadow selector readback differs");
+    result.words[i] = read_frozen_u64(0x80);
+  }
+  require_shadow(bits % 64 == 0 || (result.words.back() >> (bits % 64)) == 0,
+                 "noncanonical live widget shadow padding");
+  identity();
+  // An exception during release has ambiguous completion. It must not enable
+  // a retry that could adopt a subsequent bank, even at the same target cut.
+  shadow_retryable = false;
+  io.write_capture_mmio(0x78, 2);
+  require_capture(io.read_capture_mmio(0x88) == 0,
+                  "live widget shadow release was not acknowledged");
+  shadow_may_be_occupied = false;
+  shadow_bits = 0;
+  state = phase_t::validated;
+  return result;
 }
 
 void checkpoint_capture_session_t::release_after_publication() {
@@ -303,6 +359,7 @@ bool checkpoint_capture_session_t::abort_and_drain() {
   require_capture(stream_accounting_valid,
                   "unknown consumed stream bytes require coordinated reset");
   if (shadow_may_be_occupied) {
+    shadow_retryable = false;
     io.write_capture_mmio(0x78, 4);
     require_capture(io.read_capture_mmio(0x88) == 0,
                     "live widget shadow discard was not acknowledged");
@@ -330,6 +387,7 @@ bool checkpoint_capture_session_t::abort_and_drain() {
                   "shared stream drain acknowledgement failed");
   frames.clear();
   received = 0;
+  shadow_bits = 0;
   state = phase_t::idle;
   return true;
 }

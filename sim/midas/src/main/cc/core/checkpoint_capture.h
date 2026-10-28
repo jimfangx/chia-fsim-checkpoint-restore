@@ -52,6 +52,10 @@ public:
 
   checkpoint_capture_session_t(checkpoint_capture_io_t &io,
                                checkpoint_capture_manifest_t manifest);
+  checkpoint_capture_session_t(const checkpoint_capture_session_t &) = delete;
+  checkpoint_capture_session_t &operator=(const checkpoint_capture_session_t &) = delete;
+  checkpoint_capture_session_t(checkpoint_capture_session_t &&) = delete;
+  checkpoint_capture_session_t &operator=(checkpoint_capture_session_t &&) = delete;
   void begin();
   // Bounded, nonblocking service. False means more hardware/stream work needed.
   // All faults retain freeze until explicit abort_and_drain().
@@ -60,8 +64,12 @@ public:
   const std::vector<uint8_t> &validated_frames() const;
   // Pass SHADOW_BITS from the exact generated image/driver header. Requires a
   // validated, still-frozen capture. Failed reads retain freeze and any staging
-  // epoch until explicit abort_and_drain(); no ordinary bridge tick is issued.
+  // epoch for explicit retry or abort_and_drain(); no bridge tick is issued.
   checkpoint_live_widget_shadow_t capture_live_widget_shadow(uint32_t bits);
+  // Retry an interrupted read of THIS session's still-occupied staging bank.
+  // Never issues another capture command or adopts an existing foreign epoch.
+  // Validation failures and an attempted staging release require abort instead.
+  checkpoint_live_widget_shadow_t retry_live_widget_shadow(uint32_t bits);
   void release_after_publication();
   // May need repeated calls. Invalid shared-stream history is discarded, never
   // interpreted as a later capture. No automatic timeout silently releases it.
@@ -85,6 +93,11 @@ private:
   uint64_t consumed_frames = 0;
   bool stream_accounting_valid = true;
   bool shadow_may_be_occupied = false;
+  bool shadow_retryable = false;
+  uint32_t shadow_bits = 0;
+  checkpoint_live_widget_shadow_t
+  read_live_widget_shadow(checkpoint_live_widget_shadow_t result);
+  void require_shadow(bool condition, const char *message);
   uint64_t read_frozen_u64(uint32_t offset);
   size_t pull_counted(void *buffer, size_t capacity);
   void check_frozen();
