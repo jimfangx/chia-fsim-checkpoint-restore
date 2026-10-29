@@ -56,6 +56,16 @@ class NativeCheckpointSharedQueueSpec extends AnyFlatSpec {
         JString("registered_hit_and_data_at_original_ram_edge"))
       assert((parse(shell.banks.binding) \ "synchronous_memory_readout" \ "response_latency_edges") == JInt(3))
       assert((parse(shell.banks.binding) \ "synchronous_memory_readout" \ "original_reader_reprimed_before_response") == JBool(true))
+      val observation = parse(shell.banks.binding) \ "native_state_observation"
+      assert((observation \ "bits") == JInt(518) && (observation \ "words") == JInt(9))
+      val fields = (observation \ "state").asInstanceOf[JArray].arr
+      assert(fields.size == 14 && fields.exists(r => (r \ "expression") == JString("ram.r.data") &&
+        (r \ "width") == JInt(130) && (r \ "adapter") == JString("firrtl-emitter-memory-pipeline-v1")))
+      assert((observation \ "complete_capture_owner") == JBool(false) &&
+        (observation \ "atomic_snapshot_supported") == JBool(false) &&
+        (observation \ "stable_while_functional_freeze") == JBool(false))
+      assert(local.ports.exists(p => p.name == NativeSynchronousStateObservation.port &&
+        p.direction == Output && p.tpe == UIntType(IntWidth(518))))
       assert(shell.entries.size == 5)
     }
     val before = GeneratedExternalOwners.instances(annotated, h.circuit.main).toMap
@@ -197,7 +207,9 @@ class NativeCheckpointSharedQueueSpec extends AnyFlatSpec {
       "response_error" -> { case c: Connect if c.loc.serialize == "ckpt_saved_error" =>
         c.copy(expr = UIntLiteral(0, IntWidth(1))); case s => s },
       "reset_cancel" -> { case c: Connect if c.loc.serialize == "ckpt_native_request" =>
-        c.copy(expr = UIntLiteral(1, IntWidth(1))); case s => s })
+        c.copy(expr = UIntLiteral(1, IntWidth(1))); case s => s },
+      "observation_vector" -> { case c: Connect if c.loc.serialize == NativeSynchronousStateObservation.port =>
+        c.copy(expr = UIntLiteral(0, IntWidth(518))); case s => s })
     cases.foreach { case (name, change) =>
       def rewrite(s: Statement): Statement = change(s.mapStmt(rewrite))
       val state = adapted.state.copy(circuit = adapted.state.circuit.copy(modules = Seq(
@@ -222,7 +234,40 @@ class NativeCheckpointSharedQueueSpec extends AnyFlatSpec {
     val hiddenPolicy = SemanticStateInventory.canonical(JObject(parse(adapted.binding).asInstanceOf[JObject].obj
       .filterNot(_._1 == "synchronous_memory_readout")))
     intercept[IllegalArgumentException](GeneratedStateBankAccess.validateAnnotationBinding(adapted.copy(binding = hiddenPolicy)))
-    println("SYNCHRONOUS_SOURCE_PROOF_PASS equations=10 missing_origin=1 entries=1 ordinary=1 hidden_policy=1")
+    val hiddenObservation = SemanticStateInventory.canonical(JObject(parse(adapted.binding).asInstanceOf[JObject].obj
+      .filterNot(_._1 == "native_state_observation")))
+    intercept[IllegalArgumentException](GeneratedStateBankAccess.validateAnnotationBinding(adapted.copy(binding = hiddenObservation)))
+    println("SYNCHRONOUS_SOURCE_PROOF_PASS equations=11 missing_origin=1 entries=1 ordinary=1 hidden_policy=1 hidden_observation=1")
+  }
+
+  it should "reject observation layout corruption and reserved-port collisions without changing original selectors" in {
+    val local = NativeCheckpointShellStateAccess.generate(source, selected.head).reference
+    val ordinary = GeneratedStateBankAccess.generate(local, SimulatorStateInventory.discover(local), separateAccessClock = true)
+    val adapted = NativeSynchronousMemoryReadout.generate(local, ordinary)
+    assert(adapted.entries == ordinary.entries)
+    val doc = parse(adapted.binding)
+    val observation = doc \ "native_state_observation"
+    val fields = (observation \ "state").asInstanceOf[JArray].arr
+    val changes = Seq(
+      "omitted" -> observation.transformField { case ("state", _) => "state" -> JArray(fields.tail) },
+      "overlap" -> observation.transformField { case ("offset", _) => "offset" -> JInt(0) },
+      "width" -> observation.transformField { case ("width", _) => "width" -> JInt(1) },
+      "capture" -> observation.transformField { case ("complete_capture_owner", _) => "complete_capture_owner" -> JBool(true) },
+      "restore" -> observation.transformField { case ("metasim_restore_supported", _) => "metasim_restore_supported" -> JBool(true) })
+    changes.foreach { case (name, changed) =>
+      val binding = SemanticStateInventory.canonical(doc.transformField {
+        case ("native_state_observation", _) => "native_state_observation" -> changed
+      })
+      assert(intercept[IllegalArgumentException](GeneratedStateBankAccess.validateAnnotationBinding(
+        adapted.copy(binding = binding))).getMessage.contains("changed source-bound native RAM"), name)
+    }
+    val root = local.circuit.modules.head.asInstanceOf[Module]
+    val collision = ordinary.copy(state = ordinary.state.copy(circuit = ordinary.state.circuit.copy(modules = Seq(
+      ordinary.state.circuit.modules.head.asInstanceOf[Module].copy(ports =
+        ordinary.state.circuit.modules.head.ports :+ Port(NoInfo, NativeSynchronousStateObservation.port, Output, UIntType(IntWidth(1))))))))
+    assert(intercept[IllegalArgumentException](NativeSynchronousStateObservation.generate(collision.state, ordinary.binding))
+      .getMessage.contains("observation port identifier collision"))
+    println("SYNCHRONOUS_OBSERVATION_PASS fields=14 bits=518 metadata_negatives=5 collision=1")
   }
 
   it should "translate correlated preservation and initialization owners only to their concrete copies" in {

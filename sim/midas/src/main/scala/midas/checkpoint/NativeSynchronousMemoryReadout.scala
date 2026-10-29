@@ -262,10 +262,12 @@ ckpt_native_request <= mux(ckpt_reset, UInt<1>(0), mux(ckpt_accept, UInt<1>(1), 
     val transformed = banked.copy(body = Block(declarations ++ Seq(rewrite(banked.body)) ++ rest))
     val resolved = new Compiler(Forms.LowForm).execute(CircuitState(Parser.parse(
       banks.state.circuit.copy(modules = Seq(transformed)).serialize), firrtl.ChirrtlForm, banks.state.annotations)).copy(form = LowForm)
+    val (observed, observation) = NativeSynchronousStateObservation.generate(resolved, banks.binding)
     val doc = parse(banks.binding).asInstanceOf[JObject]
     val binding = SemanticStateInventory.canonical(JObject(doc.obj.filterNot(_._1 == "instrumented_sha256") ++
-      List("instrumented_sha256" -> JString(SemanticStateInventory.sha256(resolved.circuit.serialize)),
+      List("instrumented_sha256" -> JString(SemanticStateInventory.sha256(observed.circuit.serialize)),
+        "native_state_observation" -> observation,
         "synchronous_memory_readout" -> policy(memories.map(_.name)))))
-    banks.copy(state = resolved, binding = binding)
+    banks.copy(state = observed, binding = binding)
   }
 }
