@@ -53,7 +53,7 @@ object NativeCheckpointRegions {
       inventory: Option[ReservedCheckpointInventory] = None, shellTargets: Seq[IsModule] = Seq.empty): Result = {
     check(host.form == LowForm, "resolved LowForm required")
     inventory.foreach(_.validateSource(host))
-    check(targets.nonEmpty && targets.size + shellTargets.size <= 255, "invalid region count")
+    check(targets.size + shellTargets.size > 0 && targets.size + shellTargets.size <= 255, "invalid region count")
     val paths = targets.map(_.asPath.map(_._1.value))
     check(!paths.indices.exists(i => paths.indices.exists(j => i != j && paths(i).startsWith(paths(j)))),
       "overlapping selected executions")
@@ -63,15 +63,14 @@ object NativeCheckpointRegions {
     val shells = shellTargets.zipWithIndex.map { case (t, i) =>
       NativeCheckpointShellStateAccess.generate(host, t, shellPrefix(i))
     }
-    val clocks = regions.map(r => parse(r.native.binding) \ "enclosing_raw_clock")
-    check(clocks.distinct.size == 1, "selected executions do not share a proven raw clock")
     val regionalDescriptors = regions.zip(targets).map { case (r, t) =>
       CheckpointCaptureDescriptors.fromNativeInPlace(host.copy(annotations = host.annotations.filterNot(
         SimulatorBankProbeContext.accepts)), t, r.reference, r.manifest, r.plan, r.dependencies, inventory)
     }
     val shellDescriptors = shells.map(CheckpointCaptureDescriptors.fromNativeShell(_, inventory))
-    check(shellDescriptors.forall(d => (parse(d.binding) \ "raw_clock") == clocks.head),
-      "local storage and selected executions do not share a proven raw clock")
+    val clocks = regions.map(r => parse(r.native.binding) \ "enclosing_raw_clock") ++
+      shellDescriptors.map(d => parse(d.binding) \ "raw_clock")
+    check(clocks.distinct.size == 1, "selected executions do not share a proven raw clock")
     val descriptors = regionalDescriptors ++ shellDescriptors
     val (combined, routing) = CheckpointCaptureDescriptors.fromNativeRegions(descriptors)
     val originals = host.circuit.modules.map(m => m.name -> m).toMap
@@ -103,10 +102,21 @@ object NativeCheckpointRegions {
       generatedAnnotations ++= r.native.generatedAnnotations.flatMap(_.update(renames))
       modules.map(m => m.name -> m).toMap
     }
+    val shellSources = shells.map { shell =>
+      shell.state.circuit.modules.filterNot(m => originals.contains(m.name)).foreach { m =>
+        check(!generatedNames(m.name), "generated definition collision " + m.name)
+        generatedNames += m.name
+      }
+      shell.state.circuit.modules.map(m => m.name -> m).toMap
+    }
     val ancestors = targets.map(t => (Seq(host.circuit.main) ++ t.asPath.dropRight(1).map(_._2.value)).toSet)
-    val allSources = namespaced ++ shells.map(_.state.circuit.modules.map(m => m.name -> m).toMap)
+    val allSources = namespaced ++ shellSources
     val bodyOwners = targets.map(_.asPath.last._2.value) ++ shells.map(_.reference.circuit.main)
-    check(bodyOwners.distinct.size == bodyOwners.size, "overlapping selected body owners")
+    val ownedExecutions = targets.map(_.asPath.map(_._1.value).mkString(".")) ++ shells.map { shell =>
+      val JString(path) = parse(shell.mapping) \ "selected_execution"
+      path.stripPrefix(host.circuit.main + ".")
+    }
+    check(ownedExecutions.distinct.size == ownedExecutions.size, "overlapping selected body owners")
     val prefixes = targets.indices.map(prefix) ++ shells.indices.map(shellPrefix)
     val shellAncestors = shells.map { shell =>
       val JString(path) = parse(shell.mapping) \ "selected_execution"
@@ -136,16 +146,42 @@ object NativeCheckpointRegions {
             case x => Seq(x)
           }
           val before = flat(m.body); val after = flat(next.body)
-          check(after.take(before.size).map(_.serialize) == before.map(_.serialize),
-            "changed original ancestor body " + m.name)
+          // A selected shared root is specialized at its concrete instance.
+          // Reconcile only that declaration; all original connections and
+          // other statements must remain byte-identical. Each independent
+          // source contributes at most its own selected root substitution.
+          val replacements = scala.collection.mutable.Map.empty[String, String]
+          val restored = after.take(before.size).zip(before).map {
+            case (a: WDefInstance, b: WDefInstance) if a.module != b.module =>
+              val selected = if (i < targets.size) targets(i) else shells(i - targets.size).target match {
+                case t: InstanceTarget => t
+                case _ => throw new IllegalArgumentException("native checkpoint regions: unexpected root specialization")
+              }
+              check(a.name == selected.asPath.last._1.value &&
+                b.module == selected.asPath.last._2.value && !originals.contains(a.module) &&
+                a.copy(module = b.module).serialize == b.serialize,
+                "changed unrelated original instance " + m.name + "." + b.name)
+              replacements(b.name) = a.module
+              a.copy(module = b.module)
+            case (a, _) => a
+          }
+          check(restored.map(_.serialize) == before.map(_.serialize), "changed original ancestor body " + m.name)
           val extra = after.drop(before.size)
-          (next.ports.drop(m.ports.size), extra)
+          (next.ports.drop(m.ports.size), extra, replacements.toMap)
         }
         val ports = base.ports ++ additions.flatMap(_._1)
         check(ports.map(_.name).distinct.size == ports.size, "colliding sideband ports")
-        if (additions.isEmpty) base else base.copy(ports = ports, body = Block(Seq(base.body) ++ additions.flatMap(_._2)))
+        val selected = additions.flatMap(_._3.toSeq)
+        check(selected.map(_._1).distinct.size == selected.size, "colliding selected instance substitutions")
+        val replacements = selected.toMap
+        def specialize(s: Statement): Statement = s match {
+          case inst: WDefInstance if replacements.contains(inst.name) => inst.copy(module = replacements(inst.name))
+          case x => x.mapStmt(specialize)
+        }
+        if (additions.isEmpty) base else base.copy(ports = ports,
+          body = Block(Seq(specialize(base.body)) ++ additions.flatMap(_._2)))
       }
-    } ++ namespaced.flatMap(_.values.filterNot(m => originals.contains(m.name))).sortBy(_.name)
+    } ++ allSources.flatMap(_.values.filterNot(m => originals.contains(m.name))).sortBy(_.name)
     val circuit = host.circuit.copy(modules = modules)
     val working = firrtl.passes.ToWorkingIR.run(circuit)
     val typed = firrtl.passes.InferTypes.run(firrtl.passes.ResolveKinds.run(working))
@@ -160,14 +196,18 @@ object NativeCheckpointRegions {
       check(emitted.isInstanceOf[Module], "changed concrete owner " + path)
       GeneratedStateBankAnnotations.Clone(m.name, path, emitted.name, m)
     }
-    val (projected, projection) = GeneratedStateBankAnnotations.translate(storage, clones)
+    val concreteStorage = shells.exists(s =>
+      (parse(s.binding) \ "annotation_policy" \ "translation_results_applied") == JBool(true))
+    val (projected, projection) = GeneratedStateBankAnnotations.translate(storage, clones,
+      preserveConcreteStorage = concreteStorage)
     val context = host.annotations.filter(SimulatorBankProbeContext.accepts)
     val annotations = (projected ++ generatedAnnotations).filterNot(_.isInstanceOf[firrtl.transforms.CombinationalPath]).distinct
     val state = bare.copy(annotations = annotations ++ context)
     val finalClones = after.toSeq.collect { case (path, m: Module) =>
       GeneratedStateBankAnnotations.Clone(m.name, path, m.name, m)
     }
-    val (validated, _) = GeneratedStateBankAnnotations.translate(state.copy(annotations = annotations), finalClones)
+    val (validated, _) = GeneratedStateBankAnnotations.translate(state.copy(annotations = annotations), finalClones,
+      preserveConcreteStorage = concreteStorage)
     check(validated.toSet == annotations.toSet, "post-graft annotation targets changed")
     val snapshot = SimulatorBankProbeContext.snapshot(context, host.circuit.serialize, state.circuit.serialize)
     val shellBindings = if (shells.isEmpty) Nil else List("local_shells" -> JArray(shells.zipWithIndex.map { case (r, i) =>

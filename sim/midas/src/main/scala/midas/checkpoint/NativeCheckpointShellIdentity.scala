@@ -40,36 +40,64 @@ object NativeCheckpointShellIdentity {
     // Prove every local storage clock through transparent Clock aliases back
     // to the raw enclosing input. A data cast, gate, mux, second clock or child
     // output is not a common low-phase freeze authority.
-    def resolve(m: Module, name: String, seen: Set[String] = Set.empty): String = {
+    def resolve(m: Module, clock: Expression, enable: Option[Expression] = None,
+        seen: Set[String] = Set.empty): String = {
+      val all = statements(m.body)
+      val aliases = all.collect { case n: DefNode => n.name; case w: DefWire => w.name }.toSet
+      val drivers = all.collect {
+        case c: Connect => c.loc.serialize -> c.expr
+        case n: DefNode => n.name -> n.value
+      }.groupBy(_._1)
+      // Match the existing memory-clock provenance contract: Chisel's
+      // validif(enable, clock) is transparent only for this same memory port
+      // when its enable is the identical condition (through scalar aliases
+      // and the standard mux(enable, 1, 0) encoding).
+      def identity(value: Expression, visited: Set[String] = Set.empty): String = {
+        val name = value.serialize
+        check(!visited(name), "memory enable alias cycle")
+        value match {
+          case Mux(cond, UIntLiteral(one, IntWidth(w1)), UIntLiteral(zero, IntWidth(w0)), _)
+              if one == 1 && zero == 0 && w1 == 1 && w0 == 1 => identity(cond, visited + name)
+          case _ if aliases(name) && value.tpe == UIntType(IntWidth(1)) && drivers.contains(name) =>
+            val ds = drivers(name)
+            check(ds.size == 1, "multiply driven memory enable alias")
+            identity(ds.head._2, visited + name)
+          case _ => name
+        }
+      }
+      val name = clock.serialize
       check(!seen(name), "clock alias cycle")
-      if (m.ports.exists(p => p.name == name && p.direction == Input && p.tpe == ClockType)) name
-      else {
-        val ds = statements(m.body).collect {
-          case c: Connect if c.loc.serialize == name => c.expr
-          case n: DefNode if n.name == name => n.value
-        }
-        check(ds.size == 1, "undriven or multiply driven local clock " + m.name + "." + name)
-        ds.head match {
-          case r: WRef if r.tpe == ClockType => resolve(m, r.name, seen + name)
-          case _ => throw new IllegalArgumentException("native shell identity: nontransparent local clock")
-        }
+      clock match {
+        case r: WRef if r.tpe == ClockType &&
+            m.ports.exists(p => p.name == r.name && p.direction == Input && p.tpe == ClockType) => r.name
+        case r: WRef if r.tpe == ClockType =>
+          val ds = drivers.getOrElse(r.name, Nil)
+          check(ds.size == 1, "undriven or multiply driven local clock " + m.name + "." + r.name)
+          resolve(m, ds.head._2, enable, seen + name)
+        case ValidIf(cond, value, ClockType) if enable.exists(e => identity(e) == identity(cond)) =>
+          resolve(m, value, enable, seen + name)
+        case _ => throw new IllegalArgumentException("native shell identity: nontransparent local clock")
       }
     }
     val local = shell.reference.circuit.modules.head.asInstanceOf[Module]
     val clocks = statements(local.body).flatMap {
-      case r: DefRegister => Seq(r.clock)
-      case m: DefMemory => (m.readers ++ m.writers ++ m.readwriters).flatMap(p =>
-        statements(local.body).collect { case c: Connect if c.loc.serialize == m.name + "." + p + ".clk" => c.expr })
+      case r: DefRegister => Seq(resolve(selected, r.clock))
+      case m: DefMemory => (m.readers ++ m.writers ++ m.readwriters).map { p =>
+        val port = m.name + "." + p
+        def driver(field: String): Expression = {
+          val ds = statements(local.body).collect { case c: Connect if c.loc.serialize == port + "." + field => c.expr }
+          check(ds.size == 1, "undriven or multiply driven local memory " + port + "." + field)
+          ds.head
+        }
+        resolve(selected, driver("clk"), Some(driver("en")))
+      }
       case _ => Nil
-    }.map {
-      case r: WRef if r.tpe == ClockType => resolve(selected, r.name)
-      case _ => throw new IllegalArgumentException("native shell identity: nontransparent storage clock")
     }.distinct
     check(clocks.size == 1, "local storage must share one raw clock")
     var raw = clocks.head
     components.indices.dropRight(1).reverse.foreach { index =>
       val parent = executions(components.take(index + 1).mkString(".")).asInstanceOf[Module]
-      raw = resolve(parent, components(index + 1) + "." + raw)
+      raw = resolve(parent, WRef(components(index + 1) + "." + raw, ClockType))
     }
     check((parse(globalPlan) \ "common_source_clock") == JString(raw), "local clock differs from global raw clock")
 

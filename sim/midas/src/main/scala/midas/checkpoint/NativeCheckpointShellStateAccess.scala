@@ -90,7 +90,9 @@ object NativeCheckpointShellStateAccess {
       case Some(m: Module) => m
       case _ => throw new IllegalArgumentException("Native checkpoint shell state: concrete selected module required")
     }
-    check(live.count(_._2.name == selected.name) == 1, "selected definition has multiple executions")
+    val shared = live.count(_._2.name == selected.name) > 1
+    val emittedName = if (shared) sidebandPrefix + "selected_" + selected.name else selected.name
+    check(!shared || !modules.contains(emittedName), "specialized definition collision " + emittedName)
     val hops = selectedPath.split("\\.").toSeq
     val ancestorPaths = hops.indices.dropRight(1).map(i => hops.take(i + 1).mkString("."))
     val ancestors = ancestorPaths.map { path =>
@@ -201,10 +203,10 @@ object NativeCheckpointShellStateAccess {
         case _ => rewritten
       }
     }
-    val bankedLocal = selected.copy(ports = selected.ports ++ sidebands,
+    val bankedLocal = selected.copy(name = emittedName, ports = selected.ports ++ sidebands,
       body = Block(children ++ Seq(graft(generated.body))))
     val rewritten = host.circuit.modules.map {
-      case m if m.name == selected.name => bankedLocal
+      case m if m.name == selected.name && !shared => bankedLocal
       case m: Module if ancestors.contains(m.name) =>
         val child = ancestors(m.name)
         val connections = sidebands.map { p =>
@@ -212,22 +214,32 @@ object NativeCheckpointShellStateAccess {
           val exposed = WRef(p.name, p.tpe)
           if (p.direction == Input) Connect(NoInfo, pin, exposed) else Connect(NoInfo, exposed, pin)
         }
-        m.copy(ports = m.ports ++ sidebands, body = Block(Seq(m.body) ++ connections))
+        def specialize(s: Statement): Statement = s match {
+          case i: WDefInstance if shared && i.name == child && i.module == selected.name => i.copy(module = emittedName)
+          case x => x.mapStmt(specialize)
+        }
+        m.copy(ports = m.ports ++ sidebands, body = Block(Seq(specialize(m.body)) ++ connections))
       case m => m
     }
-    val bare = CircuitState(resolve(host.circuit.copy(modules = rewritten)), LowForm)
+    val bare = CircuitState(resolve(host.circuit.copy(modules = rewritten ++ (if (shared) Seq(bankedLocal) else Nil))), LowForm)
     val after = GeneratedExternalOwners.instances(bare, host.circuit.main)
-    check(live.map { case (p, m) => p -> m.name }.toSet == after.map { case (p, m) => p -> m.name }.toSet,
+    check(live.map { case (p, m) => p -> (if (shared && p == selectedPath) emittedName else m.name) }.toSet ==
+      after.map { case (p, m) => p -> m.name }.toSet,
       "original concrete execution set changed")
     val finalModules = bare.circuit.modules.map(m => m.name -> m).toMap
     host.circuit.modules.filterNot(m => m.name == selected.name || ancestors.contains(m.name)).foreach { m =>
       check(finalModules(m.name) == m, "changed child or unrelated original definition " + m.name)
     }
-    // No definition has been specialized or renamed. Flattening translation
-    // results would broaden a nonlocal owner to every shared execution.
-    // Preserve the complete source vector, including its order, duplicates and
-    // correlated paths; only stale combinational path caches are invalidated.
-    val annotations = host.annotations.filterNot(_.isInstanceOf[firrtl.transforms.CombinationalPath])
+    // Unique definitions retain the exact original vector. A shared selected
+    // execution needs concrete-path translation so correlated nonlocal owners
+    // follow that copy and never broaden onto its unselected siblings.
+    val clones = live.collect { case (path, m: Module) =>
+      GeneratedStateBankAnnotations.Clone(m.name, path, after.find(_._1 == path).get._2.name, m)
+    }
+    val translated: firrtl.AnnotationSeq = if (shared)
+      GeneratedStateBankAnnotations.translate(storage, clones, preserveConcreteStorage = true)._1 ++ context
+      else host.annotations
+    val annotations = translated.filterNot(_.isInstanceOf[firrtl.transforms.CombinationalPath])
     val state = bare.copy(annotations = annotations)
     val (_, finalValidation) = GeneratedStateBankAnnotations.translate(state.copy(
       annotations = annotations.filterNot(SimulatorBankProbeContext.accepts)), validationClones(after))
@@ -256,8 +268,10 @@ object NativeCheckpointShellStateAccess {
     val mapping = canonical(JObject(List("mapping_version" -> JInt(1),
       "selected_execution" -> JString(selectedPath), "state" -> JArray(mappings.map(_._2).toList))))
     val binding = canonical(JObject(List("shell_access_version" -> JInt(1),
-      "scope" -> JString("existing_unique_execution_local_state_readout_only"),
+      "scope" -> JString(if (shared) "existing_concrete_execution_local_state_readout_only" else
+        "existing_unique_execution_local_state_readout_only"),
       "target" -> JString(target.serialize), "selected_execution" -> JString(selectedPath),
+      "original_definition" -> JString(selected.name), "emitted_definition" -> JString(emittedName),
       "sideband_prefix" -> JString(sidebandPrefix), "host_sha256" -> JString(sha256(host.circuit.serialize)),
       "host_annotations_sha256" -> JString(sha256(json(host.annotations))),
       "reference_sha256" -> JString(sha256(reference.circuit.serialize)),
@@ -266,8 +280,9 @@ object NativeCheckpointShellStateAccess {
       "instrumented_annotations_sha256" -> JString(sha256(json(state.annotations))),
       "mapping_sha256" -> JString(sha256(mapping)),
       "annotation_policy" -> JObject(List("policy_version" -> JInt(1),
-        "preservation" -> JString("exact_source_annotation_vector_except_invalidated_combinational_path_caches"),
-        "translation_results_applied" -> JBool(false),
+        "preservation" -> JString(if (shared) "concrete_execution_translation" else
+          "exact_source_annotation_vector_except_invalidated_combinational_path_caches"),
+        "translation_results_applied" -> JBool(shared),
         "invalidated_path_caches" -> JArray(host.annotations.collect {
           case a: firrtl.transforms.CombinationalPath => JString(a.serialize)
         }.toList))),

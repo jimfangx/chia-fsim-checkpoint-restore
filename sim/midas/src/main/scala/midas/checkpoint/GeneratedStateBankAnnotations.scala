@@ -237,7 +237,8 @@ private[checkpoint] object GeneratedStateBankAnnotations {
   }.distinct.sortBy(_.serialize))
   def translatedHash(state: CircuitState): String = SemanticStateInventory.sha256(annotationJSON(state.annotations))
 
-  def translate(state: CircuitState, clones: Seq[Clone]): (Seq[Annotation], JValue) = {
+  def translate(state: CircuitState, clones: Seq[Clone], preserveConcreteStorage: Boolean = false):
+      (Seq[Annotation], JValue) = {
     preflight(state)
     val modules = state.circuit.modules.map(m => m.name -> m).toMap
     def targets(target: ReferenceTarget, memory: Boolean): Seq[ReferenceTarget] = {
@@ -264,7 +265,19 @@ private[checkpoint] object GeneratedStateBankAnnotations {
             case _ => false
           } || clone.body.ports.exists(_.name == target.ref)
         if (!valid) fail(s"annotation declaration/kind mismatch: ${target.serialize}")
-        ReferenceTarget(state.circuit.main, clone.module, Nil, target.ref, Nil)
+        if (!preserveConcreteStorage) ReferenceTarget(state.circuit.main, clone.module, Nil, target.ref, Nil)
+        else {
+          // A selected local bank can leave several siblings executing the
+          // unchanged shared definition. Module-local projection would broaden
+          // a nonlocal init/preservation owner onto all of those siblings.
+          val parts = path.split("\\.").toSeq
+          val hops = parts.indices.drop(1).map { index =>
+            val concrete = clones.find(_.originalPath == parts.take(index + 1).mkString(".")).getOrElse(
+              fail(s"missing concrete storage ancestor clone: $path"))
+            TargetToken.Instance(parts(index)) -> TargetToken.OfModule(concrete.module)
+          }
+          ReferenceTarget(state.circuit.main, state.circuit.main, hops, target.ref, Nil)
+        }
       }
     }
     val initTargets = mutable.Set.empty[ReferenceTarget]

@@ -1,0 +1,112 @@
+circuit SharedQueueHost :
+  extmodule Native :
+    input I : Clock
+    input CE : UInt<1>
+    output O : Clock
+    defname = BUFGCE
+  module SharedQueue :
+    input clock : Clock
+    input reset : UInt<1>
+    input enq_valid : UInt<1>
+    input enq_bits : UInt<130>
+    input deq_ready : UInt<1>
+    output enq_ready : UInt<1>
+    output deq_valid : UInt<1>
+    output deq_bits : UInt<130>
+    output count : UInt<3>
+    reg enq_ptr : UInt<3>, clock with :
+      reset => (UInt<1>(0), enq_ptr)
+    reg deq_ptr : UInt<3>, clock with :
+      reset => (UInt<1>(0), deq_ptr)
+    reg full : UInt<1>, clock with :
+      reset => (UInt<1>(0), full)
+    node equal = eq(enq_ptr, deq_ptr)
+    node empty = and(equal, not(full))
+    enq_ready <= not(and(equal, full))
+    deq_valid <= not(empty)
+    node enq = and(enq_ready, enq_valid)
+    node deq = and(deq_valid, deq_ready)
+    node enq_next = mux(eq(enq_ptr, UInt<3>(5)), UInt<3>(0), bits(add(enq_ptr, UInt<1>(1)), 2, 0))
+    node deq_next = mux(eq(deq_ptr, UInt<3>(5)), UInt<3>(0), bits(add(deq_ptr, UInt<1>(1)), 2, 0))
+    enq_ptr <= mux(reset, UInt<3>(0), mux(enq, enq_next, enq_ptr))
+    deq_ptr <= mux(reset, UInt<3>(0), mux(deq, deq_next, deq_ptr))
+    full <= mux(reset, UInt<1>(0), mux(neq(enq, deq), enq, full))
+    count <= mux(equal, mux(full, UInt<3>(6), UInt<3>(0)), mux(gt(deq_ptr, enq_ptr), bits(add(UInt<3>(6), sub(enq_ptr, deq_ptr)), 2, 0), bits(sub(enq_ptr, deq_ptr), 2, 0)))
+    mem ram :
+      data-type => UInt<130>
+      depth => 6
+      read-latency => 1
+      write-latency => 1
+      reader => r
+      writer => w
+      read-under-write => new
+    node reader_clock = validif(UInt<1>(1), clock)
+    node reader_enable = mux(UInt<1>(1), UInt<1>(1), UInt<1>(0))
+    node writer_clock = validif(enq, clock)
+    node writer_enable = mux(enq, UInt<1>(1), UInt<1>(0))
+    ram.r.clk <= reader_clock
+    ram.r.en <= reader_enable
+    ram.r.addr <= mux(deq, deq_next, deq_ptr)
+    deq_bits <= ram.r.data
+    ram.w.clk <= writer_clock
+    ram.w.en <= writer_enable
+    ram.w.addr <= enq_ptr
+    ram.w.data <= enq_bits
+    ram.w.mask <= UInt<1>(1)
+  module SharedQueueHost :
+    input clock : Clock
+    input reset : UInt<1>
+    input lane0_enq_valid : UInt<1>
+    input lane0_enq_bits : UInt<130>
+    input lane0_deq_ready : UInt<1>
+    output lane0_enq_ready : UInt<1>
+    output lane0_deq_valid : UInt<1>
+    output lane0_deq_bits : UInt<130>
+    output lane0_count : UInt<3>
+    input lane1_enq_valid : UInt<1>
+    input lane1_enq_bits : UInt<130>
+    input lane1_deq_ready : UInt<1>
+    output lane1_enq_ready : UInt<1>
+    output lane1_deq_valid : UInt<1>
+    output lane1_deq_bits : UInt<130>
+    output lane1_count : UInt<3>
+    input lane2_enq_valid : UInt<1>
+    input lane2_enq_bits : UInt<130>
+    input lane2_deq_ready : UInt<1>
+    output lane2_enq_ready : UInt<1>
+    output lane2_deq_valid : UInt<1>
+    output lane2_deq_bits : UInt<130>
+    output lane2_count : UInt<3>
+    inst gate of Native
+    gate.I <= clock
+    gate.CE <= UInt<1>(1)
+    inst q0 of SharedQueue
+    inst q1 of SharedQueue
+    inst q2 of SharedQueue
+    q0.clock <= clock
+    q0.reset <= reset
+    q0.enq_valid <= lane0_enq_valid
+    q0.enq_bits <= lane0_enq_bits
+    q0.deq_ready <= lane0_deq_ready
+    lane0_enq_ready <= q0.enq_ready
+    lane0_deq_valid <= q0.deq_valid
+    lane0_deq_bits <= q0.deq_bits
+    lane0_count <= q0.count
+    q1.clock <= clock
+    q1.reset <= reset
+    q1.enq_valid <= lane1_enq_valid
+    q1.enq_bits <= lane1_enq_bits
+    q1.deq_ready <= lane1_deq_ready
+    lane1_enq_ready <= q1.enq_ready
+    lane1_deq_valid <= q1.deq_valid
+    lane1_deq_bits <= q1.deq_bits
+    lane1_count <= q1.count
+    q2.clock <= clock
+    q2.reset <= reset
+    q2.enq_valid <= lane2_enq_valid
+    q2.enq_bits <= lane2_enq_bits
+    q2.deq_ready <= lane2_deq_ready
+    lane2_enq_ready <= q2.enq_ready
+    lane2_deq_valid <= q2.deq_valid
+    lane2_deq_bits <= q2.deq_bits
+    lane2_count <= q2.count
