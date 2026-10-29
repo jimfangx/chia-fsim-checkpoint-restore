@@ -42,6 +42,22 @@ class NativeCheckpointSharedQueueSpec extends AnyFlatSpec {
     val annotated = h.copy(annotations = h.annotations :+ hint)
     val result = NativeCheckpointRegions.generate(annotated, Seq.empty, shellTargets = selected)
     NativeCheckpointRegions.validate(result)
+    result.shells.foreach { shell =>
+      val local = shell.banks.state.circuit.modules.head.asInstanceOf[Module]
+      val memory = local.body.serialize
+      assert(memory.contains("read-latency => 1") && !memory.contains("reader => ckpt_read"))
+      assert(memory.contains("reg CheckpointPipeline_ram_r_addr"))
+      assert(memory.contains("reg CheckpointNativeHold_ram"))
+      assert(memory.contains("read-under-write => old"))
+      assert(memory.contains("reg CheckpointNativeForwardHit_ram : UInt<1>, clock"))
+      assert(memory.contains("reg CheckpointNativeForwardData_ram : UInt<130>, clock"))
+      assert((parse(shell.banks.binding) \ "synchronous_memory_readout" \ "adapter_version") == JInt(2))
+      assert((parse(shell.banks.binding) \ "synchronous_memory_readout" \ "write_first_forwarding") ==
+        JString("registered_hit_and_data_at_original_ram_edge"))
+      assert((parse(shell.banks.binding) \ "synchronous_memory_readout" \ "response_latency_edges") == JInt(3))
+      assert((parse(shell.banks.binding) \ "synchronous_memory_readout" \ "original_reader_reprimed_before_response") == JBool(true))
+      assert(shell.entries.size == 5)
+    }
     val before = GeneratedExternalOwners.instances(annotated, h.circuit.main).toMap
     val after = GeneratedExternalOwners.instances(result.state, h.circuit.main).toMap
     assert(before.keySet == after.keySet)
@@ -81,6 +97,73 @@ class NativeCheckpointSharedQueueSpec extends AnyFlatSpec {
     val damaged = result.state.copy(circuit = result.state.circuit.copy(info = FileInfo("changed")))
     intercept[IllegalArgumentException](NativeCheckpointRegions.validate(result.copy(state = damaged)))
     println(s"SHARED_QUEUE_ACCESS out=$out selected=2 untouched=1 descriptors=10")
+  }
+
+  it should "reject unsupported synchronous native shapes, disabled readers and foreign clocks" in {
+    val local = NativeCheckpointShellStateAccess.generate(source, selected.head).reference
+    val original = local.circuit.modules.head.asInstanceOf[Module]
+    def attempt(change: Statement => Statement, extraPorts: Seq[Port] = Nil): Unit = {
+      def rewrite(s: Statement): Statement = change(s.mapStmt(rewrite))
+      val changed = local.copy(circuit = local.circuit.copy(modules = Seq(original.copy(
+        ports = original.ports ++ extraPorts, body = rewrite(original.body)))))
+      intercept[IllegalArgumentException] {
+        val banks = GeneratedStateBankAccess.generate(changed, SimulatorStateInventory.discover(changed),
+          separateAccessClock = true)
+        NativeSynchronousMemoryReadout.generate(changed, banks)
+      }
+    }
+    attempt { case m: DefMemory => m.copy(readUnderWrite = ReadUnderWrite.Old); case x => x }
+    attempt { case m: DefMemory => m.copy(readLatency = 0); case x => x }
+    attempt { case m: DefMemory => m.copy(readers = m.readers :+ "other"); case x => x }
+    attempt { case c: Connect if c.loc.serialize == "ram.r.en" =>
+      c.copy(expr = UIntLiteral(0, IntWidth(1))); case x => x }
+    attempt({ case c: Connect if c.loc.serialize == "ram.w.clk" =>
+      c.copy(expr = firrtl.WRef("other_clock", ClockType)); case x => x },
+      Seq(Port(NoInfo, "other_clock", Input, ClockType)))
+  }
+
+  it should "preserve direct reader feedback and reject changed adapter policy or access clocks" in {
+    val local = NativeCheckpointShellStateAccess.generate(source, selected.head).reference
+    val original = local.circuit.modules.head.asInstanceOf[Module]
+    def memories(s: Statement): Seq[DefMemory] = s match {
+      case m: DefMemory => Seq(m)
+      case x => { val out = scala.collection.mutable.ArrayBuffer.empty[DefMemory]
+        x.foreachStmt(s => out ++= memories(s)); out.toSeq }
+    }
+    val ram = memories(original.body).head
+    def feedback(s: Statement): Statement = s match {
+      case c: Connect if c.loc.serialize == "ram.r.addr" =>
+        c.copy(expr = DoPrim(firrtl.PrimOps.Bits,
+          Seq(firrtl.passes.MemPortUtils.memPortField(ram, "r", "data")), Seq(BigInt(2), BigInt(0)), UIntType(IntWidth(3))))
+      case x => x.mapStmt(feedback)
+    }
+    val changed = local.copy(circuit = local.circuit.copy(modules = Seq(original.copy(body = feedback(original.body)))))
+    val ordinary = GeneratedStateBankAccess.generate(changed, SimulatorStateInventory.discover(changed),
+      separateAccessClock = true)
+    val adapted = NativeSynchronousMemoryReadout.generate(changed, ordinary)
+    val generated = adapted.state.circuit.modules.head.asInstanceOf[Module]
+    def connections(s: Statement): Seq[Connect] = s match {
+      case c: Connect => Seq(c)
+      case x => { val out = scala.collection.mutable.ArrayBuffer.empty[Connect]
+        x.foreachStmt(s => out ++= connections(s)); out.toSeq }
+    }
+    assert(connections(generated.body).find(_.loc.serialize == "ram.r.addr").get.expr.serialize
+      .contains("CheckpointNativeBorrowed"))
+    val policy = SemanticStateInventory.canonical(parse(adapted.binding).transformField {
+      case ("response_latency_edges", _) => "response_latency_edges" -> JInt(1)
+    })
+    intercept[IllegalArgumentException](GeneratedStateBankAccess.validateAnnotationBinding(adapted.copy(binding = policy)))
+    def wrongClock(s: Statement): Statement = s match {
+      case r: DefRegister if r.name == "ckpt_native_phase" => r.copy(clock = firrtl.WRef("clock", ClockType))
+      case x => x.mapStmt(wrongClock)
+    }
+    val state = adapted.state.copy(circuit = adapted.state.circuit.copy(modules = Seq(
+      generated.copy(body = wrongClock(generated.body)))))
+    val rehashed = SemanticStateInventory.canonical(parse(adapted.binding).transformField {
+      case ("instrumented_sha256", _) => "instrumented_sha256" -> JString(SemanticStateInventory.sha256(state.circuit.serialize))
+    })
+    intercept[IllegalArgumentException](GeneratedStateBankAccess.validateAnnotationBinding(
+      adapted.copy(state = state, binding = rehashed)))
   }
 
   it should "translate correlated preservation and initialization owners only to their concrete copies" in {

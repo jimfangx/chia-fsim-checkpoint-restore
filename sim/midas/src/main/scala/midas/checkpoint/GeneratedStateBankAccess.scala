@@ -33,6 +33,7 @@ object GeneratedStateBankAccess {
   case class Result(state: CircuitState, entries: Seq[StateAccessEntry], binding: String)
   def validateAnnotationBinding(result: Result): Unit = {
     GeneratedStateBankAnnotations.preflight(result.state)
+    NativeSynchronousMemoryReadout.validateBinding(result)
     val doc = parse(result.binding)
     val binding = doc \ "annotation_translation"
     require((binding \ "translation_version") == JInt(GeneratedStateBankAnnotations.translationVersion) &&
@@ -248,7 +249,8 @@ object GeneratedStateBankAccess {
         }
         all.foreach {
           case r: DefRegister if !(instrumented && path == circuit.main &&
-              Set("ckpt_pending", "ckpt_saved_data", "ckpt_saved_error")(r.name)) =>
+              (Set("ckpt_pending", "ckpt_saved_data", "ckpt_saved_error") ++
+                NativeSynchronousMemoryReadout.endpointRegisters)(r.name)) =>
             (if (instrumented) memoryOrigin(r.clock) else clock(r.clock)).functional(s"$path.${r.name}")
           case p: Print => clock(p.clk).functional(s"$path.print")
           case s: Stop => clock(s.clk).functional(s"$path.stop")

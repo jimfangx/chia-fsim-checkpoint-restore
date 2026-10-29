@@ -179,7 +179,9 @@ object NativeCheckpointShellStateAccess {
     }
     val reference = CircuitState(resolve(host.circuit.copy(main = selected.name, modules = Seq(local))), LowForm, policies)
     val manifest = SimulatorStateInventory.discover(reference)
-    val banks = GeneratedStateBankAccess.generate(reference, manifest, separateAccessClock = true)
+    val ordinaryBanks = GeneratedStateBankAccess.generate(reference, manifest, separateAccessClock = true)
+    val banks = if (NativeSynchronousMemoryReadout.needed(reference))
+      NativeSynchronousMemoryReadout.generate(reference, ordinaryBanks) else ordinaryBanks
     GeneratedStateBankAccess.validateAnnotationBinding(banks)
     check(banks.state.circuit.modules.size == 1, "local extraction unexpectedly generated hierarchy")
     val generated = banks.state.circuit.modules.head.asInstanceOf[Module]
