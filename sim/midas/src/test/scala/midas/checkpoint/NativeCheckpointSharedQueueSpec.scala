@@ -166,6 +166,65 @@ class NativeCheckpointSharedQueueSpec extends AnyFlatSpec {
       adapted.copy(state = state, binding = rehashed)))
   }
 
+  it should "reject coherently rehashed native equations and require an immutable original bank" in {
+    val local = NativeCheckpointShellStateAccess.generate(source, selected.head).reference
+    val ordinary = GeneratedStateBankAccess.generate(local, SimulatorStateInventory.discover(local),
+      separateAccessClock = true)
+    val adapted = NativeSynchronousMemoryReadout.generate(local, ordinary)
+    GeneratedStateBankAccess.validateAnnotationBinding(adapted)
+    assert(adapted.synchronousOrigin.nonEmpty && ordinary.synchronousOrigin.isEmpty)
+    val lost = intercept[IllegalArgumentException](GeneratedStateBankAccess.validateAnnotationBinding(
+      adapted.copy(synchronousOrigin = None)))
+    assert(lost.getMessage.contains("missing original source/bank provenance"))
+    val root = adapted.state.circuit.modules.head.asInstanceOf[Module]
+    val cases: Seq[(String, Statement => Statement)] = Seq(
+      "forward_hit" -> { case c: Connect if c.loc.serialize == "CheckpointNativeForwardHit_ram" =>
+        c.copy(expr = UIntLiteral(0, IntWidth(1))); case s => s },
+      "forward_data" -> { case c: Connect if c.loc.serialize == "CheckpointNativeForwardData_ram" =>
+        c.copy(expr = UIntLiteral(0, IntWidth(130))); case s => s },
+      "public_shadow" -> { case c: Connect if c.loc.serialize == "CheckpointNativeHold_ram" =>
+        c.copy(expr = UIntLiteral(0, IntWidth(130))); case s => s },
+      "borrowed" -> { case c: Connect if c.loc.serialize == "CheckpointNativeBorrowed" =>
+        c.copy(expr = UIntLiteral(0, IntWidth(1))); case s => s },
+      "native_address" -> { case c: Connect if c.loc.serialize == "ram.r.addr" =>
+        c.copy(expr = UIntLiteral(0, IntWidth(3))); case s => s },
+      "native_enable" -> { case c: Connect if c.loc.serialize == "ram.r.en" =>
+        c.copy(expr = UIntLiteral(0, IntWidth(1))); case s => s },
+      "endpoint_phase" -> { case c: Connect if c.loc.serialize == "ckpt_native_phase" =>
+        c.copy(expr = UIntLiteral(0, IntWidth(2))); case s => s },
+      "response_data" -> { case c: Connect if c.loc.serialize == "ckpt_saved_data" =>
+        c.copy(expr = UIntLiteral(0, IntWidth(64))); case s => s },
+      "response_error" -> { case c: Connect if c.loc.serialize == "ckpt_saved_error" =>
+        c.copy(expr = UIntLiteral(0, IntWidth(1))); case s => s },
+      "reset_cancel" -> { case c: Connect if c.loc.serialize == "ckpt_native_request" =>
+        c.copy(expr = UIntLiteral(1, IntWidth(1))); case s => s })
+    cases.foreach { case (name, change) =>
+      def rewrite(s: Statement): Statement = change(s.mapStmt(rewrite))
+      val state = adapted.state.copy(circuit = adapted.state.circuit.copy(modules = Seq(
+        root.copy(body = rewrite(root.body)))))
+      assert(state.circuit != adapted.state.circuit, name)
+      val rehashed = SemanticStateInventory.canonical(parse(adapted.binding).transformField {
+        case ("instrumented_sha256", _) => "instrumented_sha256" ->
+          JString(SemanticStateInventory.sha256(state.circuit.serialize))
+      })
+      val error = intercept[IllegalArgumentException](GeneratedStateBankAccess.validateAnnotationBinding(
+        adapted.copy(state = state, binding = rehashed)))
+      assert(error.getMessage.contains("changed source-bound native RAM"), name + ": " + error.getMessage)
+    }
+    val wrongEntry = adapted.entries.head.copy(depth = adapted.entries.head.depth + 1)
+    intercept[IllegalArgumentException](GeneratedStateBankAccess.validateAnnotationBinding(
+      adapted.copy(entries = wrongEntry +: adapted.entries.tail)))
+    val wrongOrdinary = ordinary.copy(entries = ordinary.entries.tail)
+    assert(intercept[IllegalArgumentException](NativeSynchronousMemoryReadout.generate(local, wrongOrdinary))
+      .getMessage.contains("ordinary bank does not match the original reference"))
+    // Removing both public metadata markers must not disable validation while
+    // the original proof remains attached to a copied result.
+    val hiddenPolicy = SemanticStateInventory.canonical(JObject(parse(adapted.binding).asInstanceOf[JObject].obj
+      .filterNot(_._1 == "synchronous_memory_readout")))
+    intercept[IllegalArgumentException](GeneratedStateBankAccess.validateAnnotationBinding(adapted.copy(binding = hiddenPolicy)))
+    println("SYNCHRONOUS_SOURCE_PROOF_PASS equations=10 missing_origin=1 entries=1 ordinary=1 hidden_policy=1")
+  }
+
   it should "translate correlated preservation and initialization owners only to their concrete copies" in {
     val h = source
     val q0 = selected.head.ref("ram")

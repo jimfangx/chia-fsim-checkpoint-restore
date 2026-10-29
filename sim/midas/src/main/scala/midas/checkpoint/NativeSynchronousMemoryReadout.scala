@@ -19,8 +19,19 @@ import org.json4s.native.JsonMethods.parse
   * is a caller obligation, not a CDC adapter or a complete capture owner.
   */
 object NativeSynchronousMemoryReadout {
+  /** In-memory generation provenance, not a caller-supplied hash or a capture
+    * owner. Keep the original New RAM and its ordinary bank together so that
+    * validation can reconstruct every physical reader/forwarding/control
+    * equation. Copies of a Result retain this immutable origin. A serialized
+    * bank must be regenerated from source before it can acquire this proof.
+    */
+  final class Origin private[NativeSynchronousMemoryReadout] (
+      val reference: CircuitState, val ordinaryBanks: GeneratedStateBankAccess.Result)
   private def check(ok: Boolean, why: String): Unit =
     require(ok, "Native synchronous memory readout: " + why)
+  private def sameState(a: CircuitState, b: CircuitState): Boolean =
+    a.form == b.form && a.renames == b.renames && a.circuit == b.circuit &&
+      a.annotations.toVector == b.annotations.toVector
   private def statements(s: Statement): Seq[Statement] = {
     val out = mutable.ArrayBuffer.empty[Statement]
     def visit(x: Statement): Unit = { out += x; x.foreachStmt(visit) }
@@ -51,7 +62,14 @@ object NativeSynchronousMemoryReadout {
     val all = statements(root.body)
     val endpoints = all.collect { case r: DefRegister if endpointRegisters(r.name) => r }
     val present = doc \ "synchronous_memory_readout"
-    if (present != JNothing || endpoints.nonEmpty) {
+    if (present != JNothing || endpoints.nonEmpty || result.synchronousOrigin.nonEmpty) {
+      val origin = result.synchronousOrigin.getOrElse(throw new IllegalArgumentException(
+        "Native synchronous memory readout: missing original source/bank provenance"))
+      check(origin.ordinaryBanks.synchronousOrigin.isEmpty, "nested synchronous bank provenance")
+      GeneratedStateBankAccess.validateAnnotationBinding(origin.ordinaryBanks)
+      val expected = generateImpl(origin.reference, origin.ordinaryBanks)
+      check(sameState(result.state, expected.state) && result.entries == expected.entries && result.binding == expected.binding,
+        "changed source-bound native RAM, forwarding, readout or endpoint equations")
       val memories = all.collect { case m: DefMemory => m }
       check(memories.nonEmpty && memories.forall(m => m.readLatency == 1 && m.writeLatency == 1 &&
         m.readUnderWrite == ReadUnderWrite.Old && m.readers.size == 1 && m.writers.size == 1 && m.readwriters.isEmpty),
@@ -85,6 +103,19 @@ object NativeSynchronousMemoryReadout {
   }
 
   def generate(reference: CircuitState, banks: GeneratedStateBankAccess.Result): GeneratedStateBankAccess.Result = {
+    check(banks.synchronousOrigin.isEmpty, "ordinary source bank required")
+    GeneratedStateBankAccess.validateAnnotationBinding(banks)
+    val ordinary = GeneratedStateBankAccess.generate(reference, SimulatorStateInventory.discover(reference),
+      separateAccessClock = true)
+    check(sameState(banks.state, ordinary.state) && banks.entries == ordinary.entries && banks.binding == ordinary.binding,
+      "ordinary bank does not match the original reference")
+    val generated = generateImpl(reference, banks).copy(synchronousOrigin = Some(new Origin(reference, banks)))
+    GeneratedStateBankAccess.validateAnnotationBinding(generated)
+    generated
+  }
+
+  private def generateImpl(reference: CircuitState,
+      banks: GeneratedStateBankAccess.Result): GeneratedStateBankAccess.Result = {
     check(reference.form == LowForm && reference.circuit.modules.size == 1 &&
       banks.state.circuit.modules.size == 1, "one local concrete module required")
     val original = reference.circuit.modules.head.asInstanceOf[Module]
@@ -235,8 +266,6 @@ ckpt_native_request <= mux(ckpt_reset, UInt<1>(0), mux(ckpt_accept, UInt<1>(1), 
     val binding = SemanticStateInventory.canonical(JObject(doc.obj.filterNot(_._1 == "instrumented_sha256") ++
       List("instrumented_sha256" -> JString(SemanticStateInventory.sha256(resolved.circuit.serialize)),
         "synchronous_memory_readout" -> policy(memories.map(_.name)))))
-    val result = banks.copy(state = resolved, binding = binding)
-    GeneratedStateBankAccess.validateAnnotationBinding(result)
-    result
+    banks.copy(state = resolved, binding = binding)
   }
 }

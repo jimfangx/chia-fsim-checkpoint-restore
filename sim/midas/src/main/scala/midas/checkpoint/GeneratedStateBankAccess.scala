@@ -30,7 +30,8 @@ import org.json4s.native.JsonMethods.parse
   * This is not an all-owner simulator cut or a FireSim bridge integration.
   */
 object GeneratedStateBankAccess {
-  case class Result(state: CircuitState, entries: Seq[StateAccessEntry], binding: String)
+  case class Result(state: CircuitState, entries: Seq[StateAccessEntry], binding: String,
+      synchronousOrigin: Option[NativeSynchronousMemoryReadout.Origin] = None)
   def validateAnnotationBinding(result: Result): Unit = {
     GeneratedStateBankAnnotations.preflight(result.state)
     NativeSynchronousMemoryReadout.validateBinding(result)
