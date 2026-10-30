@@ -81,6 +81,19 @@ class RocketNativeQueueCaptureSpec extends AnyFlatSpec {
     save("grafted.fir", graft.state.circuit.serialize)
     save("grafted.sv", emit(graft.state))
     graft.files.foreach(f => save("FireSim-generated" + f.fileSuffix, f.body))
+    val staged = NativeCheckpointRegionGraft.generate(result, stageNativeState = true)
+    val staging = parse(staged.binding) \ "native_state_snapshot"
+    assert((staging \ "bits") == JInt(6656) && (staging \ "words") == JInt(104))
+    assert((staging \ "control_bits") == JInt(6727))
+    assert((staging \ "restore_supported") == JBool(false))
+    assert((staging \ "global_freeze_owner_bound") == JBool(false))
+    assert(staged.state.circuit.modules.filterNot(m => m.name == "RocketQueueHost" ||
+      m.name == "RocketQueueHostCheckpointRegionReadoutAdapter") ==
+      graft.state.circuit.modules.filterNot(m => m.name == "RocketQueueHost" ||
+        m.name == "RocketQueueHostCheckpointRegionReadoutAdapter"))
+    save("staged.fir", staged.state.circuit.serialize)
+    save("staged.sv", emit(staged.state))
+    staged.files.foreach(f => save("Staged-generated" + f.fileSuffix, f.body))
     val constrained = midas.passes.WriteXDCFile.execute(result.state.copy(annotations = result.state.annotations :+
       midas.targetutils.xdc.XDCPathToCircuitAnnotation(None, None)))
     constrained.annotations.collect { case a: midas.passes.XDCOutputAnnotation => a }.foreach(a => save("generated" + a.suffix.get, a.fileBody))

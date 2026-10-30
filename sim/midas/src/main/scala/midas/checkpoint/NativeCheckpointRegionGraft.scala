@@ -23,8 +23,10 @@ object NativeCheckpointRegionGraft {
     }
     s"  ${if (p.direction == Input) "input" else "output"} wire $signed${if (width == 1) "" else s"[${width-1}:0] "}${p.name}"
   }
-  def generate(source: NativeCheckpointRegions.Result): Result = {
+  def generate(source: NativeCheckpointRegions.Result, stageNativeState: Boolean = false): Result = {
     NativeCheckpointRegions.validate(source)
+    require(!stageNativeState || source.regions.isEmpty,
+      "native region graft: staging currently supports shell-only endpoints; physical CE/common-cut owners remain unsupported")
     val state = source.state
     val original = source.host.circuit.modules.find(_.name == source.host.circuit.main).get.asInstanceOf[Module]
     val root = state.circuit.modules.find(_.name == state.circuit.main).get.asInstanceOf[Module]
@@ -63,7 +65,19 @@ object NativeCheckpointRegionGraft {
     require(nativeBits.isValidInt, "native region graft: native observation exceeds FIRRTL width")
     val nativePorts = if (nativeBits == 0) Nil else
       Seq(Port(NoInfo, "capture_native_state", Output, UIntType(IntWidth(nativeBits))))
-    val ports = NativeCheckpointInPlaceGraft.capturePorts(source.descriptors.physicalClockGates) ++ nativePorts
+    require(!stageNativeState || nativeBits > 0,
+      "native region graft: atomic staging requires a native observation owner")
+    def snapshotPort(n: String, d: Direction, bits: BigInt = 1): Port =
+      Port(NoInfo, "capture_snapshot_" + n, d, UIntType(IntWidth(bits)))
+    val snapshotPorts = if (!stageNativeState) Nil else Seq(
+      snapshotPort("request", Input), snapshotPort("release", Input), snapshotPort("owners_present", Input),
+      snapshotPort("target_cycle", Input, 64), snapshotPort("word_address", Input, 32),
+      snapshotPort("ready", Output), snapshotPort("valid", Output), snapshotPort("failed", Output),
+      snapshotPort("borrow_enable", Output), snapshotPort("word_error", Output),
+      snapshotPort("word_data", Output, 64), snapshotPort("cut_cycle", Output, 64),
+      snapshotPort("error", Output, 6), snapshotPort("state", Output, nativeBits),
+      snapshotPort("control_state", Output, nativeBits + 71))
+    val ports = NativeCheckpointInPlaceGraft.capturePorts(source.descriptors.physicalClockGates) ++ nativePorts ++ snapshotPorts
     val declarations = scala.collection.mutable.ArrayBuffer.empty[String]
     def visit(s: Statement): Unit = { s match { case d: IsDeclaration => declarations += d.name; case _ => () }; s.foreachStmt(visit) }
     visit(root.body)
@@ -98,7 +112,8 @@ object NativeCheckpointRegionGraft {
       files += GoldenGateOutputFileAnnotation(ce(1).body, s".native-region-graft-$i-ce.sv")
       val ceSlice = s"[${allocation.ceBase} +: ${allocation.ceCount}]"
       val pass = localPorts.map(p => s".${p.name}(${p.name})")
-      val control = Seq("reset", "clock_mask", "read_enable").map(n => s".capture_$n(capture_$n)") ++ Seq(
+      val control = Seq("reset", "clock_mask", "read_enable").map(n =>
+        s".capture_$n(${if (stageNativeState && n == "read_enable") "staged_read_enable" else "capture_" + n})") ++ Seq(
         s".capture_captured_ce(capture_captured_ce$ceSlice)", s".capture_logical_ce(capture_logical_ce$ceSlice)",
         ".capture_descriptor_entry(32'd0)") ++ Seq("valid", "bank", "slot", "width", "depth").map(n => s".capture_descriptor_$n()")
       val transaction = Seq("request_valid", "request_ready", "response_valid", "response_ready", "response_error")
@@ -139,6 +154,38 @@ object NativeCheckpointRegionGraft {
         s"capture_descriptor_slot=16'd${e.slot}; capture_descriptor_width=16'd${e.width}; capture_descriptor_depth=32'd${e.depth}; end"
     }.mkString("\n")
     val n = source.routing.regions.size
+    // Idle includes every endpoint, not only the currently addressed region.
+    // An outstanding response must stay pending on a lost cut; neither router
+    // nor endpoint may acknowledge it after permission is revoked. Abort then
+    // requires a common reset, not an invented completion or a new snapshot.
+    val stagingRTL = if (!stageNativeState) "" else s"""
+  wire raw_request_ready, raw_response_valid, raw_response_error;
+  wire [63:0] raw_response_data;
+  wire staged_permission = capture_snapshot_borrow_enable;
+  wire staged_read_enable = capture_read_enable && staged_permission;
+  wire all_readers_idle = raw_request_ready && (&region_request_ready) && !(|region_response_valid);
+  assign capture_request_ready = raw_request_ready && staged_permission;
+  assign capture_response_valid = raw_response_valid && staged_permission;
+  assign capture_response_data = staged_permission ? raw_response_data : 64'b0;
+  assign capture_response_error = raw_response_error && staged_permission;
+  CheckpointNativeStateSnapshot #(.BITS($nativeBits)) native_snapshot(
+    .clock($clock), .reset(capture_reset), .restore_hold(1'b0), .restore_load(1'b0),
+    .restore_state(${nativeBits + 71}'d0), .restore_ready(),
+    .request(capture_snapshot_request), .release_snapshot(capture_snapshot_release),
+    .owners_present(capture_snapshot_owners_present),
+    .functional_frozen(capture_clock_mask && capture_read_enable), .reader_idle(all_readers_idle),
+    .borrow_attempt(capture_request_valid), .target_cycle(capture_snapshot_target_cycle),
+    .live_state(capture_native_state), .word_address(capture_snapshot_word_address),
+    .request_ready(capture_snapshot_ready), .valid(capture_snapshot_valid),
+    .borrow_enable(capture_snapshot_borrow_enable), .failed(capture_snapshot_failed),
+    .word_data(capture_snapshot_word_data), .word_error(capture_snapshot_word_error),
+    .snapshot_state(capture_snapshot_state), .cut_cycle(capture_snapshot_cut_cycle),
+    .error(capture_snapshot_error), .control_state(capture_snapshot_control_state));
+"""
+    def routerSignal(n: String): String = if (!stageNativeState) "capture_" + n else n match {
+      case "request_valid" | "response_ready" => "capture_" + n + " && staged_permission"
+      case _ => "raw_" + n
+    }
     val declarationsRTL = (adapterPorts ++ ports).map { p =>
       val text = port(p)
       if (p.name.startsWith("capture_descriptor_") && p.direction == Output) text.replace("output wire", "output reg") else text
@@ -160,12 +207,13 @@ $cases
   wire [7:0] region_bank;
   wire [15:0] region_slot;
   wire [31:0] region_address;
+$stagingRTL
   CheckpointRegionStateRouter #(${source.routing.parameters}) router(
     .clock($clock), .reset(capture_reset),
-    .request_valid(capture_request_valid), .request_ready(capture_request_ready),
+    .request_valid(${routerSignal("request_valid")}), .request_ready(${routerSignal("request_ready")}),
     .bank(capture_bank), .slot(capture_slot), .address(capture_address),
-    .response_valid(capture_response_valid), .response_ready(capture_response_ready),
-    .response_data(capture_response_data), .response_error(capture_response_error),
+    .response_valid(${routerSignal("response_valid")}), .response_ready(${routerSignal("response_ready")}),
+    .response_data(${routerSignal("response_data")}), .response_error(${routerSignal("response_error")}),
     .region_request_valid(region_request_valid), .region_request_ready(region_request_ready),
     .region_bank(region_bank), .region_slot(region_slot), .region_address(region_address),
     .region_response_valid(region_response_valid), .region_response_ready(region_response_ready),
@@ -178,12 +226,23 @@ endmodule
     def resource(n: String): String = { val s = scala.io.Source.fromResource(n); try s.mkString finally s.close() }
     files += GoldenGateOutputFileAnnotation(resource("CheckpointRegionStateRouter.sv"), ".native-region-graft-router.sv")
     files += GoldenGateOutputFileAnnotation(resource("CheckpointPhysicalStateRouter.sv"), ".native-region-graft-physical-router.sv")
+    if (stageNativeState) files += GoldenGateOutputFileAnnotation(resource("CheckpointNativeStateSnapshot.sv"),
+      ".native-region-graft-snapshot.sv")
     val nativeBinding = if (observations.isEmpty) Nil else List("native_state_observation" -> JObject(List(
       "version" -> JInt(1), "port" -> JString("capture_native_state"), "bits" -> JInt(nativeBits),
       "bit_order" -> JString("shell_order_lsb0"), "regions" -> JArray(observations.toList),
       "sampling_contract" -> JString("atomically_stage_entire_vector_before_any_borrow_or_bank_request"),
       "stable_while_functional_freeze" -> JBool(false), "atomic_snapshot_supported" -> JBool(false),
       "complete_capture_owner" -> JBool(false), "metasim_restore_supported" -> JBool(false))))
+    val snapshotBinding = if (!stageNativeState) Nil else List("native_state_snapshot" -> JObject(List(
+      "version" -> JInt(1), "module" -> JString("CheckpointNativeStateSnapshot"),
+      "instance" -> JString(instance + ".native_snapshot"), "bits" -> JInt(nativeBits),
+      "words" -> JInt((nativeBits + 63) / 64), "control_bits" -> JInt(nativeBits + 71),
+      "control_layout_lsb0" -> JArray(List(JString("payload"), JString("occupied"), JString("cut_cycle"), JString("error"))),
+      "sampling" -> JString("one_common_raw_positive_edge_preedge_values_before_any_bank_request"),
+      "idle" -> JString("router_ready_and_every_endpoint_ready_and_no_endpoint_response"),
+      "bank_requests_and_responses_gated" -> JBool(true), "restore_supported" -> JBool(false),
+      "global_freeze_owner_bound" -> JBool(false), "owner" -> JString("capture_only_native_staging_control"))))
     val binding = canonical(JObject(List(
       "graft_version" -> JInt(1), "scope" -> JString("existing_native_regions_shared_readout_only"),
       "root" -> JString(root.name), "adapter_module" -> JString(name), "adapter_instance" -> JString(instance),
@@ -193,7 +252,7 @@ endmodule
       "files" -> JObject(files.map(f => f.fileSuffix -> JString(sha256(f.body))).toList),
       "common_mask_and_sample_interface" -> JBool(true), "production_freeze_owners_bound" -> JBool(false),
       "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
-      "metasim_restore_supported" -> JBool(false)) ++ nativeBinding))
+      "metasim_restore_supported" -> JBool(false)) ++ nativeBinding ++ snapshotBinding))
     Result(state.copy(circuit = flowed), files.toSeq :+
       GoldenGateOutputFileAnnotation(binding, ".native-region-graft.json"), binding)
   }

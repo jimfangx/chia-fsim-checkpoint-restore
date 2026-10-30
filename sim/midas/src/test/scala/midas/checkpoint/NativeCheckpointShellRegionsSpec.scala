@@ -54,6 +54,11 @@ class NativeCheckpointShellRegionsSpec extends AnyFlatSpec {
       intercept[IllegalArgumentException](NativeCheckpointRegions.generate(source, targets, shellTargets = ts)))
   }
 
+  it should "reject native staging of mixed physical-clock regions before emitting a partial cut" in {
+    val error = intercept[IllegalArgumentException](NativeCheckpointRegionGraft.generate(generate, stageNativeState = true))
+    assert(error.getMessage.contains("shell-only endpoints"))
+  }
+
   it should "reject nontransparent and unrelated local clocks before connecting shared raw readout" in {
     val h = source
     val changed = h.copy(circuit = h.circuit.copy(modules = h.circuit.modules.map {
