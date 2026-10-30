@@ -46,9 +46,10 @@ object NativeSynchronousMemoryReadout {
     "ckpt_native_address", "ckpt_native_active", "ckpt_native_request")
 
   private def policy(memories: Seq[String]): JObject = JObject(List(
-    "adapter_version" -> JInt(2), "original_ram_ports_retained" -> JBool(true),
+    "adapter_version" -> JInt(3), "original_ram_ports_retained" -> JBool(true),
     "access_clock_contract" -> JString("same_running_original_raw_clock"),
-    "response_latency_edges" -> JInt(3), "original_reader_reprimed_before_response" -> JBool(true),
+    "response_latency_edges" -> JInt(4), "registered_request_before_borrow" -> JBool(true),
+    "original_reader_reprimed_before_response" -> JBool(true),
     "cancel_reprime_before_ready" -> JBool(true), "public_reader_shadowed" -> JBool(true),
     "native_read_under_write" -> JString("old"),
     "original_read_under_write" -> JString("new"),
@@ -216,6 +217,12 @@ object NativeSynchronousMemoryReadout {
       case n: DefNode => n.copy(value = expr(n.value))
       case x => x.mapStmt(rewrite)
     }
+    // Accept only captures selectors. Phase 3 borrows from those registers on
+    // the following edge; phase 1 captures the returned data and re-primes the
+    // original reader, then phase 2 publishes the response. In particular the
+    // permission-qualified accepting request never selects the URAM address.
+    // Lost hold invalidates an accepted request even if hold returns before
+    // payload sampling. The existing phase register covers this extra edge.
     val controls = """reg ckpt_native_phase : UInt<2>, ckpt_clock
 reg ckpt_native_bank : UInt<8>, ckpt_clock
 reg ckpt_native_slot : UInt<16>, ckpt_clock
@@ -224,12 +231,12 @@ reg ckpt_native_active : UInt<1>, ckpt_clock
 reg ckpt_native_request : UInt<1>, ckpt_clock
 node ckpt_native_completion = and(ckpt_native_request, not(ckpt_reset))
 node ckpt_native_busy = neq(ckpt_native_phase, UInt<2>(0))
-node ckpt_native_borrow = and(and(ckpt_freeze, not(ckpt_reset)), or(ckpt_accept, eq(ckpt_native_phase, UInt<2>(1))))
-ckpt_native_phase <= mux(ckpt_reset, UInt<2>(2), mux(ckpt_accept, UInt<2>(1), mux(eq(ckpt_native_phase, UInt<2>(1)), UInt<2>(2), UInt<2>(0))))
+node ckpt_native_borrow = and(and(ckpt_freeze, not(ckpt_reset)), eq(ckpt_native_phase, UInt<2>(3)))
+ckpt_native_phase <= mux(ckpt_reset, UInt<2>(2), mux(ckpt_accept, UInt<2>(3), mux(eq(ckpt_native_phase, UInt<2>(3)), UInt<2>(1), mux(eq(ckpt_native_phase, UInt<2>(1)), UInt<2>(2), UInt<2>(0)))))
 ckpt_native_bank <= mux(ckpt_accept, ckpt_bank, ckpt_native_bank)
 ckpt_native_slot <= mux(ckpt_accept, ckpt_slot, ckpt_native_slot)
 ckpt_native_address <= mux(ckpt_accept, ckpt_address, ckpt_native_address)
-ckpt_native_active <= mux(ckpt_reset, UInt<1>(0), mux(ckpt_accept, and(ckpt_freeze, ckpt_match), mux(eq(ckpt_native_phase, UInt<2>(2)), UInt<1>(0), ckpt_native_active)))
+ckpt_native_active <= mux(ckpt_reset, UInt<1>(0), mux(ckpt_accept, and(ckpt_freeze, ckpt_match), mux(or(eq(ckpt_native_phase, UInt<2>(2)), not(ckpt_freeze)), UInt<1>(0), ckpt_native_active)))
 ckpt_pending <= mux(ckpt_reset, UInt<1>(0), mux(eq(ckpt_native_phase, UInt<2>(2)), ckpt_native_completion, mux(ckpt_resp_ready, UInt<1>(0), ckpt_pending)))
 ckpt_saved_data <= mux(eq(ckpt_native_phase, UInt<2>(1)), mux(and(ckpt_native_active, ckpt_freeze), ckpt_data, UInt<64>(0)), mux(and(eq(ckpt_native_phase, UInt<2>(2)), not(ckpt_freeze)), UInt<64>(0), ckpt_saved_data))
 ckpt_saved_error <= mux(eq(ckpt_native_phase, UInt<2>(1)), not(and(ckpt_native_active, ckpt_freeze)), mux(and(eq(ckpt_native_phase, UInt<2>(2)), not(ckpt_freeze)), UInt<1>(1), ckpt_saved_error))

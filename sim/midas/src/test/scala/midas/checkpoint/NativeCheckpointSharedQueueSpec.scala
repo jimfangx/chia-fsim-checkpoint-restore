@@ -51,10 +51,11 @@ class NativeCheckpointSharedQueueSpec extends AnyFlatSpec {
       assert(memory.contains("read-under-write => old"))
       assert(memory.contains("reg CheckpointNativeForwardHit_ram : UInt<1>, clock"))
       assert(memory.contains("reg CheckpointNativeForwardData_ram : UInt<130>, clock"))
-      assert((parse(shell.banks.binding) \ "synchronous_memory_readout" \ "adapter_version") == JInt(2))
+      assert((parse(shell.banks.binding) \ "synchronous_memory_readout" \ "adapter_version") == JInt(3))
       assert((parse(shell.banks.binding) \ "synchronous_memory_readout" \ "write_first_forwarding") ==
         JString("registered_hit_and_data_at_original_ram_edge"))
-      assert((parse(shell.banks.binding) \ "synchronous_memory_readout" \ "response_latency_edges") == JInt(3))
+      assert((parse(shell.banks.binding) \ "synchronous_memory_readout" \ "response_latency_edges") == JInt(4))
+      assert((parse(shell.banks.binding) \ "synchronous_memory_readout" \ "registered_request_before_borrow") == JBool(true))
       assert((parse(shell.banks.binding) \ "synchronous_memory_readout" \ "original_reader_reprimed_before_response") == JBool(true))
       val observation = parse(shell.banks.binding) \ "native_state_observation"
       assert((observation \ "bits") == JInt(518) && (observation \ "words") == JInt(9))
@@ -103,6 +104,9 @@ class NativeCheckpointSharedQueueSpec extends AnyFlatSpec {
       save(s"shell-$index-mapping.json", shell.mapping)
       save(s"shell-$index-binding.json", shell.binding)
       save(s"shell-$index-manifest.json", shell.manifest)
+      save(s"shell-$index-banks-binding.json", shell.banks.binding)
+      save(s"shell-$index-reference.fir", shell.reference.circuit.serialize)
+      save(s"shell-$index-banked.fir", shell.banks.state.circuit.serialize)
     }
     val damaged = result.state.copy(circuit = result.state.circuit.copy(info = FileInfo("changed")))
     intercept[IllegalArgumentException](NativeCheckpointRegions.validate(result.copy(state = damaged)))
@@ -196,6 +200,10 @@ class NativeCheckpointSharedQueueSpec extends AnyFlatSpec {
         c.copy(expr = UIntLiteral(0, IntWidth(130))); case s => s },
       "borrowed" -> { case c: Connect if c.loc.serialize == "CheckpointNativeBorrowed" =>
         c.copy(expr = UIntLiteral(0, IntWidth(1))); case s => s },
+      "accepting_edge_borrow" -> { case n: DefNode if n.name == "ckpt_native_borrow" =>
+        n.copy(value = firrtl.WRef("ckpt_accept", UIntType(IntWidth(1)))); case s => s },
+      "transient_hold_loss" -> { case c: Connect if c.loc.serialize == "ckpt_native_active" =>
+        c.copy(expr = firrtl.WRef("ckpt_native_active", UIntType(IntWidth(1)))); case s => s },
       "native_address" -> { case c: Connect if c.loc.serialize == "ram.r.addr" =>
         c.copy(expr = UIntLiteral(0, IntWidth(3))); case s => s },
       "native_enable" -> { case c: Connect if c.loc.serialize == "ram.r.en" =>
@@ -237,7 +245,7 @@ class NativeCheckpointSharedQueueSpec extends AnyFlatSpec {
     val hiddenObservation = SemanticStateInventory.canonical(JObject(parse(adapted.binding).asInstanceOf[JObject].obj
       .filterNot(_._1 == "native_state_observation")))
     intercept[IllegalArgumentException](GeneratedStateBankAccess.validateAnnotationBinding(adapted.copy(binding = hiddenObservation)))
-    println("SYNCHRONOUS_SOURCE_PROOF_PASS equations=11 missing_origin=1 entries=1 ordinary=1 hidden_policy=1 hidden_observation=1")
+    println("SYNCHRONOUS_SOURCE_PROOF_PASS equations=13 missing_origin=1 entries=1 ordinary=1 hidden_policy=1 hidden_observation=1")
   }
 
   it should "reject observation layout corruption and reserved-port collisions without changing original selectors" in {
