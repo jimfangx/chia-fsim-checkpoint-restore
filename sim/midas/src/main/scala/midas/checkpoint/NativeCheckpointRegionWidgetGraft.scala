@@ -72,6 +72,11 @@ object NativeCheckpointRegionWidgetGraft {
     val conflicts = liveTransportConflicts(before, after, source)
     check(conflicts.arr.isEmpty,
       s"local shell freeze would stop live checkpoint MMIO/DMA transport (${conflicts.arr.size} original owners); separate atomic transport owner required")
+    // The physical widget has no atomic staging input for native reader state.
+    // Do not leave a newly exposed live vector unconnected and then claim its
+    // original descriptor table covers the instrumented synchronous pipeline.
+    check(!source.shells.exists(s => (parse(s.banks.binding) \ "native_state_observation") != JNothing),
+      "native synchronous reader state requires an atomic widget staging owner before connection")
     val graft = NativeCheckpointRegionGraft.generate(source)
     val execution = after.annotations.collect { case a: NativeCheckpointWidgetExecutionAnnotation => a }.head
     check(execution.entries == source.descriptors.entries.size && execution.gates == source.descriptors.physicalClockGates,

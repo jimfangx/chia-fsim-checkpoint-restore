@@ -93,6 +93,22 @@ class NativeCheckpointSharedQueueSpec extends AnyFlatSpec {
     save("generated.anno.json", JsonProtocol.serialize(result.state.annotations))
     save("binding.json", result.binding); save("descriptors.json", result.descriptors.manifest)
     save("descriptor-binding.json", result.descriptors.binding); save("routing.json", result.routing.binding)
+    val graft = NativeCheckpointRegionGraft.generate(result)
+    val observation = parse(graft.binding) \ "native_state_observation"
+    assert((observation \ "bits") == JInt(1036))
+    val native = (observation \ "regions").asInstanceOf[JArray].arr
+    assert(native.map(_ \ "offset") == Seq(JInt(0), JInt(518)))
+    assert(native.map(_ \ "selected_execution") == Seq(JString("SharedQueueHost.q0"), JString("SharedQueueHost.q1")))
+    assert((observation \ "atomic_snapshot_supported") == JBool(false))
+    assert((observation \ "stable_while_functional_freeze") == JBool(false))
+    assert(NativeCheckpointInPlaceGraft.capturePorts(0).forall {
+      case Port(_, _, _, UIntType(IntWidth(w))) => w > 0
+      case _ => false
+    })
+    intercept[IllegalArgumentException](NativeCheckpointInPlaceGraft.capturePorts(-1))
+    intercept[IllegalArgumentException](NativeCheckpointInPlaceGraft.capturePorts(65536))
+    save("grafted.fir", graft.state.circuit.serialize); save("grafted.sv", emit(graft.state))
+    graft.files.foreach(f => save("FireSim-generated" + f.fileSuffix, f.body))
     Seq("source" -> annotated, "generated" -> result.state).foreach { case (name, state) =>
       val constrained = midas.passes.WriteXDCFile.execute(state.copy(annotations = state.annotations :+
         midas.targetutils.xdc.XDCPathToCircuitAnnotation(None, Some("shell/CL"))))

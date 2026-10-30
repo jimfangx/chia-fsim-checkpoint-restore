@@ -36,7 +36,34 @@ object NativeCheckpointRegionGraft {
     val clockPort = original.ports.find(p => p.name == clock && p.direction == Input && p.tpe == ClockType).get
     val name = root.name + "CheckpointRegionReadoutAdapter"
     val instance = "checkpoint_region_readout_adapter"
-    val ports = NativeCheckpointInPlaceGraft.capturePorts(source.descriptors.physicalClockGates)
+    // Synchronous native readers introduce live state that does not belong to
+    // the original descriptor table. Keep it observable in immutable shell/
+    // field order; freeze alone does not stabilize the borrowed RAM pipeline.
+    // A downstream atomic staging owner is still required before capture.
+    var nativeBits = BigInt(0)
+    val observations = source.shells.zipWithIndex.flatMap { case (shell, index) =>
+      (parse(shell.banks.binding) \ "native_state_observation") match {
+        case JNothing => Nil
+        case observation: JObject =>
+          val JInt(bits) = observation \ "bits"
+          require(bits > 0 && bits.isValidInt, "native region graft: invalid native observation width")
+          val localPort = shell.sidebandPrefix + NativeSynchronousStateObservation.port
+          require(access.exists(p => p.name == localPort && p.direction == Output &&
+            p.tpe == UIntType(IntWidth(bits))), "native region graft: missing native observation port")
+          val JString(execution) = parse(shell.mapping) \ "selected_execution"
+          val row = JObject(List("region" -> JInt(source.regions.size + index),
+            "selected_execution" -> JString(execution), "port" -> JString(localPort),
+            "offset" -> JInt(nativeBits), "bits" -> JInt(bits),
+            "banks_binding_sha256" -> JString(sha256(shell.banks.binding)), "observation" -> observation))
+          nativeBits += bits
+          Seq(row)
+        case _ => throw new IllegalArgumentException("native region graft: invalid native observation")
+      }
+    }
+    require(nativeBits.isValidInt, "native region graft: native observation exceeds FIRRTL width")
+    val nativePorts = if (nativeBits == 0) Nil else
+      Seq(Port(NoInfo, "capture_native_state", Output, UIntType(IntWidth(nativeBits))))
+    val ports = NativeCheckpointInPlaceGraft.capturePorts(source.descriptors.physicalClockGates) ++ nativePorts
     val declarations = scala.collection.mutable.ArrayBuffer.empty[String]
     def visit(s: Statement): Unit = { s match { case d: IsDeclaration => declarations += d.name; case _ => () }; s.foreachStmt(visit) }
     visit(root.body)
@@ -90,14 +117,23 @@ object NativeCheckpointRegionGraft {
         "ckpt_req_valid" -> s"region_request_valid[$i]", "ckpt_req_ready" -> s"region_request_ready[$i]",
         "ckpt_resp_valid" -> s"region_response_valid[$i]", "ckpt_resp_ready" -> s"region_response_ready[$i]",
         "ckpt_resp_data" -> s"region_response_data[${i*64} +: 64]", "ckpt_resp_error" -> s"region_response_error[$i]")
+      val observed = observations.filter(r => (r \ "region") == JInt(i)).map(r =>
+        (r \ "port").asInstanceOf[JString].s)
       require(local.map(_.name).toSet == (signals.map(x => prefix + x._1) ++
-        Seq(prefix + "ckpt_match", prefix + "ckpt_data")).toSet, "native region graft: unknown shell interface")
+        Seq(prefix + "ckpt_match", prefix + "ckpt_data") ++ observed).toSet,
+        "native region graft: unknown shell interface")
       signals.map { case (pin, wire) =>
         val p = local.find(_.name == prefix + pin).get
         if (p.direction == Input) s"  assign $wire = ${p.name};" else s"  assign ${p.name} = $wire;"
       }.mkString("\n")
     }
     val endpoints = (nativeEndpoints ++ shellEndpoints).mkString("\n")
+    val nativeRTL = observations.map { row =>
+      val JInt(offset) = row \ "offset"
+      val JInt(bits) = row \ "bits"
+      val JString(pin) = row \ "port"
+      s"  assign capture_native_state[$offset +: $bits] = $pin;"
+    }.mkString("\n")
     val cases = source.descriptors.entries.zipWithIndex.map { case (e, i) =>
       s"      32'd$i: begin capture_descriptor_valid=1; capture_descriptor_bank=8'd${e.bank}; " +
         s"capture_descriptor_slot=16'd${e.slot}; capture_descriptor_width=16'd${e.width}; capture_descriptor_depth=32'd${e.depth}; end"
@@ -135,12 +171,19 @@ $cases
     .region_response_valid(region_response_valid), .region_response_ready(region_response_ready),
     .region_response_data(region_response_data), .region_response_error(region_response_error));
 $endpoints
+$nativeRTL
 endmodule
 """
     files += GoldenGateOutputFileAnnotation(rtl, ".native-region-graft.sv")
     def resource(n: String): String = { val s = scala.io.Source.fromResource(n); try s.mkString finally s.close() }
     files += GoldenGateOutputFileAnnotation(resource("CheckpointRegionStateRouter.sv"), ".native-region-graft-router.sv")
     files += GoldenGateOutputFileAnnotation(resource("CheckpointPhysicalStateRouter.sv"), ".native-region-graft-physical-router.sv")
+    val nativeBinding = if (observations.isEmpty) Nil else List("native_state_observation" -> JObject(List(
+      "version" -> JInt(1), "port" -> JString("capture_native_state"), "bits" -> JInt(nativeBits),
+      "bit_order" -> JString("shell_order_lsb0"), "regions" -> JArray(observations.toList),
+      "sampling_contract" -> JString("atomically_stage_entire_vector_before_any_borrow_or_bank_request"),
+      "stable_while_functional_freeze" -> JBool(false), "atomic_snapshot_supported" -> JBool(false),
+      "complete_capture_owner" -> JBool(false), "metasim_restore_supported" -> JBool(false))))
     val binding = canonical(JObject(List(
       "graft_version" -> JInt(1), "scope" -> JString("existing_native_regions_shared_readout_only"),
       "root" -> JString(root.name), "adapter_module" -> JString(name), "adapter_instance" -> JString(instance),
@@ -150,7 +193,7 @@ endmodule
       "files" -> JObject(files.map(f => f.fileSuffix -> JString(sha256(f.body))).toList),
       "common_mask_and_sample_interface" -> JBool(true), "production_freeze_owners_bound" -> JBool(false),
       "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
-      "metasim_restore_supported" -> JBool(false))))
+      "metasim_restore_supported" -> JBool(false)) ++ nativeBinding))
     Result(state.copy(circuit = flowed), files.toSeq :+
       GoldenGateOutputFileAnnotation(binding, ".native-region-graft.json"), binding)
   }

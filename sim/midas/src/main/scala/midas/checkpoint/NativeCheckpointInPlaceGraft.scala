@@ -19,11 +19,11 @@ object NativeCheckpointInPlaceGraft {
   case class Result(state: CircuitState, files: Seq[GoldenGateOutputFileAnnotation], binding: String)
 
   def capturePorts(gates: Int): Seq[Port] = {
-    require(gates > 0 && gates <= 65535, "native in-place graft: invalid physical gate count")
+    require(gates >= 0 && gates <= 65535, "native in-place graft: invalid physical gate count")
     def p(name: String, width: Int, direction: Direction) =
       Port(NoInfo, "capture_" + name, direction, UIntType(IntWidth(width)))
-    Seq(p("reset", 1, Input), p("clock_mask", 1, Input), p("read_enable", 1, Input),
-      p("captured_ce", gates, Input), p("logical_ce", gates, Output),
+    Seq(p("reset", 1, Input), p("clock_mask", 1, Input), p("read_enable", 1, Input)) ++
+      (if (gates == 0) Nil else Seq(p("captured_ce", gates, Input), p("logical_ce", gates, Output))) ++ Seq(
       p("descriptor_entry", 32, Input), p("descriptor_valid", 1, Output),
       p("descriptor_bank", 8, Output), p("descriptor_slot", 16, Output),
       p("descriptor_width", 16, Output), p("descriptor_depth", 32, Output),
