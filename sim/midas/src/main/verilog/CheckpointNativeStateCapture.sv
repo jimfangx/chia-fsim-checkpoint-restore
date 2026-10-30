@@ -81,10 +81,32 @@ module CheckpointNativeStateCapture #(
     wire read_integrity_fault = |error || |snapshot_sticky_error ||
         physical_failed || !physical_ready || !frozen || !safe_owners ||
         capture_request || (snapshot_occupied && target_cycle != snapshot_cycle);
-    wire read_command_fault = borrow_attempt &&
-        (!snapshot_occupied || reset || release_request);
-    assign failed = phase == READ ? read_integrity_fault || read_command_fault :
-        |error || |faults || phase == FAULT;
+    // The non-READ arm used to send physical_ready through snapshot.failed,
+    // snapshot.request_ready and this sequencer's faults before returning it
+    // to the transport. Synthesis must time that arm even during READ. Expand
+    // the *whole* snapshot policy, not just READ, at this owner boundary. The
+    // snapshot restore ports are tied off below; its original registers and
+    // hierarchical faults still own all diagnostics and state transitions.
+    wire staging_request = phase == SAMPLE && !capture_request && !release_request;
+    wire staging_release = phase == DRAIN && reader_idle;
+    wire staging_active = snapshot_occupied || staging_request || borrow_attempt || staging_release;
+    wire staging_structure_fault =
+        (staging_request && snapshot_occupied) ||
+        (staging_release && !snapshot_occupied) ||
+        (snapshot_occupied && target_cycle != snapshot_cycle) ||
+        (borrow_attempt && !snapshot_occupied) ||
+        (staging_request && !snapshot_occupied && (!reader_idle || borrow_attempt));
+    wire command_fault =
+        (capture_request && phase != RUN && phase != WAIT_CUT) ||
+        (release_request && phase != READ && phase != DRAIN && phase != RELEASE);
+    wire borrow_fault = borrow_attempt &&
+        (phase != READ || !snapshot_occupied || reset || release_request);
+    assign failed = |error || |snapshot_sticky_error || phase == FAULT ||
+        staging_structure_fault || command_fault || borrow_fault ||
+        (phase == SAMPLE && (snapshot_occupied || reset)) ||
+        ((cut_required || staging_active) && (!physical_ready || !frozen)) ||
+        (active && physical_failed) ||
+        ((active || capture_request || staging_active) && !safe_owners);
     // Independent of capture_request: command-pulse producers may qualify
     // their request with ready. Missing owners must not create ready/request
     // feedback through the attempted-command fault qualification.
