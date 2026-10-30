@@ -28,7 +28,9 @@ module CheckpointNativeStateCapture #(
     output wire word_error,
     output wire [BITS-1:0] snapshot_state,
     output wire [GATES-1:0] captured_ce,
-    output reg [2:0] phase,
+    // The live-state ABI exposes these three source-encoded bits directly.
+    // Keep synthesis from replacing them with an inferred/decoded FSM owner.
+    (* fsm_encoding = "none", dont_touch = "true" *) output reg [2:0] phase,
     // missing/error owner, lost/failed physical cut, lost functional freeze,
     // invalid command, snapshot fault, unexpected borrow. Sticky until reset.
     output reg [5:0] error,
@@ -67,7 +69,22 @@ module CheckpointNativeStateCapture #(
         (active && physical_failed) || (cut_required && !physical_ready),
         (active || capture_request) && !safe_owners
     };
-    assign failed = |error || |faults || phase == FAULT;
+    // READ is the timing-critical transport permission path. Expand the
+    // snapshot's fault predicate at this boundary rather than routing physical
+    // readiness through snapshot.valid -> read_safe -> faults -> failed. The
+    // exact whole-owner layout gives us its registered occupied/error/label
+    // fields; no permission or diagnostic is registered or delayed here.
+    // Outside READ retain the complete command/sampling/release checks below.
+    wire snapshot_occupied = staging_state[BITS];
+    wire [63:0] snapshot_cycle = staging_state[BITS+64:BITS+1];
+    wire [5:0] snapshot_sticky_error = staging_state[BITS+70:BITS+65];
+    wire read_integrity_fault = |error || |snapshot_sticky_error ||
+        physical_failed || !physical_ready || !frozen || !safe_owners ||
+        capture_request || (snapshot_occupied && target_cycle != snapshot_cycle);
+    wire read_command_fault = borrow_attempt &&
+        (!snapshot_occupied || reset || release_request);
+    assign failed = phase == READ ? read_integrity_fault || read_command_fault :
+        |error || |faults || phase == FAULT;
     // Independent of capture_request: command-pulse producers may qualify
     // their request with ready. Missing owners must not create ready/request
     // feedback through the attempted-command fault qualification.
@@ -79,8 +96,9 @@ module CheckpointNativeStateCapture #(
     // An unauthorized attempted borrow already has read_safe=0. Do not feed
     // its fault back into its own grant; endpoints may report an actual
     // accepted request combinationally from borrow_enable and ready.
-    assign valid = read_safe && !faults[3];
-    assign borrow_enable = valid && snapshot_borrow;
+    assign valid = phase == READ && snapshot_occupied && !read_integrity_fault &&
+        !reset && !release_request;
+    assign borrow_enable = valid;
     assign word_error = !valid || snapshot_word_error;
     assign word_data = word_error ? 64'b0 : snapshot_word;
     assign control_state = {error, phase, physical_state, staging_state};
