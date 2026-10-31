@@ -76,7 +76,10 @@ class FAMEClockProgressSpec extends AnyFlatSpec {
   private def emit(s: CircuitState): (CircuitState, String) = {
     val e = new SemanticCleanEmitter
     val lowered = new Compiler(Forms.LowForm).execute(s.copy(form = HighForm,
-      annotations = s.annotations.collect { case a: DontTouchAnnotation => a }))
+      annotations = s.annotations.filter {
+        case _: DontTouchAnnotation | _: FAMEClockProgressSignalAnnotation | _: FAMEClockProgressModelAnnotation => true
+        case _ => false
+      }))
     val result = new Compiler(Seq(firrtl.options.Dependency.fromTransform(e)), Forms.LowForm, Set(e)).execute(
       lowered.copy(annotations = lowered.annotations :+
         EmitCircuitAnnotation(e.getClass)))
@@ -127,15 +130,22 @@ class FAMEClockProgressSpec extends AnyFlatSpec {
     assert(body.contains("checkpoint_fame_clockA_launch <= and(and(clockA_enabled, targetCycleFinishing), not(hostReset))"))
     assert(body.contains("checkpoint_fame_clockA_consume <= and(and(targetCycleFinishing, not(hostReset)), asUInt(clocks_sink.bits.A))"))
     assert(observed.annotations.collect { case a: DontTouchAnnotation if a.target.ref.startsWith(FAMEClockProgress.prefix) => a }.size == 12)
+    assert(FAMEClockProgressBindings.resolve(observed).size == 21)
     val (actual, rtl) = emit(observed); val (_, originalRTL) = emit(reference)
     val inventory = SimulatorStateInventory.discover(actual)
     assert(inventory.contains("checkpoint_fame_clockA_applied"))
     assert(inventory.contains("checkpoint_fame_clockB_consumed"))
+    FAMEClockProgressBindings.validatePreserved(observed, actual)
+    val binding = FAMEClockProgressBindings.emit(actual, rtl, inventory).head.body
     sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { base =>
       val out = Paths.get(base).resolve("fame-progress"); Files.createDirectories(out)
       Seq("reference.fir" -> reference.circuit.serialize, "observed.fir" -> observed.circuit.serialize,
         "observed.sv" -> rtl, "reference.sv" -> originalRTL, "probed.sv" -> emit(probes(observed))._2,
-        "state.json" -> inventory).foreach {
+        "state.json" -> inventory, "progress-binding.json" -> binding, "emission-reference.fir" -> actual.circuit.serialize,
+        "progress-annotations.json" -> JsonProtocol.serialize(actual.annotations.collect {
+          case a: FAMEClockProgressSignalAnnotation => a
+          case a: FAMEClockProgressModelAnnotation => a
+        })).foreach {
         case (name, text) => Files.write(out.resolve(name), text.getBytes(UTF_8))
       }
     }
@@ -153,12 +163,118 @@ class FAMEClockProgressSpec extends AnyFlatSpec {
   it should "reject unresolved domains and reserved names rather than hiding observer state" in {
     val s = seed(); val m = s.circuit.modules.collectFirst { case m: Module if m.name == "Model" => m }.get
     val clock = WRef("hostClock", ClockType); val bit = WRef("flag", UIntType(IntWidth(1)))
-    val domain = FAMEClockProgress.Domain("clockA", bit, bit, bit)
+    val domain = FAMEClockProgress.Domain("clockA", bit, bit, bit, "gate")
     def instrument(module: Module = m, ds: Seq[FAMEClockProgress.Domain] = Seq(domain)) =
       FAMEClockProgress.instrument("Top", module, clock, bit, bit, ds)
     for (ds <- Seq(Nil, Seq(domain, domain), Seq(domain.copy(incoming = clock)), Seq(domain.copy(name = "a.b"))))
       intercept[IllegalArgumentException](instrument(ds = ds))
     intercept[IllegalArgumentException](instrument(m.copy(ports = m.ports :+ Port(NoInfo, "checkpoint_fame_external", Input, bit.tpe))))
     intercept[IllegalArgumentException](instrument(m.copy(body = Block(Seq(m.body, DefWire(NoInfo, "checkpoint_fame_hidden", bit.tpe))))))
+  }
+  it should "follow actual native inlining and emitter renames without guessing role names" in {
+    val original = transform(true)
+    val low = new Compiler(Forms.LowForm).execute(original.copy(form = HighForm))
+    val inline = new Compiler(Seq(firrtl.options.Dependency[firrtl.passes.InlineInstances]), Forms.LowForm).execute(
+      low.copy(annotations = low.annotations :+
+        firrtl.passes.InlineAnnotation(ModuleName("Model", CircuitName("Top")))))
+    FAMEClockProgressBindings.validatePreserved(original, inline)
+    val (actual, rtl) = emit(inline)
+    FAMEClockProgressBindings.validatePreserved(original, actual)
+    val rows = FAMEClockProgressBindings.resolve(actual)
+    assert(rows.size == 21)
+    assert(actual.annotations.collect { case a: FAMEClockProgressSignalAnnotation => a.target.module }.toSet == Set("Top"))
+    val binding = FAMEClockProgressBindings.emit(actual, rtl, SimulatorStateInventory.discover(actual)).head.body
+    assert(binding.contains("Top.model__checkpoint_fame_clockA_applied"))
+    val roundtrip = JsonProtocol.deserialize(JsonProtocol.serialize(actual.annotations.collect {
+      case a: FAMEClockProgressSignalAnnotation => a
+      case a: FAMEClockProgressModelAnnotation => a
+    }))
+    assert(roundtrip.size == 22)
+    assert(FAMEClockProgressBindings.resolve(actual.copy(annotations = roundtrip)) == rows)
+  }
+  it should "reject missing duplicate unknown and aliased roles before final emission" in {
+    val state = transform(true)
+    val signals = state.annotations.collect { case a: FAMEClockProgressSignalAnnotation => a }
+    val first = signals.head
+    val bad = Seq(
+      state.annotations.filterNot(_ == first), state.annotations :+ first,
+      state.annotations.filterNot(_.isInstanceOf[FAMEClockProgressModelAnnotation]),
+      state.annotations.map { case a: FAMEClockProgressSignalAnnotation if a == first => a.copy(role = "unknown"); case a => a },
+      state.annotations.map { case a: FAMEClockProgressSignalAnnotation if a == first => a.copy(target = signals(1).target); case a => a })
+    bad.foreach(as => intercept[IllegalArgumentException](FAMEClockProgressBindings.resolve(state.copy(annotations = as))))
+    bad.take(4).foreach(as => intercept[IllegalArgumentException](FAMEClockProgressBindings.validatePreserved(state, state.copy(annotations = as))))
+    val wrongModel = state.annotations.map {
+      case a: FAMEClockProgressModelAnnotation => a.copy(domains = a.domains :+ "fakeClock")
+      case a => a
+    }
+    intercept[IllegalArgumentException](FAMEClockProgressBindings.resolve(state.copy(annotations = wrongModel)))
+  }
+  it should "bind the actual production emitter and reject host passes that erase the entire role set" in {
+    val observed = transform(true)
+    val low = new Compiler(Forms.LowForm).execute(observed.copy(form = HighForm))
+    val output = midas.stage.FAMEClockProgressPipelineFixture.compile(low)
+    val binding = output.collectFirst {
+      case midas.stage.GoldenGateOutputFileAnnotation(body, ".fame-clock-progress.json") => body
+    }.get
+    val rtl = output.collectFirst { case firrtl.EmittedVerilogCircuitAnnotation(v) => v.value }.get
+    assert(binding.contains(SemanticStateInventory.sha256(rtl)))
+    assert(binding.contains("\"global_target_cut_proven\":false"))
+    val error = intercept[IllegalArgumentException](midas.stage.FAMEClockProgressPipelineFixture.eraseRoles(low))
+    assert(error.getMessage.contains("construction-site identities lost or duplicated"))
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { base =>
+      val out = Paths.get(base).resolve("fame-progress"); Files.createDirectories(out)
+      Files.write(out.resolve("production-binding.json"), binding.getBytes(UTF_8))
+      Files.write(out.resolve("production.sv"), rtl.getBytes(UTF_8))
+    }
+  }
+  it should "reject coherent gate swaps and pending or register clock corruption" in {
+    val state = transform(true)
+    val signals = state.annotations.collect { case a: FAMEClockProgressSignalAnnotation => a }
+    def change(role: String): CircuitState = state.copy(annotations = state.annotations.map {
+      case a: FAMEClockProgressSignalAnnotation if a.domain == "clockA" && a.role == role =>
+        a.copy(target = signals.find(b => b.domain == "clockB" && b.role == role).get.target)
+      case a => a
+    })
+    for (role <- Seq("gate_ce", "gate_output", "pending_flag", "applied"))
+      intercept[IllegalArgumentException](FAMEClockProgressBindings.resolve(change(role)))
+    val swapped = state.copy(annotations = state.annotations.map {
+      case a: FAMEClockProgressSignalAnnotation if a.domain.nonEmpty && Set("gate_ce", "gate_output")(a.role) =>
+        a.copy(target = signals.find(b => b.domain != a.domain && b.role == a.role).get.target)
+      case a => a
+    })
+    intercept[IllegalArgumentException](FAMEClockProgressBindings.resolve(swapped))
+    def corruptStatement(s: Statement): Statement = s match {
+      case r: DefRegister if r.name == "checkpoint_fame_clockA_applied" => r.copy(clock = firrtl.WRef("clockA_enabled", ClockType))
+      case x => x.mapStmt(corruptStatement)
+    }
+    val corrupt = state.copy(circuit = state.circuit.copy(modules = state.circuit.modules.map {
+      case m: Module if m.name == "Model" => m.copy(body = corruptStatement(m.body))
+      case m => m
+    }))
+    intercept[IllegalArgumentException](FAMEClockProgressBindings.resolve(corrupt))
+  }
+  it should "reject foreign missing reshaped and replicated execution targets" in {
+    val state = transform(true)
+    val first = state.annotations.collectFirst { case a: FAMEClockProgressSignalAnnotation => a }.get
+    for (target <- Seq(first.target.copy(circuit = "Other"), first.target.copy(ref = "missing"),
+        first.target.field("unknown"), first.target.copy(module = "missing"))) {
+      val bad = state.copy(annotations = state.annotations.map {
+        case a: FAMEClockProgressSignalAnnotation if a == first => a.copy(target = target)
+        case a => a
+      })
+      intercept[IllegalArgumentException](FAMEClockProgressBindings.resolve(bad))
+    }
+    val replicated = state.copy(circuit = state.circuit.copy(modules = state.circuit.modules.map {
+      case m: Module if m.name == "Top" => m.copy(body = Block(Seq(m.body, WDefInstance("replica", "Model"))))
+      case m => m
+    }))
+    intercept[IllegalArgumentException](FAMEClockProgressBindings.resolve(replicated))
+    val gate = state.annotations.collectFirst {
+      case a: FAMEClockProgressSignalAnnotation if a.role == "gate_ce" => a
+    }.get
+    val forged = gate.copy(target = gate.target.copy(path = gate.target.path.updated(gate.target.path.size - 1,
+      gate.target.path.last._1 -> TargetToken.OfModule("UnrelatedGate"))))
+    intercept[IllegalArgumentException](FAMEClockProgressBindings.resolve(state.copy(annotations =
+      state.annotations.map { case a if a == gate => forged; case a => a })))
   }
 }

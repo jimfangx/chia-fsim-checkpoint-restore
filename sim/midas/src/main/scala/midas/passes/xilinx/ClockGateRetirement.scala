@@ -88,7 +88,39 @@ object ClockGateRetirement {
     check(source.target.circuit.name == state.circuit.main &&
       source.name == "AbstractClockGate.v" && source.text == DefineAbstractClockGate.impl &&
       sha256(source.text) == knownSourceSHA256, "unknown abstract-gate inline source")
-    val kept = state.annotations.filterNot(_ == source)
+    val gateRenames = RenameMap()
+    defs.foreach(m => gateRenames.record(ModuleTarget(state.circuit.main, m.name),
+      ModuleTarget(state.circuit.main, DefineBUFGCE.blackboxName)))
+    lazy val executionCounts = midas.checkpoint.GeneratedExternalOwners.instances(state, state.circuit.main)
+      .groupBy(_._2.name).map { case (name, executions) => name -> executions.size }
+    val kept = state.annotations.filterNot(_ == source).flatMap {
+      // Exact construction-site gate port roles are the only new consumers of
+      // the retiring definition. Apply the native rename at this real rewrite;
+      // arbitrary references and all other annotations still fail below.
+      case a: midas.checkpoint.FAMEClockProgressSignalAnnotation if refers(a, retired) =>
+        val t = a.target
+        check(Set("gate_ce", "gate_output")(a.role) && t.circuit == state.circuit.main &&
+          t.component.isEmpty && t.path.nonEmpty &&
+          retired(t.path.last._2.value) && t.ref == (if (a.role == "gate_ce") "CE" else "O"),
+          "invalid FAME native gate port role: " + t.serialize)
+        // SimulationMapping changes the circuit name while retaining the
+        // inner root as a concrete module inside the outer platform. A native
+        // target may remain rooted there; reject ambiguity, not that valid
+        // root. Never broaden a local role across repeated module executions.
+        check(executionCounts.getOrElse(t.module, 0) == 1,
+          "FAME gate role requires one concrete reachable parent")
+        var parent = t.module
+        val concrete = declarations(state.circuit)
+        t.path.foreach { case (instance, module) =>
+          check(concrete.count { case (p, i) => p == parent && i.name == instance.value && i.module == module.value } == 1,
+            "FAME native gate role path mismatch")
+          parent = module.value
+        }
+        val updated = a.update(gateRenames)
+        check(updated.size == 1 && !updated.exists(x => refers(x, retired)), "FAME gate role rename lost or replicated")
+        updated
+      case a => Seq(a)
+    }
     check(!kept.exists(a => refers(a, retired)), "annotation references retiring definition")
     val rows = declarations(state.circuit).collect { case (parent, i) if retired(i.module) =>
       RetiredClockGateInstance(parent, i.name, i.module, DefineBUFGCE.blackboxName)

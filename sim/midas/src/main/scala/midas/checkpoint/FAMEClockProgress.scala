@@ -27,7 +27,8 @@ case object FAMEClockProgressAnnotation extends NoTargetAnnotation with Unserial
   */
 object FAMEClockProgress {
   val prefix = "checkpoint_fame_"
-  case class Domain(name: String, incoming: Expression, pending: Expression, launch: Expression)
+  case class Domain(name: String, incoming: Expression, pending: Expression, launch: Expression,
+      gateInstance: String)
   private def fail(why: String): Nothing =
     throw new IllegalArgumentException("FAME clock progress unsupported: " + why)
 
@@ -44,6 +45,7 @@ object FAMEClockProgress {
     val bit = UIntType(IntWidth(1)); val word = UIntType(IntWidth(64))
     if (hostClock.tpe != ClockType || hostReset.tpe != bit || finishing.tpe != bit || domains.isEmpty ||
         domains.exists(d => !d.name.matches("[A-Za-z_][A-Za-z0-9_$]*") ||
+          !d.gateInstance.matches("[A-Za-z_][A-Za-z0-9_$]*") ||
           Seq(d.incoming, d.pending, d.launch).exists(_.tpe != bit)) ||
         domains.map(_.name).distinct.size != domains.size)
       fail("resolved host clock/reset, completion and distinct one-bit clock domains required")
@@ -98,6 +100,28 @@ object FAMEClockProgress {
     connects += Connect(NoInfo, WRef(overflow), op(firrtl.PrimOps.Or, WRef(overflow), anyOverflow))
     val observed = module.copy(body = Block(decls.toSeq ++ Seq(module.body) ++ connects.toSeq))
     val target = ModuleTarget(circuit, module.name)
-    (observed, kept.map(n => DontTouchAnnotation(target.ref(n))).toSeq)
+    val identity = target.serialize // historical identity; only ReferenceTargets are renamed
+    val bindings = scala.collection.mutable.ArrayBuffer.empty[FAMEClockProgressSignalAnnotation]
+    def bind(domain: String, role: String, ref: firrtl.annotations.ReferenceTarget): Unit =
+      bindings += FAMEClockProgressSignalAnnotation(identity, domain, role, ref)
+    def original(expr: Expression): firrtl.annotations.ReferenceTarget = expr match {
+      case r: firrtl.WRef => target.ref(r.name)
+      case _ => fail("host clock/reset, completion and pending roles require exact local references")
+    }
+    bind("", "host_clock", original(hostClock)); bind("", "host_reset", original(hostReset))
+    bind("", "finishing", original(finishing))
+    bind("", "completed_steps", target.ref(prefix + "completed_steps"))
+    bind("", "overflow", target.ref(overflowName))
+    domains.foreach { d =>
+      Seq("consume", "launch", "pending", "consumed", "applied").foreach { role =>
+        bind(d.name, role, target.ref(prefix + d.name + "_" + role))
+      }
+      bind(d.name, "pending_flag", original(d.pending))
+      bind(d.name, "gate_ce", target.ref(d.gateInstance).field("CE"))
+      bind(d.name, "gate_output", target.ref(d.gateInstance).field("O"))
+    }
+    val preserved = (kept.map(target.ref) ++ bindings.map(_.target).filter(_.component.isEmpty)).distinct
+    (observed, preserved.map(DontTouchAnnotation(_)).toSeq ++ bindings.toSeq :+
+      FAMEClockProgressModelAnnotation(identity, domains.map(_.name)))
   }
 }

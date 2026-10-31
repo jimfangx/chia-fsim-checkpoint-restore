@@ -187,6 +187,7 @@ object FAMEModuleTransformer {
       inputChannelEnable:  Expression,
       clockBuffer:         SignalInfo,
       launchEnable:        Expression,
+      gateInstance:        String,
     )
 
     // Multi-clock management step 4: Generate clock buffers for all target clocks
@@ -248,6 +249,7 @@ object FAMEModuleTransformer {
           clockChannel.replacePortRef(WRef(en)),
           SignalInfo(Block(Seq(enableReg, buf)), connects, WSubField(WRef(buf), "O", ClockType, SourceFlow)),
           launchEnable,
+          buf.name,
         )
       }
 
@@ -380,7 +382,8 @@ object FAMEModuleTransformer {
       val (observed, annotations) = midas.checkpoint.FAMEClockProgress.instrument(
         analysis.circuit.main, transformed, WRef(hostClock), WRef(hostReset), WRef(finishing), clockMetadata.map { c =>
           midas.checkpoint.FAMEClockProgress.Domain(c.targetSourcePort.name,
-            DoPrim(PrimOps.AsUInt, Seq(c.inputChannelEnable), Nil, BoolType), c.outputChannelEnable, c.launchEnable)
+            DoPrim(PrimOps.AsUInt, Seq(c.inputChannelEnable), Nil, BoolType), c.outputChannelEnable, c.launchEnable,
+            c.gateInstance)
         })
       addedAnnos ++= annotations
       observed
@@ -539,6 +542,7 @@ class FAMETransform extends Transform {
     }
 
     val newCircuit = c.copy(modules = transformedModules)
-    CircuitState(newCircuit, outputForm, filteredAnnos ++ addedAnnos, Some(hostDecouplingRenames(analysis)))
+    midas.checkpoint.FAMEClockProgressBindings.rootAtConstruction(
+      CircuitState(newCircuit, outputForm, filteredAnnos ++ addedAnnos, Some(hostDecouplingRenames(analysis))))
   }
 }

@@ -122,6 +122,7 @@ class GoldenGateCompilerPhase extends Phase {
     midas.checkpoint.SimulatorFPGASynthesisConstants.validateRequest(simulator)
     midas.checkpoint.PhysicalClockCutPlan.validateRequest(simulator)
     midas.checkpoint.NativeCheckpointRegionCompilerProbe.validateCardinality(simulator.annotations)
+    midas.checkpoint.FAMEClockProgressBindings.resolve(simulator)
     // Note: the final lowering to Verilog is broken up into multiple firrtl.Compiler steps
     // to avoid breakages that can emerge from "legal" but unsound pass orderings
     // due to underspecified pass constraints + invalidations
@@ -203,6 +204,9 @@ class GoldenGateCompilerPhase extends Phase {
       val manifest = files.collectFirst {
         case GoldenGateOutputFileAnnotation(body, ".simulator-state.json") => body
       }.get
+      midas.checkpoint.FAMEClockProgressBindings.validatePreserved(simulator, emissionIR)
+      val fameClockFiles = midas.checkpoint.FAMEClockProgressBindings.emit(
+        emissionIR, emitted.getEmittedCircuit.value, manifest)
       val externalOwners = files.collectFirst {
         case GoldenGateOutputFileAnnotation(body, ".simulator-external-owners.json") => body
       }.get
@@ -219,7 +223,7 @@ class GoldenGateCompilerPhase extends Phase {
         "emitted_verilog_sha256" -> JString(sha256(emitted.getEmittedCircuit.value)))))
       val physicalClockFiles = midas.checkpoint.PhysicalClockCutPlan.emit(
         emissionIR, manifest, emitted.getEmittedCircuit.value)
-      emitted.annotations ++ files ++ semanticMapFiles ++ bankProbeFiles ++ fpgaConstantFiles ++ emitterPolicyFiles ++ physicalClockFiles :+
+      emitted.annotations ++ files ++ semanticMapFiles ++ bankProbeFiles ++ fpgaConstantFiles ++ emitterPolicyFiles ++ physicalClockFiles ++ fameClockFiles :+
         GoldenGateOutputFileAnnotation(binding, ".simulator-emission.json")
     } else emitted.annotations ++ semanticMapFiles ++ bankProbeFiles ++ fpgaConstantFiles ++ emitterPolicyFiles
   }

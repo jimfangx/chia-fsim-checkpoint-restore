@@ -64,6 +64,33 @@ class ClockGateRetirementSpec extends AnyFlatSpec {
   import ClockGateRetirementTestFixture._
   behavior.of("Actual Xilinx abstract clock-gate retirement")
 
+  it should "rename only exact concrete FAME gate port roles at the native replacement" in {
+    import midas.checkpoint.FAMEClockProgressSignalAnnotation
+    val gate = ModuleTarget("GateTop", "GateTop").instOf("child", "Child").instOf("gate", "AbstractClockGate_0")
+    val ce = FAMEClockProgressSignalAnnotation("historical-model", "clock", "gate_ce", gate.ref("CE"))
+    val out = ce.copy(role = "gate_output", target = gate.ref("O"))
+    val actual = ReplaceAbstractClockGates.execute(input.copy(annotations = input.annotations ++ Seq(ce, out)))
+    val roles = actual.annotations.collect { case a: FAMEClockProgressSignalAnnotation => a }
+    assert(roles.size == 2)
+    assert(roles.map(_.target.path.last._2.value).toSet == Set("BUFGCE"))
+    assert(roles.map(_.target.ref).toSet == Set("CE", "O"))
+    val inner = ce.copy(target = ModuleTarget("GateTop", "Child").instOf("gate", "AbstractClockGate_0").ref("CE"))
+    val linked = ReplaceAbstractClockGates.execute(input.copy(annotations = input.annotations :+ inner))
+    assert(linked.annotations.collect { case a: FAMEClockProgressSignalAnnotation => a.target }.head ==
+      ModuleTarget("GateTop", "Child").instOf("gate", "BUFGCE").ref("CE"))
+    val repeated = input.copy(circuit = input.circuit.copy(modules = input.circuit.modules.map {
+      case m: Module if m.name == "GateTop" => m.copy(body = Block(Seq(m.body, WDefInstance("other", "Child"))))
+      case m => m
+    }), annotations = input.annotations :+ inner)
+    intercept[IllegalArgumentException](ReplaceAbstractClockGates.execute(repeated))
+    for (bad <- Seq(ce.copy(role = "pending"), ce.copy(target = gate.ref("I")),
+        ce.copy(target = gate.ref("CE").field("fake")),
+        ce.copy(target = gate.ref("CE").copy(path = gate.ref("CE").path.updated(0,
+          TargetToken.Instance("missing") -> TargetToken.OfModule("Child")))))) {
+      intercept[IllegalArgumentException](ReplaceAbstractClockGates.execute(input.copy(annotations = input.annotations :+ bad)))
+    }
+  }
+
   it should "rewrite every global declaration before retiring exact unused source and definitions" in {
     assert(result.circuit.modules.map(_.name) == Seq("GateTop", "Child", "Unreachable", "BUFGCE"))
     assert(!result.annotations.contains(source))
