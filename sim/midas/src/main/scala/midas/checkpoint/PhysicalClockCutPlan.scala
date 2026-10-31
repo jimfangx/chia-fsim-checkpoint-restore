@@ -29,6 +29,7 @@ object PhysicalClockCutPlan {
 
   def validateCardinality(annotations: firrtl.AnnotationSeq): Unit = {
     PhysicalClockCutWiring.validateRequest(annotations)
+    SynchronousResetCutWiring.validateRequest(annotations)
     val n = annotations.count(_ == PhysicalClockCutPlanAnnotation)
     if (n == 0) return
     if (n != 1) fail("exactly one clock-plan request is required")
