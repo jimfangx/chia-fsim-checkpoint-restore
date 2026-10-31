@@ -122,7 +122,15 @@ module CheckpointNativeCaptureTransport #(
     assign request_ready = snapshot_selected ? !snapshot_response_valid && native_valid :
         control_selected ? control_request_ready : bank_request_ready && native_borrow;
     assign response_valid = snapshot_selected ? snapshot_response_valid : control_selected ? control_response_valid : bank_response_valid;
-    assign response_data = snapshot_selected ? snapshot_response_data : control_selected ? control_response_data : bank_response_data;
+    // The internal transport samples data only on response_valid/ready. Use
+    // the bank's original saved-data register directly so the falling-edge
+    // physical permission does not also traverse a 64-bit zeroing mux and
+    // the transport's variable-width canonical-data check in half a cycle.
+    // On every accepting edge this equals control_response_data. The bank's
+    // own public data output still zeros immediately when permission is lost;
+    // response_valid and every downstream acceptance remain fail-closed.
+    assign response_data = snapshot_selected ? snapshot_response_data :
+        control_selected ? native_control_bank_state[63:0] : bank_response_data;
     assign response_error = snapshot_selected ? snapshot_response_error : control_selected ? control_response_error : bank_response_error;
     assign control_state = {snapshot_response_error, snapshot_response_data,
         snapshot_response_valid, transport_control_state, native_control_state};

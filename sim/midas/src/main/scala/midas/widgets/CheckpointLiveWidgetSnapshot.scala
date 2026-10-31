@@ -98,12 +98,18 @@ class CheckpointLiveWidgetSnapshot(val bits: Int, restoreEnabled: Boolean = fals
   val capture = command && io.write && io.data === 1.U
   val release = command && io.write && io.data === 2.U
   val abort = command && io.write && io.data === 4.U
+  // Qualify each state update directly. The error response also decodes every
+  // read address; routing that mux back into the wide bank's clock enable adds
+  // unrelated logic to the physical stop's half-cycle acceptance path.
+  val captureAllowed = capture && !occupied && io.cutValid
+  val releaseAllowed = release && occupied || abort
+  val selectAllowed = select && io.write && io.data < words.U
   // Bound the dynamic shift before constructing its hardware: an unbounded
   // 32-bit index would infer a very large barrel shifter and could wrap.
   val offset = Cat(index(log2Ceil(words max 2) - 1, 0), 0.U(6.W))
   val word = (saved.pad(words * 64) >> offset)(63, 0)
   io.error := reset.asBool || Mux(io.write,
-    Mux(command, !(capture && !occupied && io.cutValid || release && occupied || abort),
+    Mux(command, !(captureAllowed || releaseAllowed),
       !select || io.data >= words.U),
     !(select || status || count || version || bitCount || (lo || hi || cycleLo || cycleHi) && visible))
   io.response := MuxCase(0.U, Seq(select -> index, status -> visible.asUInt,
@@ -111,10 +117,10 @@ class CheckpointLiveWidgetSnapshot(val bits: Int, restoreEnabled: Boolean = fals
     (lo && visible) -> word(31, 0), (hi && visible) -> word(63, 32),
     (cycleLo && visible) -> label(31, 0), (cycleHi && visible) -> label(63, 32)))
   val running = io.restore.map(r => !r.hold && !r.load).getOrElse(true.B)
-  when(running && io.access && !io.error && io.write) {
-    when(capture) { saved := io.live; label := io.cycle; occupied := true.B; index := 0.U }
-    when(release || abort) { occupied := false.B }
-    when(select) { index := io.data }
+  when(running && io.access && !reset.asBool) {
+    when(captureAllowed) { saved := io.live; label := io.cycle; occupied := true.B; index := 0.U }
+    when(releaseAllowed) { occupied := false.B }
+    when(selectAllowed) { index := io.data }
   }
   io.restore.foreach { r =>
     r.current := Cat(index, label, saved, occupied)
