@@ -20,6 +20,7 @@ trait GoldenGateCli { this: Shell =>
     midas.checkpoint.SemanticMultiClockInventoryAnnotation,
     midas.checkpoint.SemanticFAMEStateMapAnnotation,
     midas.checkpoint.SimulatorCheckpointInventoryAnnotation,
+    midas.checkpoint.FAMEClockProgressAnnotation,
     midas.checkpoint.SimulatorBankProbeAnnotation,
     midas.checkpoint.SimulatorFPGASynthesisConstantsAnnotation,
     midas.checkpoint.PhysicalClockCutPlanAnnotation,

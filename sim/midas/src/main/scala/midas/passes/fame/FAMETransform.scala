@@ -121,7 +121,8 @@ case class FAME1OutputChannel(
 // - Use to initialize isFired for all channels (with negation)
 // - Finishing is gated with clock channel valid
 object FAMEModuleTransformer {
-  def apply(m: Module, analysis: FAMEChannelAnalysis, addedAnnos: mutable.ArrayBuffer[Annotation]): Module = {
+  def apply(m: Module, analysis: FAMEChannelAnalysis, addedAnnos: mutable.ArrayBuffer[Annotation],
+      observeClockProgress: Boolean = false): Module = {
     // Step 0: Bookkeeping for port structure conventions
     implicit val ns       = Namespace(m)
     val mTarget           = ModuleTarget(analysis.circuit.main, m.name)
@@ -185,6 +186,7 @@ object FAMEModuleTransformer {
       outputChannelEnable: Expression,
       inputChannelEnable:  Expression,
       clockBuffer:         SignalInfo,
+      launchEnable:        Expression,
     )
 
     // Multi-clock management step 4: Generate clock buffers for all target clocks
@@ -193,11 +195,12 @@ object FAMEModuleTransformer {
         val enableReg      = hostFlagReg(s"${en.name}_enabled")
         val buf            = WDefInstance(ns.newName(s"${en.name}_buffer"), DefineAbstractClockGate.blackbox.name)
         val clockFlag      = DoPrim(PrimOps.AsUInt, Seq(clockChannel.replacePortRef(WRef(en))), Nil, BoolType)
+        val launchEnable   = And.reduce(Seq(WRef(enableReg), WRef(finishing), nReset))
         val connects       = Block(
           Seq(
             Connect(NoInfo, WRef(enableReg), Mux(WRef(finishing), clockFlag, WRef(enableReg), BoolType)),
             Connect(NoInfo, WSubField(WRef(buf), "I"), WRef(hostClock)),
-            Connect(NoInfo, WSubField(WRef(buf), "CE"), And.reduce(Seq(WRef(enableReg), WRef(finishing), nReset))),
+            Connect(NoInfo, WSubField(WRef(buf), "CE"), launchEnable),
           )
         )
         // Add multicycle annotations
@@ -244,6 +247,7 @@ object FAMEModuleTransformer {
           WRef(enableReg),
           clockChannel.replacePortRef(WRef(en)),
           SignalInfo(Block(Seq(enableReg, buf)), connects, WSubField(WRef(buf), "O", ClockType, SourceFlow)),
+          launchEnable,
         )
       }
 
@@ -371,7 +375,16 @@ object FAMEModuleTransformer {
     val decls   =
       finishing +: unusedOutputsAsWires ++: targetClockBufs.map(_.decl) ++: (inChannels ++ outChannels).map(_.firedReg)
     val assigns = targetClockBufs.map(_.assigns) ++ channelStateRules ++ inputRules ++ outputRules ++ topRules
-    Module(m.info, m.name, transformedPorts, Block(decls ++: updatedBody +: assigns))
+    val transformed = Module(m.info, m.name, transformedPorts, Block(decls ++: updatedBody +: assigns))
+    if (!observeClockProgress) transformed else {
+      val (observed, annotations) = midas.checkpoint.FAMEClockProgress.instrument(
+        analysis.circuit.main, transformed, WRef(hostClock), WRef(hostReset), WRef(finishing), clockMetadata.map { c =>
+          midas.checkpoint.FAMEClockProgress.Domain(c.targetSourcePort.name,
+            DoPrim(PrimOps.AsUInt, Seq(c.inputChannelEnable), Nil, BoolType), c.outputChannelEnable, c.launchEnable)
+        })
+      addedAnnos ++= annotations
+      observed
+    }
   }
 }
 
@@ -501,8 +514,11 @@ class FAMETransform extends Transform {
   }
 
   override def execute(state: CircuitState): CircuitState = {
+    val observeClockProgress = midas.checkpoint.FAMEClockProgress.requested(state)
     val c                    = state.circuit
     val analysis             = new FAMEChannelAnalysis(state)
+    require(!observeClockProgress || analysis.transformedModules.nonEmpty,
+      "FAME clock progress unsupported: no transformed models")
     // TODO: pick a value that does not collide
     implicit val triggerName = "finishing"
 
@@ -512,11 +528,12 @@ class FAMETransform extends Transform {
     val transformedModules = c.modules.map {
       case m: Module if (m.name == c.main)                                   => transformTop(m, analysis)
       case m: Module if (toTransform.contains(ModuleTarget(c.main, m.name))) =>
-        FAMEModuleTransformer(m, analysis, addedAnnos)
+        FAMEModuleTransformer(m, analysis, addedAnnos, observeClockProgress)
       case m                                                                 => m // TODO (Albert): revisit this; currently, not transforming nested modules
     }
 
     val filteredAnnos = state.annotations.filter {
+      case midas.checkpoint.FAMEClockProgressAnnotation                     => false // consumed at the actual FAME rules
       case DontTouchAnnotation(rt) if toTransform.contains(rt.moduleTarget) => false
       case _                                                                => true
     }
