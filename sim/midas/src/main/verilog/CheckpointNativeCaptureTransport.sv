@@ -9,7 +9,13 @@ module CheckpointNativeCaptureTransport #(
     parameter integer ENTRIES = 1,
     parameter integer EXTERNAL_CLOCK_NETWORK = 0,
     parameter [7:0] SNAPSHOT_BANK = 8'hfc,
-    parameter [255:0] MANIFEST_SHA256 = 256'b0
+    parameter [255:0] MANIFEST_SHA256 = 256'b0,
+    // Explicit ABI opt-in: append one descriptor for the COMPLETE stable
+    // native owner (staging, physical cut and sequencer), not only payload.
+    // The exact manifest must include this bank. Its own 67 live readout bits
+    // below remain separately owned; this is not transport self-checkpointing.
+    parameter integer CAPTURE_NATIVE_CONTROL = 0,
+    parameter [7:0] NATIVE_CONTROL_BANK = 8'hfb
 ) (
     input wire clock, reset,
     input wire [GATES-1:0] ce,
@@ -56,11 +62,15 @@ module CheckpointNativeCaptureTransport #(
     output wire dma_last, dma_abort,
     // Every new register, including the response holding register. This is a
     // live control vector, not an atomic self-snapshot or a restore ABI.
-    output wire [BITS+GATES+626:0] control_state
+    output wire [BITS+GATES+626:0] control_state,
+    output wire [66:0] native_control_bank_state
 );
     localparam integer FULL_WORDS = BITS / 64;
     localparam integer TAIL_BITS = BITS % 64;
     localparam integer SNAPSHOT_ENTRIES = (FULL_WORDS != 0) + (TAIL_BITS != 0);
+    localparam integer NATIVE_CONTROL_BITS = BITS + GATES + 150;
+    localparam integer NATIVE_CONTROL_WORDS = (NATIVE_CONTROL_BITS + 63) / 64;
+    localparam integer CONTROL_ENTRIES = CAPTURE_NATIVE_CONTROL != 0;
     wire transport_freeze, native_hold, native_ready, native_borrow;
     wire [2:0] native_phase;
     wire [5:0] native_error;
@@ -88,6 +98,9 @@ module CheckpointNativeCaptureTransport #(
     wire [63:0] response_data;
     wire response_error;
     wire snapshot_selected = bank == SNAPSHOT_BANK;
+    wire control_selected = CONTROL_ENTRIES != 0 && bank == NATIVE_CONTROL_BANK;
+    wire control_request_ready, control_response_valid, control_response_error, control_bank_failed;
+    wire [63:0] control_response_data;
     reg snapshot_response_valid;
     reg [63:0] snapshot_response_data;
     reg snapshot_response_error;
@@ -101,18 +114,35 @@ module CheckpointNativeCaptureTransport #(
     // REQUEST is its literal source encoding 4 (FSM recoding is disabled).
     // Do not qualify intent with bank_request_ready either: real generated
     // endpoints may themselves qualify readiness with native read permission.
-    wire borrow_intent = transport_control_state[3:0] == 4 && !snapshot_selected;
+    wire borrow_intent = transport_control_state[3:0] == 4 && !snapshot_selected && !control_selected;
     wire snapshot_selector_valid = (slot == 0 && FULL_WORDS != 0 && address < FULL_WORDS) ||
         (slot == 1 && TAIL_BITS != 0 && address == 0);
-    assign bank_request_valid = request_valid && !snapshot_selected && native_borrow;
-    assign bank_response_ready = response_ready && !snapshot_selected;
+    assign bank_request_valid = request_valid && !snapshot_selected && !control_selected && native_borrow;
+    assign bank_response_ready = response_ready && !snapshot_selected && !control_selected;
     assign request_ready = snapshot_selected ? !snapshot_response_valid && native_valid :
-        bank_request_ready && native_borrow;
-    assign response_valid = snapshot_selected ? snapshot_response_valid : bank_response_valid;
-    assign response_data = snapshot_selected ? snapshot_response_data : bank_response_data;
-    assign response_error = snapshot_selected ? snapshot_response_error : bank_response_error;
+        control_selected ? control_request_ready : bank_request_ready && native_borrow;
+    assign response_valid = snapshot_selected ? snapshot_response_valid : control_selected ? control_response_valid : bank_response_valid;
+    assign response_data = snapshot_selected ? snapshot_response_data : control_selected ? control_response_data : bank_response_data;
+    assign response_error = snapshot_selected ? snapshot_response_error : control_selected ? control_response_error : bank_response_error;
     assign control_state = {snapshot_response_error, snapshot_response_data,
         snapshot_response_valid, transport_control_state, native_control_state};
+
+    generate if (CAPTURE_NATIVE_CONTROL != 0) begin : native_owner_bank
+        CheckpointSnapshotStateBank #(.BITS(NATIVE_CONTROL_BITS), .BANK(NATIVE_CONTROL_BANK)) endpoint (
+            .clock(clock), .reset(reset), .read_enable(native_valid), .snapshot_state(native_control_state),
+            .request_valid(request_valid && control_selected), .request_ready(control_request_ready),
+            .bank(bank), .slot(slot), .address(address), .response_valid(control_response_valid),
+            .response_ready(response_ready && control_selected), .response_data(control_response_data),
+            .response_error(control_response_error), .failed(control_bank_failed),
+            .control_state(native_control_bank_state));
+    end else begin : no_native_owner_bank
+        assign control_request_ready = 1'b0;
+        assign control_response_valid = 1'b0;
+        assign control_response_data = 64'b0;
+        assign control_response_error = 1'b0;
+        assign control_bank_failed = 1'b0;
+        assign native_control_bank_state = 67'b0;
+    end endgenerate
 
     // The response register remains stable under backpressure and drains even
     // after abort. No staging response is borrowed from an original RAM reader.
@@ -138,8 +168,9 @@ module CheckpointNativeCaptureTransport #(
         .capture_request(transport_freeze && native_phase == 0),
         .release_request(!transport_freeze && native_phase == 3),
         .capture_ready(native_ready), .ce(ce), .target_cycle(target_cycle),
-        .owner_present(owner_present), .owner_frozen(owner_frozen), .owner_error(owner_error),
-        .reader_idle(reader_idle && !snapshot_response_valid),
+        .owner_present(owner_present), .owner_frozen(owner_frozen),
+        .owner_error(owner_error | {OWNERS{control_bank_failed}}),
+        .reader_idle(reader_idle && !snapshot_response_valid && !native_control_bank_state[65]),
         .borrow_attempt(borrow_intent),
         .live_state(live_state), .word_address(snapshot_address),
         .root_clock(root_clock), .gate_clock(gate_clock), .clock_mask(clock_mask),
@@ -149,20 +180,21 @@ module CheckpointNativeCaptureTransport #(
         .captured_ce(captured_ce), .phase(native_phase), .error(native_error),
         .control_state(native_control_state));
 
-    wire full_descriptor = FULL_WORDS != 0 && descriptor_entry == ENTRIES;
-    wire tail_descriptor = TAIL_BITS != 0 && descriptor_entry == ENTRIES + (FULL_WORDS != 0);
+    wire control_descriptor = CONTROL_ENTRIES != 0 && descriptor_entry == ENTRIES;
+    wire full_descriptor = FULL_WORDS != 0 && descriptor_entry == ENTRIES + CONTROL_ENTRIES;
+    wire tail_descriptor = TAIL_BITS != 0 && descriptor_entry == ENTRIES + CONTROL_ENTRIES + (FULL_WORDS != 0);
     wire original_descriptor = descriptor_entry < ENTRIES;
-    wire bound_descriptor_valid = original_descriptor ? descriptor_valid && descriptor_bank != SNAPSHOT_BANK :
-        full_descriptor || tail_descriptor;
-    wire [7:0] bound_descriptor_bank = original_descriptor ? descriptor_bank : SNAPSHOT_BANK;
-    wire [15:0] bound_descriptor_slot = original_descriptor ? descriptor_slot : full_descriptor ? 0 : 1;
-    wire [15:0] bound_descriptor_width = original_descriptor ? descriptor_width : full_descriptor ? 64 : TAIL_BITS;
-    wire [31:0] bound_descriptor_depth = original_descriptor ? descriptor_depth : full_descriptor ? FULL_WORDS : 1;
-    CheckpointCaptureTransport #(.OWNERS(OWNERS+1), .ENTRIES(ENTRIES+SNAPSHOT_ENTRIES),
+    wire bound_descriptor_valid = original_descriptor ? descriptor_valid && descriptor_bank != SNAPSHOT_BANK &&
+        (CONTROL_ENTRIES == 0 || descriptor_bank != NATIVE_CONTROL_BANK) : control_descriptor || full_descriptor || tail_descriptor;
+    wire [7:0] bound_descriptor_bank = original_descriptor ? descriptor_bank : control_descriptor ? NATIVE_CONTROL_BANK : SNAPSHOT_BANK;
+    wire [15:0] bound_descriptor_slot = original_descriptor ? descriptor_slot : control_descriptor || full_descriptor ? 0 : 1;
+    wire [15:0] bound_descriptor_width = original_descriptor ? descriptor_width : control_descriptor || full_descriptor ? 64 : TAIL_BITS;
+    wire [31:0] bound_descriptor_depth = original_descriptor ? descriptor_depth : control_descriptor ? NATIVE_CONTROL_WORDS : full_descriptor ? FULL_WORDS : 1;
+    CheckpointCaptureTransport #(.OWNERS(OWNERS+1), .ENTRIES(ENTRIES+CONTROL_ENTRIES+SNAPSHOT_ENTRIES),
         .DEFERRED_CUT(1), .MANIFEST_SHA256(MANIFEST_SHA256)) transport (
         .clock(clock), .reset(reset), .restore_hold(1'b0), .restore_load_pos(1'b0), .restore_state(411'b0),
         .target_cycle(target_cycle), .owner_present({1'b1, owner_present}),
-        .owner_frozen({native_valid, owner_frozen}), .owner_error({native_failed, owner_error}),
+        .owner_frozen({native_valid, owner_frozen}), .owner_error({native_failed || control_bank_failed, owner_error}),
         .freeze(transport_freeze), .mmio_valid(mmio_valid && command_allowed), .mmio_write(mmio_write),
         .mmio_ready(transport_mmio_ready), .mmio_address(mmio_address), .mmio_wdata(mmio_wdata),
         .mmio_response_valid(mmio_response_valid), .mmio_response_ready(mmio_response_ready),
@@ -176,4 +208,8 @@ module CheckpointNativeCaptureTransport #(
         .bank_response_data(response_data), .bank_response_error(response_error),
         .dma_valid(dma_valid), .dma_ready(dma_ready), .dma_data(dma_data),
         .dma_last(dma_last), .dma_abort(dma_abort), .control_state(transport_control_state));
+    initial begin
+        if (CAPTURE_NATIVE_CONTROL != 0 && (NATIVE_CONTROL_BANK == SNAPSHOT_BANK || NATIVE_CONTROL_BANK == 255))
+            $fatal(1, "native control bank aliases payload or physical state");
+    end
 endmodule
