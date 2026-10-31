@@ -208,6 +208,26 @@ object NativeCheckpointWidgetReservation {
     * including when every annotation/header has been stripped.
     */
   def requireBound(state: CircuitState): Unit = {
+    // Native descriptors can be fully bound while the transport, its separate
+    // 67-bit response bank and the external clock network still lack atomic
+    // owners. Neither a real digest nor CAPTURE_NATIVE_CONTROL authorizes an
+    // image. Check structure independently of annotations and parameter VALUES:
+    // even malformed geometry or a renamed definition must fail closed.
+    val nativePorts = Set("live_state", "snapshot_state", "reader_idle", "functional_hold",
+      "native_valid", "native_failed", "native_cut_cycle", "native_control_bank_state")
+    val nativeParams = Set("BITS", "GATES", "SNAPSHOT_BANK", "NATIVE_CONTROL_BANK", "CAPTURE_NATIVE_CONTROL")
+    val transportPorts = Set("mmio_valid", "descriptor_entry", "bank_request_valid", "dma_data", "control_state")
+    val native = state.circuit.modules.exists { m =>
+      val ports = m.ports.map(_.name).toSet
+      m.name == "CheckpointNativeCaptureTransport" || nativePorts.subsetOf(ports) || (m match {
+        case e: ExtModule => e.defname == "CheckpointNativeCaptureTransport" ||
+          (nativeParams.subsetOf(e.params.map(_.name).toSet) && transportPorts.subsetOf(ports))
+        case _ => false
+      })
+    }
+    check(!native,
+      "native transport requires complete atomic capture/restore owners before image emission; " +
+        "bound descriptors, live shadow and native response-bank observation do not provide those owners")
     val markers = state.annotations.exists {
       case _: NativeCheckpointWidgetExecutionAnnotation | _: NativeCheckpointWidgetPinAnnotation => true
       case a: GoldenGateOutputFileAnnotation => a.body.contains("Unbound_checkpoint_widget_reservation") ||
