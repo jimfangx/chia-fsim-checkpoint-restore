@@ -23,6 +23,21 @@ struct checkpoint_capture_manifest_t {
   std::vector<checkpoint_capture_entry_t> entries;
 };
 
+// Generated native endpoint geometry. The manifest hash binds the original
+// ROM, appended stream table and this observation layout. This metadata does
+// not certify atomic transport/response-bank ownership or restore support.
+struct checkpoint_native_capture_binding_t {
+  uint32_t original_entries;
+  uint32_t native_bits;
+  uint32_t physical_clock_gates;
+  uint32_t external_owners;
+  uint32_t capture_native_control;
+  uint32_t snapshot_bank;
+  uint32_t native_control_bank;
+  uint32_t shadow_layout_version;
+  uint32_t shadow_bits;
+};
+
 // Observation of the live transport at a held target cut, layout version 2.
 // This is not a canonical Level-1 image or a complete/restore-capable owner.
 struct checkpoint_live_widget_shadow_t {
@@ -52,6 +67,9 @@ public:
 
   checkpoint_capture_session_t(checkpoint_capture_io_t &io,
                                checkpoint_capture_manifest_t manifest);
+  checkpoint_capture_session_t(checkpoint_capture_io_t &io,
+                               checkpoint_capture_manifest_t manifest,
+                               checkpoint_native_capture_binding_t binding);
   checkpoint_capture_session_t(const checkpoint_capture_session_t &) = delete;
   checkpoint_capture_session_t &operator=(const checkpoint_capture_session_t &) = delete;
   checkpoint_capture_session_t(checkpoint_capture_session_t &&) = delete;
@@ -85,6 +103,7 @@ private:
   const checkpoint_capture_manifest_t manifest;
   const uint64_t words;
   const size_t total_bytes;
+  const uint32_t bound_shadow_bits;
   phase_t state = phase_t::idle;
   std::vector<uint8_t> frames;
   size_t received = 0;

@@ -44,8 +44,10 @@ object CheckpointCaptureABI {
         sb.append(s"// descriptor[$index] StateID: ${entry.stateID}\n")
       }
     }
-    (Seq("CheckpointCaptureTransport.sv", "CheckpointCaptureCut.sv") ++
-      (if (cfg.physicalClockGates > 0) Seq("CheckpointPhysicalCaptureTransport.sv", "CheckpointPhysicalClockCut.sv") else Nil)).foreach { resource =>
+    val resources = if (cfg.nativeDescriptors.nonEmpty) CheckpointNativeCaptureTransportBlackBox.resources else
+      Seq("CheckpointCaptureTransport.sv", "CheckpointCaptureCut.sv") ++
+        (if (cfg.physicalClockGates > 0) Seq("CheckpointPhysicalCaptureTransport.sv", "CheckpointPhysicalClockCut.sv") else Nil)
+    resources.foreach { resource =>
       val in = getClass.getResourceAsStream("/" + resource)
       require(in != null, s"missing checkpoint RTL resource: $resource")
       val bytes = try in.readAllBytes() finally in.close()
@@ -54,7 +56,8 @@ object CheckpointCaptureABI {
     }
     sb.append(s"#define ${prefix}_FRAME_BYTES 64U\n#define ${prefix}_TRANSPORT_VERSION 1U\n")
     sb.append(s"#define ${prefix}_ABORT_REQUIRES_HOST_DRAIN 1U\n")
-    val controlBits = if (cfg.physicalClockGates > 0) 481 + cfg.physicalClockGates else 411
+    val controlBits = cfg.nativeDescriptors.map(_.endpoint.layout.endpointBits)
+      .getOrElse(if (cfg.physicalClockGates > 0) 481 + cfg.physicalClockGates else 411)
     sb.append(s"#define ${prefix}_SHADOW_LAYOUT_VERSION 2U\n")
     sb.append(s"#define ${prefix}_SHADOW_CONTROL_BITS ${controlBits}U\n")
     sb.append(s"#define ${prefix}_SHADOW_BITS ${controlBits + CheckpointLiveWidgetSnapshot.localBits + CheckpointNastiState.bits}U\n")
@@ -72,6 +75,14 @@ object CheckpointCaptureABI {
     cfg.ownerNames.zipWithIndex.foreach { case (owner, index) =>
       sb.append(s"// owner[$index]: $owner\n")
     }
+    cfg.nativeDescriptors.foreach { d =>
+      sb.append(s"#define ${prefix}_NATIVE_TRANSPORT 1U\n")
+      sb.append(s"#define ${prefix}_DESCRIPTOR_BINDING_SHA256 \"${d.bindingSha256}\"\n")
+      sb.append(s"#define ${prefix}_INTERNAL_DESCRIPTOR_ROM 1U\n")
+      // The common fields above carry the complete stream geometry; this
+      // separate prefix also retains original-ROM and native owner identities.
+      sb.append(d.header(prefix + "_NATIVE"))
+    }
     sb.toString
   }
 }
@@ -79,7 +90,15 @@ object CheckpointCaptureABI {
 case class CheckpointCaptureWidgetParams(entries: Int, manifestSha256: String,
     ownerNames: Seq[String], queueDepth: Int = 64,
     descriptors: Option[CheckpointCaptureDescriptors] = None, physicalClockGates: Int = 0,
-    deferredGraft: Boolean = false) {
+    deferredGraft: Boolean = false,
+    nativeDescriptors: Option[CheckpointNativeCaptureDescriptors] = None) {
+  require(nativeDescriptors.isEmpty || !deferredGraft,
+    "native widget requires an installed descriptor binding; deferred physical reservation is unsupported")
+  nativeDescriptors.foreach { d =>
+    require(descriptors.isEmpty && entries == d.entries.size && manifestSha256 == d.manifestSha256 &&
+      ownerNames == d.ownerNames && physicalClockGates == d.endpoint.gates,
+      "native widget configuration differs from its complete stream descriptor binding")
+  }
   require(!deferredGraft || (descriptors.isEmpty && physicalClockGates > 0 &&
     manifestSha256 == midas.checkpoint.NativeCheckpointWidgetReservation.digest),
     "checkpoint deferred graft requires the exact unbound reservation contract")
@@ -91,7 +110,7 @@ case class CheckpointCaptureWidgetParams(entries: Int, manifestSha256: String,
   require(queueDepth > 0)
   require(physicalClockGates >= 0 && physicalClockGates <= 65535,
     "physical clock count must fit the descriptor transport")
-  require(physicalClockGates == 0 || entries > physicalClockGates,
+  require(nativeDescriptors.nonEmpty || physicalClockGates == 0 || entries > physicalClockGates,
     "physical capture requires functional and physical CE descriptors")
   descriptors.foreach { d =>
     require(d.entries.size == entries && d.manifestSha256 == manifestSha256,
@@ -340,7 +359,7 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
   // Like streamEnq, this port must be accessible from the containing module
   // without relying on an anonymous WidgetImp structural refinement.
   val capturePort = InModuleBody {
-    val capture = IO(new CheckpointCaptureSideband(cfg.ownerNames.size, cfg.physicalClockGates))
+    val capture = IO(new CheckpointCaptureSideband(cfg.ownerNames.size, cfg.physicalClockGates, cfg.nativeDescriptors.map(_.endpoint)))
     capture
   }
   lazy val module = new WidgetImp(this) {
@@ -348,38 +367,87 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
     // Exposes descriptor/bank/owners/freeze, never a target-token port. MMIO and
     // stream members are wired internally below rather than left as top ports.
     val capture = capturePort.getWrappedValue
-    val transport: CheckpointCaptureTransportIO = if (cfg.physicalClockGates > 0) {
-      val physicalTransport = Module(new CheckpointPhysicalCaptureTransportBlackBox(cfg))
-      physicalTransport.io.restore_load_neg := false.B
-      capture.physical.get.connect(physicalTransport.io)
-      physicalTransport.io
-    } else Module(new CheckpointCaptureTransportBlackBox(cfg)).io
-    transport.clock := clock
-    transport.reset := reset.asBool
-    // The component restore supervisor is parked outside this production
-    // widget. Its inputs are inactive and the RTL restore mux is disabled.
-    transport.restore_hold := false.B
-    transport.restore_load_pos := false.B
-    transport.restore_state := 0.U
-    capture.connect(transport)
-    cfg.descriptors.foreach { descriptors =>
-      val rom = Module(new CheckpointCaptureDescriptorROM(descriptors))
-      rom.io.entry := transport.descriptor_entry
-      transport.descriptor_valid := rom.io.valid
-      transport.descriptor_bank := rom.io.bank
-      transport.descriptor_slot := rom.io.slot
-      transport.descriptor_width := rom.io.bitWidth
-      transport.descriptor_depth := rom.io.depth
+    if (cfg.nativeDescriptors.nonEmpty) {
+      val descriptors = cfg.nativeDescriptors.get
+      val nativeEndpoint = Module(new CheckpointNativeBoundWidgetEndpoint(descriptors, p(CtrlNastiKey)))
+      val endpoint = nativeEndpoint.io
+      endpoint.ctrl <> io.ctrl; streamEnq <> endpoint.stream
+      endpoint.native.ce := capture.physical.get.logicalCE
+      endpoint.native.targetCycle := capture.targetCycle
+      endpoint.native.ownerPresent := capture.ownerPresent; endpoint.native.ownerFrozen := capture.ownerFrozen
+      endpoint.native.ownerError := capture.ownerError
+      endpoint.native.readerIdle := capture.native.get.readerIdle
+      endpoint.native.liveState := capture.native.get.liveState
+      capture.native.get.functionalHold := endpoint.native.functionalHold
+      capture.native.get.snapshotState := endpoint.native.snapshotState
+      capture.native.get.rawControlState := endpoint.native.rawControlState
+      capture.native.get.nativeControlBankState := endpoint.native.nativeControlBankState
+      capture.native.get.endpointControlState := endpoint.native.endpointControlState
+      capture.native.get.endpointState := endpoint.endpointState
+      capture.freeze := endpoint.native.freeze
+      capture.physical.get.clockMask := endpoint.native.clockMask
+      capture.physical.get.capturedCE := endpoint.native.capturedCE
+      capture.physical.get.stopped := endpoint.native.valid
+      capture.physical.get.readEnable := endpoint.native.valid && !endpoint.native.failed &&
+        endpoint.native.cutCycle === capture.targetCycle
+      capture.physical.get.failed := endpoint.native.failed
+      capture.physical.get.cutCycle := endpoint.native.cutCycle
+      // Native SV exposes a failed predicate, not the physical controller's
+      // three-bit error enum. STATUS/ERROR remain the authoritative MMIO ABI.
+      capture.physical.get.error := endpoint.native.failed.asUInt
+      capture.descriptorEntry := endpoint.descriptorEntry
+      endpoint.bankRequestReady := capture.bankRequestReady
+      capture.bankRequestValid := endpoint.bankRequestValid
+      capture.bank := endpoint.bank; capture.slot := endpoint.slot; capture.address := endpoint.address
+      endpoint.bankResponseValid := capture.bankResponseValid
+      capture.bankResponseReady := endpoint.bankResponseReady
+      endpoint.bankResponseData := capture.bankResponseData; endpoint.bankResponseError := capture.bankResponseError
+      capture.streamLast := endpoint.streamLast; capture.streamAbort := endpoint.streamAbort
+      capture.controllerReset := reset.asBool
+      // The checked original ROM is internal. Compatibility descriptor inputs
+      // on the common sideband cannot override its identity or appended table.
+    } else {
+      val transport: CheckpointCaptureTransportIO = if (cfg.physicalClockGates > 0) {
+        val physicalTransport = Module(new CheckpointPhysicalCaptureTransportBlackBox(cfg))
+        physicalTransport.io.restore_load_neg := false.B
+        capture.physical.get.connect(physicalTransport.io)
+        physicalTransport.io
+      } else Module(new CheckpointCaptureTransportBlackBox(cfg)).io
+      transport.clock := clock
+      transport.reset := reset.asBool
+      // The component restore supervisor is parked outside this production
+      // widget. Its inputs are inactive and the RTL restore mux is disabled.
+      transport.restore_hold := false.B
+      transport.restore_load_pos := false.B
+      transport.restore_state := 0.U
+      capture.connect(transport)
+      cfg.descriptors.foreach { descriptors =>
+        val rom = Module(new CheckpointCaptureDescriptorROM(descriptors))
+        rom.io.entry := transport.descriptor_entry
+        transport.descriptor_valid := rom.io.valid
+        transport.descriptor_bank := rom.io.bank
+        transport.descriptor_slot := rom.io.slot
+        transport.descriptor_width := rom.io.bitWidth
+        transport.descriptor_depth := rom.io.depth
+      }
+      capture.controllerReset := reset.asBool
+      CheckpointWidgetEndpoint.build(p(CtrlNastiKey), io.ctrl, transport,
+        streamEnq, capture.targetCycle,
+        transport.freeze && capture.ownerPresent.andR && capture.ownerFrozen.andR &&
+          !capture.ownerError.orR && capture.physical.map(p => p.readEnable &&
+            !p.failed && p.cutCycle === capture.targetCycle).getOrElse(true.B))
     }
-    capture.controllerReset := reset.asBool
-    CheckpointWidgetEndpoint.build(p(CtrlNastiKey), io.ctrl, transport,
-      streamEnq, capture.targetCycle,
-      transport.freeze && capture.ownerPresent.andR && capture.ownerFrozen.andR &&
-        !capture.ownerError.orR && capture.physical.map(p => p.readEnable &&
-          !p.failed && p.cutCycle === capture.targetCycle).getOrElse(true.B))
     override def genHeader(base: BigInt, memoryRegions: Map[String, BigInt], sb: StringBuilder): Unit = {
       if (cfg.deferredGraft) {
         sb.append(midas.checkpoint.NativeCheckpointWidgetReservation.header(base, toHostStreamIdx))
+      } else if (cfg.nativeDescriptors.nonEmpty) {
+        val descriptors = cfg.nativeDescriptors.get
+        sb.append(midas.checkpoint.NativeCheckpointWidgetIdentity.incomplete + "\n")
+        sb.append(CheckpointCaptureABI.header(getWName.toUpperCase, base, cfg, toHostStreamIdx))
+        sb.append("#ifdef GET_INCLUDES\n#include \"bridges/checkpoint_capture.h\"\n#endif\n")
+        sb.append("#ifdef GET_BRIDGE_CONSTRUCTOR\n")
+        sb.append(s"registry.add_widget(new checkpoint_capture_t(simif, registry.get_stream_engine(), ${base}ULL, ${toHostStreamIdx}U,\n")
+        sb.append(s"  ${descriptors.cppManifest}, ${descriptors.cppNativeBinding}));\n#endif\n")
       } else {
         sb.append(CheckpointCaptureABI.header(getWName.toUpperCase, base, cfg, toHostStreamIdx))
         // Unlike target bridge constructors, this global driver has no target
@@ -395,7 +463,20 @@ class CheckpointCaptureWidget(val cfg: CheckpointCaptureWidgetParams)(implicit p
   }
 }
 
-class CheckpointCaptureSideband(owners: Int, physicalClockGates: Int = 0) extends Bundle {
+class CheckpointCaptureNativeSideband(cfg: CheckpointNativeEndpointParams) extends Bundle {
+  val readerIdle = Input(Bool())
+  val liveState = Input(UInt(cfg.bits.W))
+  val functionalHold = Output(Bool())
+  val snapshotState = Output(UInt(cfg.bits.W))
+  val rawControlState = Output(UInt(cfg.layout.rawBits.W))
+  val nativeControlBankState = Output(UInt(67.W))
+  val endpointControlState = Output(UInt(cfg.layout.endpointBits.W))
+  val endpointState = Output(UInt(CheckpointWidgetEndpoint.bits.W))
+}
+
+class CheckpointCaptureSideband(owners: Int, physicalClockGates: Int = 0,
+    nativeParams: Option[CheckpointNativeEndpointParams] = None) extends Bundle {
+  val native = nativeParams.map(new CheckpointCaptureNativeSideband(_))
   val physical = if (physicalClockGates > 0) Some(new CheckpointPhysicalCaptureSideband(physicalClockGates)) else None
   val controllerReset = Output(Bool())
   val targetCycle = Input(UInt(64.W))

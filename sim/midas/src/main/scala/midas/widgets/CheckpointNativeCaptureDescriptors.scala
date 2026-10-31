@@ -33,6 +33,16 @@ final class CheckpointNativeCaptureDescriptors private (
     s"checkpoint_capture_manifest_t{{{$bytes}}, {$rows}}"
   }
 
+  /** The driver validates the native appended table and endpoint shadow layout
+    * before any MMIO access. Complete stream descriptors accompany this ABI.
+    */
+  def cppNativeBinding: String = {
+    val values = Seq(endpoint.entries, endpoint.bits, endpoint.gates, endpoint.owners,
+      if (endpoint.captureNativeControl) 1 else 0, endpoint.snapshotBank, endpoint.nativeControlBank,
+      2, endpoint.layout.endpointBits + CheckpointWidgetEndpoint.bits)
+    "checkpoint_native_capture_binding_t{" + values.map(v => s"${v}U").mkString(", ") + "}"
+  }
+
   /** Native-specific metadata, deliberately distinct from the production
     * widget header. It cannot authorize an image or release a restore owner.
     */
@@ -160,7 +170,7 @@ class CheckpointNativeBoundWidgetEndpoint(descriptors: CheckpointNativeCaptureDe
     val streamLast = Output(Bool()); val streamAbort = Output(Bool())
     val endpointState = Output(UInt(CheckpointWidgetEndpoint.bits.W))
   })
-  val endpoint = Module(new CheckpointNativeWidgetEndpoint(cfg))
+  val endpoint = Module(new CheckpointNativeWidgetEndpoint(cfg, np))
   val originalROM = Module(new CheckpointCaptureDescriptorROM(descriptors.original))
   endpoint.io.ctrl <> io.ctrl; io.stream <> endpoint.io.stream; io.native <> endpoint.io.native
   originalROM.io.entry := endpoint.io.descriptorEntry

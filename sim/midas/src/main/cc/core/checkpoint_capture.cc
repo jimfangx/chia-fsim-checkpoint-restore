@@ -47,6 +47,60 @@ size_t frame_bytes(uint64_t words) {
   return static_cast<size_t>(words + 2) * 64;
 }
 
+uint32_t native_shadow_bits(const checkpoint_capture_manifest_t &manifest,
+                            const checkpoint_native_capture_binding_t &binding) {
+  require_capture(binding.original_entries > 0 && binding.original_entries <= 65535 &&
+                      binding.native_bits > 0 && binding.physical_clock_gates > 0 &&
+                      binding.physical_clock_gates <= 65535 &&
+                      binding.external_owners > 0 && binding.external_owners < 65535 &&
+                      binding.capture_native_control <= 1 &&
+                      binding.snapshot_bank < 255 && binding.native_control_bank < 255 &&
+                      binding.snapshot_bank != binding.native_control_bank,
+                  "invalid native capture geometry");
+  const uint64_t bits = uint64_t(binding.native_bits) + binding.physical_clock_gates;
+  require_capture(bits + 1549 <= std::numeric_limits<int32_t>::max() &&
+                      binding.shadow_layout_version == 2 &&
+                      binding.shadow_bits == bits + 1452,
+                  "native capture shadow layout mismatch");
+  require_capture(!std::all_of(manifest.wire_hash.begin(), manifest.wire_hash.end(),
+                               [](uint8_t b) { return b == 0xff; }),
+                  "unbound native capture manifest");
+  const size_t appended = binding.capture_native_control +
+                          (binding.native_bits / 64 != 0) + (binding.native_bits % 64 != 0);
+  require_capture(manifest.entries.size() == binding.original_entries + appended,
+                  "native capture original/full descriptor count mismatch");
+  unsigned physical = 0;
+  for (size_t i = 0; i < binding.original_entries; ++i) {
+    const auto &entry = manifest.entries[i];
+    require_capture(entry.bank != binding.snapshot_bank &&
+                        entry.bank != binding.native_control_bank,
+                    "native capture original descriptor aliases reserved bank");
+    if (entry.bank == 255) {
+      require_capture(entry.slot == physical && entry.width == 1 && entry.depth == 1,
+                      "invalid native capture original physical descriptor");
+      ++physical;
+    } else {
+      require_capture(physical == 0, "native capture physical descriptors must be last in ROM");
+    }
+  }
+  require_capture(physical == 0 || physical == binding.physical_clock_gates,
+                  "native capture original physical gate count mismatch");
+  size_t index = binding.original_entries;
+  const auto expect = [&](uint32_t bank, uint16_t slot, uint16_t width, uint32_t depth) {
+    const auto &entry = manifest.entries[index++];
+    require_capture(entry.bank == bank && entry.slot == slot && entry.width == width &&
+                        entry.depth == depth,
+                    "native capture appended descriptor mismatch");
+  };
+  if (binding.capture_native_control)
+    expect(binding.native_control_bank, 0, 64, static_cast<uint32_t>((bits + 150 + 63) / 64));
+  if (binding.native_bits / 64)
+    expect(binding.snapshot_bank, 0, 64, binding.native_bits / 64);
+  if (binding.native_bits % 64)
+    expect(binding.snapshot_bank, 1, binding.native_bits % 64, 1);
+  return binding.shadow_bits;
+}
+
 uint32_t crc32c(const uint8_t *bytes, size_t length) {
   uint32_t value = 0xffffffff;
   for (size_t i = 0; i < length; ++i) {
@@ -61,7 +115,13 @@ uint32_t crc32c(const uint8_t *bytes, size_t length) {
 checkpoint_capture_session_t::checkpoint_capture_session_t(
     checkpoint_capture_io_t &io, checkpoint_capture_manifest_t manifest)
     : io(io), manifest(std::move(manifest)), words(manifest_words(this->manifest)),
-      total_bytes(frame_bytes(words)) {}
+      total_bytes(frame_bytes(words)), bound_shadow_bits(0) {}
+
+checkpoint_capture_session_t::checkpoint_capture_session_t(
+    checkpoint_capture_io_t &io, checkpoint_capture_manifest_t manifest,
+    checkpoint_native_capture_binding_t binding)
+    : io(io), manifest(std::move(manifest)), words(manifest_words(this->manifest)),
+      total_bytes(frame_bytes(words)), bound_shadow_bits(native_shadow_bits(this->manifest, binding)) {}
 
 void checkpoint_capture_session_t::validate_frames(
     const std::vector<uint8_t> &frames,
@@ -236,11 +296,13 @@ checkpoint_live_widget_shadow_t
 checkpoint_capture_session_t::capture_live_widget_shadow(uint32_t bits) {
   require_capture(state == phase_t::validated && !shadow_may_be_occupied,
                   "live widget shadow requires a validated, unoccupied capture");
-  // Layout 2: 411 nonphysical or 481+GATES physical control bits, plus 228
-  // local bits and 530 canonical NASTI adapter bits. Layout 1 is incompatible.
+  // Layout 2: legacy control bits or the identity-bound native observation,
+  // plus 228 local bits and 530 canonical NASTI adapter bits. Layout 1 is
+  // incompatible; native widths require the checked original/appended table.
   // Bound allocation before any MMIO mutation; the generated header is the
   // caller's exact shape authority, not an arbitrary runtime word count.
-  require_capture(bits == 1169 || (bits >= 1240 && bits <= 66774),
+  require_capture(bound_shadow_bits ? bits == bound_shadow_bits :
+                      (bits == 1169 || (bits >= 1240 && bits <= 66774)),
                   "unsupported live widget shadow shape");
   checkpoint_live_widget_shadow_t result{bits, cycle,
                                         std::vector<uint64_t>((bits + 63) / 64)};

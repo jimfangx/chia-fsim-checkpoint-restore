@@ -15,6 +15,12 @@ public:
   checkpoint_capture_t(simif_t &sim, StreamEngine &stream, size_t mmio_base,
                        unsigned stream_index,
                        checkpoint_capture_manifest_t manifest);
+  // Generated native installation checks the nullable registry engine before
+  // dereferencing it and binds the complete stream table/observation layout.
+  checkpoint_capture_t(simif_t &sim, StreamEngine *stream, size_t mmio_base,
+                       unsigned stream_index,
+                       checkpoint_capture_manifest_t manifest,
+                       checkpoint_native_capture_binding_t binding);
   checkpoint_capture_session_t &capture_session() { return session; }
 
 private:

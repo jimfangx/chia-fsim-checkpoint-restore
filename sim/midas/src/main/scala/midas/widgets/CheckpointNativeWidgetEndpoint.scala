@@ -154,9 +154,10 @@ class CheckpointNativeEndpointSideband(cfg: CheckpointNativeEndpointParams) exte
   val endpointControlState = Output(UInt(cfg.layout.endpointBits.W))
 }
 
-/** Preparatory production API: actual NASTI/stream endpoint and native RTL.
-  * No production widget selection, descriptor header, graft or image admission.
-  * The shared endpoint observes a coordinator-first view without changing SV.
+/** Actual NASTI/stream endpoint and native RTL, also used by the installed
+  * descriptor-bound CheckpointCaptureWidget. Deferred graft and complete image
+  * admission remain unsupported. The shared endpoint observes a
+  * coordinator-first view without changing SV.
   */
 class CheckpointNativeWidgetEndpoint(cfg: CheckpointNativeEndpointParams,
     np: NastiParameters = NastiParameters(32, 32, 4)) extends Module {

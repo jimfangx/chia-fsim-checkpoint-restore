@@ -59,6 +59,10 @@ object NativeCheckpointWidgetReservation {
     */
   def inspect(state: CircuitState): String = {
     check(state.form == LowForm, "resolved LowForm required")
+    check(!state.circuit.modules.exists {
+      case e: ExtModule => e.defname == "CheckpointNativeCaptureTransport"
+      case _ => false
+    }, "installed native widget cannot use the physical deferred reservation/peer ABI")
     val executions = state.annotations.collect { case a: NativeCheckpointWidgetExecutionAnnotation => a }
     val pins = state.annotations.collect { case a: NativeCheckpointWidgetPinAnnotation => a }
     check(executions.size == 1, "one explicit existing execution required")

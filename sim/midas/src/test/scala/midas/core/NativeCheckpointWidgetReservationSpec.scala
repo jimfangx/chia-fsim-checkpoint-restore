@@ -204,4 +204,56 @@ class NativeCheckpointWidgetReservationSpec extends AnyFlatSpec {
     intercept[IllegalArgumentException](CheckpointCaptureWidgetParams(7, "1" * 64,
       Seq("fixture"), physicalClockGates = 2, deferredGraft = true))
   }
+
+  private class InstalledNativeBinding(missing: Option[String] = None) extends CheckpointCaptureTopBinding {
+    val params = CheckpointCaptureNativeWidgetFixture.cfg
+    def connect(top: FPGATopImp, capture: CheckpointCaptureSideband): Unit = {
+      def input(name: String, sink: UInt): Unit = if (!missing.contains(name))
+        sink := IO(Input(UInt(sink.getWidth.W))).suggestName("native_" + name)
+      input("targetCycle", capture.targetCycle)
+      input("ownerPresent", capture.ownerPresent); input("ownerFrozen", capture.ownerFrozen)
+      input("ownerError", capture.ownerError)
+      input("logicalCE", capture.physical.get.logicalCE)
+      if (!missing.contains("readerIdle"))
+        capture.native.get.readerIdle := IO(Input(Bool())).suggestName("native_readerIdle")
+      input("liveState", capture.native.get.liveState)
+      // These common compatibility inputs cannot replace the internal ROM.
+      capture.descriptorValid := false.B; capture.descriptorBank := 0.U
+      capture.descriptorSlot := 0.U; capture.descriptorWidth := 0.U; capture.descriptorDepth := 0.U
+      capture.bankRequestReady := IO(Input(Bool())).suggestName("native_bankRequestReady")
+      capture.bankResponseValid := IO(Input(Bool())).suggestName("native_bankResponseValid")
+      input("bankResponseData", capture.bankResponseData)
+      capture.bankResponseError := IO(Input(Bool())).suggestName("native_bankResponseError")
+      IO(Output(Bool())).suggestName("native_freeze") := capture.freeze
+      IO(Output(Bool())).suggestName("native_hold") := capture.native.get.functionalHold
+    }
+  }
+
+  it should "install a bound native widget in the real MMIO and stream allocators without admitting an image" in {
+    implicit val p: Parameters = parameters(new InstalledNativeBinding)
+    val top = LazyModule(new FPGATop)
+    val dir = out.resolve("installed-native")
+    val rtl = new ChiselStage().emitVerilog(top.module, Array("--target-dir", dir.toString))
+    val header = new StringBuilder; top.genHeader(header)
+    assert(top.checkpointCapture.get.toHostStreamIdx == 1 && top.toCPUStreamParams.map(_.idx) == Seq(0, 1))
+    assert(top.streamingEngine.get.params.toCPUParams == top.toCPUStreamParams)
+    assert(rtl.contains("CheckpointNativeCaptureTransport") && rtl.contains("capture_native_readerIdle"))
+    assert(header.toString.contains(CheckpointCaptureNativeWidgetFixture.descriptors.cppNativeBinding))
+    assert(header.toString.contains("TO_HOST_STREAM_IDX 1U"))
+    assert(header.toString.contains(NativeCheckpointWidgetIdentity.incomplete))
+    Files.write(dir.resolve("installed-native.h"), header.toString.getBytes(UTF_8))
+  }
+
+  it should "reject every absent native owner and required common-cut source during top initialization" in {
+    for (name <- Seq("targetCycle", "ownerPresent", "ownerFrozen", "ownerError", "logicalCE", "readerIdle", "liveState")) {
+      implicit val p: Parameters = parameters(new InstalledNativeBinding(Some(name)))
+      val top = LazyModule(new FPGATop)
+      val error = intercept[Exception] {
+        new ChiselStage().emitVerilog(top.module,
+          Array("--target-dir", out.resolve("native-missing-" + name).toString))
+      }
+      assert(error.getMessage.contains("not fully initialized") && error.getMessage.contains(name), error.getMessage)
+    }
+  }
+
 }

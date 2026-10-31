@@ -37,6 +37,10 @@ object NativeCheckpointWidgetPeerRouting {
 
   def inspect(before: CircuitState, after: CircuitState): String = {
     val reservation = parse(NativeCheckpointWidgetReservation.inspect(before))
+    check(!after.circuit.modules.exists {
+      case e: ExtModule => e.defname == "CheckpointNativeCaptureTransport"
+      case _ => false
+    }, "installed native widget cannot use the physical deferred reservation/peer ABI")
     check(after.form == LowForm && after.circuit.main == before.circuit.main,
       "same resolved LowForm circuit required")
     val history = after.annotations.collect { case a: SimulationInlineResultAnnotation => a }
