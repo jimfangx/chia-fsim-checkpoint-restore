@@ -150,6 +150,134 @@ class FAMEClockProgressSpec extends AnyFlatSpec {
       }
     }
   }
+  private def bankReference(): CircuitState = {
+    val s = transform(true)
+    new Compiler(Forms.LowForm).execute(s.copy(form = HighForm, annotations = s.annotations.filter {
+      case _: DontTouchAnnotation | _: FAMEClockProgressSignalAnnotation | _: FAMEClockProgressModelAnnotation => true
+      case _ => false
+    })).copy(form = LowForm)
+  }
+
+  it should "specialize complete FAME identities into native functional banks and hash every translated role" in {
+    val reference = bankReference()
+    val manifest = SimulatorStateInventory.discover(reference)
+    val plan = PhysicalClockCutPlan.discover(reference, manifest)
+    val deps = PhysicalClockCutDependencies.discover(reference, manifest, plan)
+    val result = GeneratedStateBankAccess.generatePhysicalCompanion(reference, manifest, plan, deps)
+    GeneratedStateBankAccess.validateAnnotationBinding(result)
+    FAMEClockProgressBindings.validatePreserved(reference, result.state)
+    val original = reference.annotations.collect { case a: FAMEClockProgressSignalAnnotation => a }
+    val translated = result.state.annotations.collect { case a: FAMEClockProgressSignalAnnotation => a }
+    assert(translated.size == 21 && translated.map(_.target).distinct.size == 21)
+    assert(translated.map(_.model).toSet == original.map(_.model).toSet)
+    assert(translated.forall(_.target.module == "Top"))
+    assert(translated.forall(_.target.path.head._1 == original.head.target.path.head._1))
+    assert(translated.forall(_.target.path.head._2.value != "Model"))
+    val gates = translated.filter(a => Set("gate_ce", "gate_output")(a.role))
+    assert(gates.size == 4 && gates.forall(a => a.target.path.size == 2 && a.target.component.isEmpty))
+    assert(result.state.circuit.modules.collect { case m: ExtModule => m } ==
+      reference.circuit.modules.collect { case m: ExtModule => m })
+    val descriptors = midas.widgets.CheckpointCaptureDescriptors.fromNativeGenerated(result, reference, manifest, plan, deps)
+    assert(descriptors.entries.nonEmpty)
+    // Every loss/retarget/identity mutation invalidates the actual bank binding,
+    // even though all ordinary storage and its original manifest are unchanged.
+    translated.foreach { role =>
+      Seq(result.state.annotations.filterNot(_ == role), result.state.annotations.map {
+        case a: FAMEClockProgressSignalAnnotation if a == role => a.copy(model = a.model + "_changed")
+        case a => a
+      }, result.state.annotations.map {
+        case a: FAMEClockProgressSignalAnnotation if a == role => a.copy(target = a.target.copy(ref = "missing"))
+        case a => a
+      }).foreach { changed =>
+        intercept[IllegalArgumentException] {
+          GeneratedStateBankAccess.validateAnnotationBinding(result.copy(state = result.state.copy(annotations = changed)))
+        }
+      }
+    }
+    val model = result.state.annotations.collectFirst { case a: FAMEClockProgressModelAnnotation => a }.get
+    intercept[IllegalArgumentException] {
+      GeneratedStateBankAccess.validateAnnotationBinding(result.copy(state = result.state.copy(
+        annotations = result.state.annotations.filterNot(_ == model))))
+    }
+    // The ordinary hardware owner guard must now be reached rather than hiding
+    // behind an unsupported-annotation diagnostic. No physical CE is fabricated.
+    assert(intercept[IllegalArgumentException] {
+      GeneratedStateBankAccess.generate(reference, manifest, separateAccessClock = true)
+    }.getMessage.contains("requires a synthesized capture owner"))
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { base =>
+      val out = Paths.get(base).resolve("fame-progress-banks"); Files.createDirectories(out)
+      Seq("reference.fir" -> reference.circuit.serialize, "manifest.json" -> manifest,
+        "plan.json" -> plan, "dependencies.json" -> deps, "instrumented.fir" -> result.state.circuit.serialize,
+        "instrumented.sv" -> emit(result.state)._2, "binding.json" -> result.binding,
+        "annotations.json" -> JsonProtocol.serialize(result.state.annotations),
+        "descriptors.json" -> descriptors.manifest).foreach {
+        case (name, text) => Files.write(out.resolve(name), text.getBytes(UTF_8))
+      }
+    }
+  }
+
+  it should "reject incomplete replicated aliased and stale FAME roles before bank specialization" in {
+    val reference = bankReference()
+    val roles = reference.annotations.collect { case a: FAMEClockProgressSignalAnnotation => a }
+    val first = roles.head
+    val bad = Seq(reference.annotations.filterNot(_.isInstanceOf[FAMEClockProgressModelAnnotation]),
+      reference.annotations.filterNot(_ == first), reference.annotations :+ first,
+      reference.annotations.map {
+        case a: FAMEClockProgressSignalAnnotation if a == first => a.copy(target = roles(1).target)
+        case a => a
+      }, reference.annotations.map {
+        case a: FAMEClockProgressSignalAnnotation if a == first => a.copy(target = a.target.copy(circuit = "Foreign"))
+        case a => a
+      }, reference.annotations.map {
+        case a: FAMEClockProgressModelAnnotation => a.copy(domains = a.domains :+ "missing")
+        case a => a
+      })
+    bad.foreach { annotations =>
+      assert(intercept[IllegalArgumentException] {
+        GeneratedStateBankAnnotations.preflight(reference.copy(annotations = annotations))
+      }.getMessage.contains("FAME clock progress binding unsupported"))
+    }
+  }
+
+  it should "reject changed bank freeze condition hold value and inner reset ownership" in {
+    val reference = bankReference()
+    val manifest = SimulatorStateInventory.discover(reference)
+    val plan = PhysicalClockCutPlan.discover(reference, manifest)
+    val deps = PhysicalClockCutDependencies.discover(reference, manifest, plan)
+    val result = GeneratedStateBankAccess.generatePhysicalCompanion(reference, manifest, plan, deps)
+    val role = result.state.annotations.collectFirst {
+      case a: FAMEClockProgressSignalAnnotation if a.role == "completed_steps" => a
+    }.get
+    val owner = role.target.path.last._2.value
+    for (mutation <- 0 until 3) {
+      var changed = 0
+      def rewrite(s: Statement): Statement = s match {
+        case c: Connect if c.loc.serialize == role.target.ref =>
+          changed += 1
+          val m = c.expr.asInstanceOf[Mux]
+          c.copy(expr = mutation match {
+            case 0 => m.copy(cond = UIntLiteral(0, IntWidth(1)))
+            case 1 => m.copy(tval = UIntLiteral(0, IntWidth(64)))
+            case 2 => m.copy(fval = WRef(role.target.ref, UIntType(IntWidth(64))))
+          })
+        case s => s.mapStmt(rewrite)
+      }
+      val circuit = result.state.circuit.copy(modules = result.state.circuit.modules.map {
+        case m: Module if m.name == owner => m.copy(body = rewrite(m.body))
+        case m => m
+      })
+      assert(changed == 1)
+      val error = intercept[IllegalArgumentException] {
+        GeneratedStateBankAccess.validateAnnotationBinding(result.copy(state = result.state.copy(circuit = circuit)))
+      }
+      assert(error.getMessage.contains("FAME clock progress binding unsupported"))
+    }
+    // Ordinary production validation never silently accepts banked semantics.
+    assert(intercept[IllegalArgumentException] {
+      FAMEClockProgressBindings.resolve(result.state)
+    }.getMessage.contains("reset owner mismatch"))
+  }
+
   it should "leave unrequested builds byte-identical and reject incomplete duplicate requests" in {
     val s = seed(); assert(!FAMEClockProgress.requested(s))
     assert(new FAMETransform().execute(s).circuit.serialize == new FAMETransform().execute(s).circuit.serialize)

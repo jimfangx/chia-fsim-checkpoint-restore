@@ -33,7 +33,7 @@ object GeneratedStateBankAccess {
   case class Result(state: CircuitState, entries: Seq[StateAccessEntry], binding: String,
       synchronousOrigin: Option[NativeSynchronousMemoryReadout.Origin] = None)
   def validateAnnotationBinding(result: Result): Unit = {
-    GeneratedStateBankAnnotations.preflight(result.state)
+    GeneratedStateBankAnnotations.preflight(result.state, bankedProgress = true)
     NativeSynchronousMemoryReadout.validateBinding(result)
     val doc = parse(result.binding)
     val binding = doc \ "annotation_translation"

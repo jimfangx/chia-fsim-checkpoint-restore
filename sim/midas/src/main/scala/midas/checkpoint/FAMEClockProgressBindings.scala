@@ -87,7 +87,17 @@ object FAMEClockProgressBindings {
   /** Validate against the actual IR, including all hierarchy hops and the
     * original gate's I/CE/O connectivity. No name-prefix role inference.
     */
-  def resolve(input: CircuitState): Seq[JValue] = {
+  def resolve(input: CircuitState): Seq[JValue] = resolveImpl(input, banked = false)
+
+  /** A bank companion holds each observer and original pending register using
+    * its local ckpt_freeze port. Check that exact generated wrapper before
+    * checking the original reset owner inside it. This grants no physical cut
+    * authority and is deliberately separate from the production role checker.
+    */
+  private[checkpoint] def resolveBanked(input: CircuitState): Seq[JValue] =
+    resolveImpl(input, banked = true)
+
+  private def resolveImpl(input: CircuitState, banked: Boolean): Seq[JValue] = {
     if (models(input).isEmpty && signals(input).isEmpty) return Nil
     val state = PhysicalClockCutPlan.explicitConnections(input)
     val ms = models(state); val ss = signals(state)
@@ -213,7 +223,22 @@ object FAMEClockProgressBindings {
         // RemoveReset moves a synchronous reset into the register's data mux
         // before Verilog emission. Check that exact ownership rather than
         // accepting any reset-free register of the right width.
-        val next = drivers.filter(_._1 == reg.name).map(_._2)
+        val driven = drivers.filter(_._1 == reg.name).map(_._2)
+        val next = if (!banked) driven else driven match {
+          case Seq(m: Mux) if module.ports.exists(p => p.name == "ckpt_freeze" &&
+              p.direction == Input && p.tpe == UIntType(IntWidth(1))) &&
+              m.cond.serialize == "ckpt_freeze" && m.tval.serialize == reg.name =>
+            // Banking preserves the original register reset expression even
+            // when RemoveReset has already lowered it to the literal zero.
+            // FIRRTL may retain that exact inert reset mux in LowForm.
+            val functional = m.fval match {
+              case inner: Mux if inner.cond == UIntLiteral(0, IntWidth(1)) &&
+                  inner.tval.serialize == reg.name => inner.fval
+              case other => other
+            }
+            Seq(functional)
+          case _ => fail("missing exact bank freeze/hold wrapper: " + reg.name)
+        }
         val resetMux = next match {
           case Seq(m: Mux) => normalize(m.cond) == normalize(expression(reset)) && (m.tval match {
             case UIntLiteral(value, _) => value == 0
@@ -227,8 +252,10 @@ object FAMEClockProgressBindings {
         })
         val loweredReset = (reg.reset match { case UIntLiteral(value, _) => value == 0; case _ => false }) &&
           reg.init.serialize == reg.name && resetMux
-        if (normalize(reg.clock) != normalize(expression(host)) || !(originalReset || loweredReset))
-          fail("observer/pending register clock or reset owner mismatch: " + reg.name)
+        if (normalize(reg.clock) != normalize(expression(host)) || !(if (banked) loweredReset else originalReset || loweredReset))
+          fail("observer/pending register clock or reset owner mismatch: " + reg.name +
+            " clock=" + reg.clock.serialize + " reset=" + reg.reset.serialize + " init=" + reg.init.serialize +
+            " next=" + next.map(_.serialize).mkString(","))
       }
       model.domains.foreach { domain =>
         val ce = annotation(domain, "gate_ce"); val output = annotation(domain, "gate_output")

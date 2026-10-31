@@ -35,7 +35,8 @@ private[checkpoint] object GeneratedStateBankAnnotations {
   }
   private[checkpoint] def supported(a: Annotation): Boolean = a match {
     case a if memoryPolicy(a) => true
-    case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: firrtl.transforms.CombinationalPath |
+    case _: FAMEClockProgressModelAnnotation | _: FAMEClockProgressSignalAnnotation |
+         _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: firrtl.transforms.CombinationalPath |
          _: firrtl.transforms.NoDedupAnnotation | _: firrtl.passes.InlineAnnotation |
          _: SynthesisPlusArgConstantAnnotation | _: FirrtlMemModelAnnotation |
          _: InternalXDCAnnotation | _: XDCAnnotation | _: TargetBoxAnnotation |
@@ -142,8 +143,12 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     }
   }
 
-  def preflight(state: CircuitState): Unit = {
+  def preflight(state: CircuitState, bankedProgress: Boolean = false): Unit = {
     GeneratedSynthesisConstantAdapter.validate(state, instrumented = true)
+    // These are live, correlated construction-site roles, never inert compiler
+    // context. Validate the complete model and exact native gate connectivity
+    // before projecting any of its targets into instance-specialized banks.
+    if (bankedProgress) FAMEClockProgressBindings.resolveBanked(state) else FAMEClockProgressBindings.resolve(state)
     val unsupported = state.annotations.filterNot(supported)
     if (unsupported.nonEmpty) fail("input annotations require explicit clone/rename translation: " +
       unsupported.map(_.getClass.getName).distinct.mkString(", "))
@@ -228,7 +233,8 @@ private[checkpoint] object GeneratedStateBankAnnotations {
   }
   def annotationJSON(annotations: Seq[Annotation]): String = JsonProtocol.serialize(annotations.filter {
     case a if memoryPolicy(a) => true
-    case _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: SynthesisPlusArgConstantAnnotation |
+    case _: FAMEClockProgressModelAnnotation | _: FAMEClockProgressSignalAnnotation |
+         _: DontTouchAnnotation | _: MemoryFileInlineAnnotation | _: SynthesisPlusArgConstantAnnotation |
          _: firrtl.transforms.NoDedupAnnotation | _: firrtl.passes.InlineAnnotation |
          _: FirrtlMemModelAnnotation | _: InternalXDCAnnotation | _: XDCAnnotation | _: TargetBoxAnnotation |
          _: firrtl.transforms.DedupedResult => true
@@ -349,6 +355,19 @@ private[checkpoint] object GeneratedStateBankAnnotations {
         renamed
       }
     val requested = state.annotations.flatMap {
+      case a: FAMEClockProgressModelAnnotation =>
+        // Model/domain strings are immutable identities, not live FIRRTL names.
+        record(a, Seq(a.serialize))
+        Seq(a)
+      case a: FAMEClockProgressSignalAnnotation =>
+        // Retain every hierarchy hop, including the native gate leaf. Expanding
+        // a local pin across all BUFGCEs would alias different clock domains.
+        // Preflight proves exactly one execution and the full correlated roles;
+        // specialization may rename that execution but must never replicate it.
+        val copies = xdcCopies(Seq(a.target)).map(args => a.copy(target = args.head))
+        if (copies.size != 1) fail("FAME progress role requires one specialized execution")
+        record(a, copies.map(_.serialize))
+        copies
       case a: firrtl.transforms.DedupedResult =>
         val copies = a.duplicate match {
           case Some(target) => specialize(target).map(t => a.copy(duplicate = Some(t)))
