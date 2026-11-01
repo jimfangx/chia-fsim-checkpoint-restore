@@ -16,7 +16,8 @@ import org.json4s.native.JsonMethods.parse
 object NativeCheckpointLiveShellSnapshot {
   import SemanticStateInventory.{canonical, sha256}
   val definition = "CheckpointNativeStateSnapshot"
-  case class Result(state: CircuitState, shell: NativeCheckpointShellStateAccess.Result, binding: String)
+  case class Result(state: CircuitState, shell: NativeCheckpointShellStateAccess.Result, binding: String,
+      stageNativeState: Boolean = false)
   private def check(ok: Boolean, why: String): Unit =
     require(ok, "native live shell snapshot: " + why)
   private def statements(s: Statement): Seq[Statement] = {
@@ -24,7 +25,7 @@ object NativeCheckpointLiveShellSnapshot {
     def visit(x: Statement): Unit = { out += x; x.foreachStmt(visit) }
     visit(s); out.toSeq
   }
-  def generate(shell: NativeCheckpointShellStateAccess.Result): Result = {
+  def generate(shell: NativeCheckpointShellStateAccess.Result, stageNativeState: Boolean = false): Result = {
     NativeCheckpointShellStateAccess.validate(shell)
     check(shell.liveRegisters.nonEmpty, "explicit live register partition required")
     val doc = parse(shell.mapping)
@@ -103,6 +104,51 @@ object NativeCheckpointLiveShellSnapshot {
       bits += width.toInt
       row
     }
+    val originalBits = bits
+    val observation = parse(shell.banks.binding) \ "native_state_observation"
+    // The synchronous adapter already inventories every derived register,
+    // including its emitter-owned RAM data pipeline. Project its local names
+    // through the same shell graft rather than discovering a second subset.
+    val nativeRows = if (!stageNativeState) Nil else {
+      check(observation.isInstanceOf[JObject], "native staging requires a source-bound synchronous observation")
+      val local = (observation \ "state").asInstanceOf[JArray].arr
+      val JInt(nativeBits) = observation \ "bits"
+      val nativeModule = shell.banks.state.circuit.modules.head.asInstanceOf[Module]
+      val nativeDrivers = statements(nativeModule.body).collect {
+        case c: Connect => c.loc.serialize -> c.expr
+        case n: DefNode => n.name -> n.value
+      }.groupBy(_._1)
+      def sameRawClock(clock: String, seen: Set[String] = Set.empty): Boolean = {
+        check(!seen(clock), "native clock alias cycle")
+        if (Set(rawClock, "ckpt_clock")(clock)) true
+        else nativeDrivers.get(clock) match {
+          case Some(Seq((_, e: WRef))) if e.tpe == ClockType => sameRawClock(e.serialize, seen + clock)
+          case Some(Seq((_, e: WSubField))) if e.tpe == ClockType => sameRawClock(e.serialize, seen + clock)
+          case _ => false
+        }
+      }
+      check(nativeBits > 0 && nativeBits.isValidInt && bits.toLong + nativeBits.toLong + 71 <= Int.MaxValue,
+        "native staging vector exceeds supported width")
+      val projected = local.map { row =>
+        val JString(expression) = row \ "expression"
+        val JString(hierarchy) = row \ "hierarchy"
+        val JInt(offset) = row \ "offset"
+        val name = hierarchy.stripPrefix(shell.reference.circuit.main + ".")
+        check(name != hierarchy, "unrooted native state owner")
+        val actualName = if (name.startsWith("ckpt_")) p + name else name
+        val actualExpression = if (expression.startsWith("ckpt_")) p + expression else expression
+        val JString(clock) = row \ "clock_expression"
+        check(sameRawClock(clock), "native state must share the original raw clock")
+        val base = row.asInstanceOf[JObject].obj.filterNot(x =>
+          Set("hierarchy", "expression", "offset", "instrumented_state_id")(x._1))
+        JObject(base ++ List("hierarchy" -> JString(path + "." + actualName),
+          "expression" -> JString(actualExpression), "offset" -> JInt(originalBits + offset),
+          "instrumented_state_id" -> JString(SimulatorStateInventory.stateID(path + "." + actualName, "register")),
+          "local_instrumented_state_id" -> (row \ "instrumented_state_id")))
+      }
+      bits += nativeBits.toInt
+      projected
+    }
     def port(n: String, d: Direction, w: Int): Port = Port(NoInfo, n, d, UIntType(IntWidth(w)))
     val inputs = Seq("reset" -> 1, "request" -> 1, "release" -> 1, "owners_present" -> 1,
       "owners_frozen" -> 1, "target_cycle" -> 64, "word_address" -> 32)
@@ -121,7 +167,7 @@ object NativeCheckpointLiveShellSnapshot {
         "cut_cycle" -> 64, "error" -> 6, "control_state" -> (bits + 71))
         .map { case (n,w) => port(n, Output, w) }, definition,
       Seq(IntParam("BITS", bits), IntParam("RESTORE_ENABLE", 0)))
-    val vector = rows.reverse.map { row =>
+    val vector = (rows ++ nativeRows).reverse.map { row =>
       val JString(name) = row \ "expression"
       if ((row \ "signed") == JBool(true)) s"asUInt($name)" else name
     }.reduceLeft((a,b) => s"cat($a, $b)")
@@ -136,7 +182,7 @@ object NativeCheckpointLiveShellSnapshot {
     $instance.release_snapshot <= ${prefix}release
     $instance.owners_present <= and(${prefix}owners_present, not(${p}ckpt_reset))
     $instance.functional_frozen <= and(${p}ckpt_freeze, ${prefix}owners_frozen)
-    $instance.reader_idle <= not(${p}ckpt_pending)
+    $instance.reader_idle <= ${if (stageNativeState) s"and(${prefix}raw_req_ready, not(${prefix}raw_resp_valid))" else s"not(${p}ckpt_pending)"}
     $instance.borrow_attempt <= ${p}ckpt_req_valid
     $instance.target_cycle <= ${prefix}target_cycle
     $instance.live_state <= $vector
@@ -160,6 +206,15 @@ object NativeCheckpointLiveShellSnapshot {
       case x => x.mapExpr(expr)
     }
     def bank(s: Statement): Statement = s match {
+      // Initialize only derived explicit storage. The implicit RAM data owner
+      // is initialized by the original RAM execution, never invented/reset by
+      // this adapter. Once initialized, every inactive byte is retained.
+      case c: Connect if stageNativeState && nativeRows.exists(row =>
+          (row \ "expression") == JString(c.loc.serialize)) =>
+        val r = all.collect { case r: DefRegister if r.name == c.loc.serialize => r }.head
+        val zero = if (r.tpe.isInstanceOf[SIntType]) SIntLiteral(0, r.tpe.asInstanceOf[SIntType].width)
+          else UIntLiteral(0, r.tpe.asInstanceOf[UIntType].width)
+        c.copy(expr = Mux(WRef(p + "ckpt_reset", UIntType(IntWidth(1))), zero, expr(c.expr), r.tpe))
       case c: Connect if replaceOutputs.contains(c.loc.serialize) =>
         c.copy(loc = WRef(replaceOutputs(c.loc.serialize), c.loc.tpe), expr = expr(c.expr))
       case x => x.mapStmt(bank).mapExpr(expr)
@@ -197,8 +252,14 @@ object NativeCheckpointLiveShellSnapshot {
     val source = try new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8) finally in.close()
     val flags = List("complete_fpga_capture", "deployable_capture_image", "production_freeze_owners_bound",
       "metasim_restore_supported", "staging_restore_supported", "target_time_authority_proven").map(_ -> JBool(false))
-    val binding = canonical(JObject(List("snapshot_version" -> JInt(1),
-      "scope" -> JString("selected_original_live_shell_register_atomic_observation_only"),
+    val nativeBinding = if (!stageNativeState) Nil else List("native_state" -> JArray(nativeRows.toList),
+      "original_live_bits" -> JInt(originalBits), "native_bits" -> JInt(bits - originalBits),
+      "native_observation" -> observation,
+      "derived_initialization" -> JString("explicit_derived_registers_on_bank_reset_implicit_ram_data_by_original_execution"),
+      "reader_idle_contract" -> JString("all_native_phases_idle_and_no_pending_response"))
+    val binding = canonical(JObject(List("snapshot_version" -> JInt(if (stageNativeState) 2 else 1),
+      "scope" -> JString(if (stageNativeState) "live_shell_and_native_reader_atomic_observation_only" else
+        "selected_original_live_shell_register_atomic_observation_only"),
       "shell_binding_sha256" -> JString(sha256(shell.binding)),
       "wired_sha256" -> JString(sha256(state.circuit.serialize)),
       "wired_annotations_sha256" -> JString(sha256(firrtl.annotations.JsonProtocol.serialize(state.annotations))),
@@ -211,12 +272,12 @@ object NativeCheckpointLiveShellSnapshot {
       "bank_clock_contract" -> JString("independent_access_clock_removed_endpoint_tied_to_original_live_raw_clock"),
       "hold_contract" -> JString("request_or_occupied_or_retained_error_without_live_fault_feedback"),
       "unowned_native_state" -> (parse(shell.banks.binding) \ "native_state_observation"),
-      "original_unsupported_live_owners" -> JArray(owners)) ++ flags))
-    Result(state, shell, binding)
+      "original_unsupported_live_owners" -> JArray(owners)) ++ nativeBinding ++ flags))
+    Result(state, shell, binding, stageNativeState)
   }
 
   def validate(result: Result): Unit = {
-    val expected = generate(result.shell)
+    val expected = generate(result.shell, result.stageNativeState)
     check(result.state == expected.state && result.binding == expected.binding,
       "changed live owners, packing, read permission, raw clock, staging or binding")
   }

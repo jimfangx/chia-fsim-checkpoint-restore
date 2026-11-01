@@ -63,6 +63,65 @@ class NativeCheckpointLiveShellSnapshotSpec extends AnyFlatSpec {
     case _ => false
   }
   behavior.of("Atomic original live shell register staging")
+  it should "stage all original live and derived synchronous reader owners at the same preedge" in {
+    val memorySource = source.replace("    input reset : UInt<1>",
+      "    input writeEn : UInt<1>\n    input address : UInt<2>\n    input data : UInt<64>\n    input reset : UInt<1>")
+      .replace("    output live : UInt<237>", "    output memoryOut : UInt<64>\n    output live : UInt<237>")
+      .replace("    live <= cat(h,", """    mem mem :
+      data-type => UInt<64>
+      depth => 4
+      read-latency => 1
+      write-latency => 1
+      reader => r
+      writer => w
+      read-under-write => new
+    mem.r.clk <= clock
+    mem.r.en <= UInt<1>(1)
+    mem.r.addr <= address
+    memoryOut <= mem.r.data
+    mem.w.clk <= clock
+    mem.w.en <= writeEn
+    mem.w.addr <= address
+    mem.w.data <= data
+    mem.w.mask <= UInt<1>(1)
+    live <= cat(h,""")
+      .replace("    shell.reset <= reset", """    shell.reset <= reset
+    shell.writeEn <= writeEn
+    shell.address <= address
+    shell.data <= data
+    memoryOut <= shell.memoryOut""")
+    val s = shell(lower(memorySource))
+    val result = NativeCheckpointLiveShellSnapshot.generate(s, stageNativeState = true)
+    NativeCheckpointLiveShellSnapshot.validate(result)
+    assert(originalLive(s.state) == originalLive(result.state))
+    val doc = parse(result.binding)
+    val native = (doc \ "native_state").asInstanceOf[JArray].arr
+    val observation = parse(s.banks.binding) \ "native_state_observation"
+    assert(native.size == (observation \ "state").asInstanceOf[JArray].arr.size)
+    assert((doc \ "original_live_bits") == JInt(237))
+    assert((doc \ "bits") == JInt(237 + (observation \ "bits").asInstanceOf[JInt].num))
+    assert(native.exists(r => (r \ "expression") == JString("mem.r.data")))
+    assert(native.exists(r => (r \ "expression") == JString("checkpoint_shell_ckpt_native_phase")))
+    assert(native.exists(r => (r \ "expression") == JString("checkpoint_shell_ckpt_saved_data")))
+    assert(result.state.circuit.serialize.contains("reader_idle <= and(checkpoint_shell_live_snapshot_raw_req_ready, not(checkpoint_shell_live_snapshot_raw_resp_valid))"))
+    assert(!result.state.circuit.serialize.contains("checkpoint_shell_ckpt_clock"))
+    intercept[IllegalArgumentException] { NativeCheckpointLiveShellSnapshot.validate(result.copy(stageNativeState = false)) }
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { base =>
+      val out = java.nio.file.Paths.get(base, "live-shell-native-snapshot"); java.nio.file.Files.createDirectories(out)
+      Seq("source.fir" -> s.host.circuit.serialize, "source.sv" -> emit(s.host),
+        "banked.fir" -> s.state.circuit.serialize, "banked-binding.json" -> s.binding,
+        "banked-mapping.json" -> s.mapping, "banks-binding.json" -> s.banks.binding,
+        "wired.fir" -> result.state.circuit.serialize, "wired.sv" -> emit(result.state),
+        "wired.anno.json" -> JsonProtocol.serialize(result.state.annotations), "binding.json" -> result.binding)
+        .foreach { case (name,text) => java.nio.file.Files.write(out.resolve(name),
+          text.getBytes(java.nio.charset.StandardCharsets.UTF_8)) }
+    }
+  }
+  it should "refuse native staging without a complete source-bound reader observation" in {
+    assert(intercept[IllegalArgumentException] {
+      NativeCheckpointLiveShellSnapshot.generate(shell(), stageNativeState = true)
+    }.getMessage.contains("source-bound synchronous observation"))
+  }
   it should "stage all eight original owners while preserving their equations and tying all reads to the raw clock" in {
     val s = shell(); val result = NativeCheckpointLiveShellSnapshot.generate(s)
     NativeCheckpointLiveShellSnapshot.validate(result)
