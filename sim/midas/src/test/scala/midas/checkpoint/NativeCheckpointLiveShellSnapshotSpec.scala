@@ -118,9 +118,38 @@ class NativeCheckpointLiveShellSnapshotSpec extends AnyFlatSpec {
       assert((doc \ "local_readout_capture_words") == JInt(2))
       assert((doc \ "local_readout_capture_extra_storage_bits") == JInt(0))
       assert((doc \ "local_readout_capture_target_cycle_authority") == JBool(false))
+      assert((doc \ "local_readout_capture_permission_withdrawal") ==
+        JString("capture_hold_masks_local_permission_preserving_staging_owner"))
+      assert((doc \ "local_readout_capture_permission_extra_storage_bits") == JInt(0))
+      assert((doc \ "global_capture_permission_owner_bound") == JBool(false))
       assert((doc \ "complete_fpga_capture") == JBool(false))
       assert((doc \ "original_and_staging_restore_supported") == JBool(false))
       val root = captured.state.circuit.modules.find(_.name == "LiveTop").get
+      val permission = "checkpoint_live_readout_adapter.permission <= "
+      assert(root.serialize.contains(permission +
+        "and(checkpoint_shell_live_snapshot_borrow_enable, not(checkpoint_live_readout_capture_hold))"))
+      assert(readout.state.circuit.modules.find(_.name == "LiveTop").get.serialize.contains(
+        permission + "checkpoint_shell_live_snapshot_borrow_enable"))
+      // The capture control must never feed the staging request/release/reset.
+      // Restaging/releasing while the response is pending loses its epoch.
+      val stagedModule = captured.state.circuit.modules.find(_.name == "Shell").get
+      assert(!stagedModule.serialize.contains("checkpoint_live_readout_capture_hold"))
+      val changedPermission = captured.state.copy(circuit = captured.state.circuit.copy(
+        modules = captured.state.circuit.modules.map {
+          case m: Module if m.name == "LiveTop" =>
+            def alter(s: Statement): Statement = s match {
+              case c: Connect if c.loc.serialize == "checkpoint_live_readout_adapter.permission" =>
+                c.copy(expr = firrtl.WRef("checkpoint_shell_live_snapshot_borrow_enable", UIntType(IntWidth(1))))
+              case x => x.mapStmt(alter)
+            }
+            m.copy(body = alter(m.body))
+          case x => x
+        }))
+      val changedBinding = SemanticStateInventory.canonical(doc merge JObject(List(
+        "wired_sha256" -> JString(SemanticStateInventory.sha256(changedPermission.circuit.serialize)))))
+      intercept[IllegalArgumentException] {
+        NativeCheckpointLiveShellBankReadout.validate(captured.copy(state = changedPermission, binding = changedBinding))
+      }
       assert(root.ports.filter(_.name.startsWith("checkpoint_live_readout_capture_")).size == 5)
       assert(readout.state.circuit.modules.find(_.name == "LiveTop").get.ports.forall(p =>
         !p.name.startsWith("checkpoint_live_readout_capture_")))

@@ -121,7 +121,16 @@ object NativeCheckpointLiveShellBankReadout {
         wires ++ Seq(WDefInstance(instance, definition),
           Connect(NoInfo, pin("clock"), WRef(enclosingClock.stripPrefix(rootName + "."), ClockType)),
           Connect(NoInfo, pin("reset"), WRef(p + "ckpt_reset")),
-          Connect(NoInfo, pin("permission"), WRef(sp + "borrow_enable")),
+          // Withdrawing local bank permission must NOT release the immutable
+          // staging owner. In particular a pending snapshot response must be
+          // parked before permission disappears, on the same raw clock. This
+          // combinational mask and the leaf capture hold share one input; no
+          // additional state/epoch or independent cut authority is introduced.
+          Connect(NoInfo, pin("permission"), if (enableCapture)
+            DoPrim(firrtl.PrimOps.And, Seq(WRef(sp + "borrow_enable"),
+              DoPrim(firrtl.PrimOps.Not, Seq(WRef(prefix + "capture_hold", UIntType(IntWidth(1)))),
+                Nil, UIntType(IntWidth(1)))), Nil, UIntType(IntWidth(1)))
+            else WRef(sp + "borrow_enable")),
           Connect(NoInfo, pin("snapshot_state"), DoPrim(firrtl.PrimOps.Bits, Seq(WRef(sp + "control_state")),
             Seq(bits - 1, BigInt(0)), UIntType(IntWidth(bits)))),
           Connect(NoInfo, WRef(idlePort.name), pin("idle")),
@@ -166,6 +175,10 @@ object NativeCheckpointLiveShellBankReadout {
       "local_readout_capture_extra_storage_bits" -> JInt(0),
       "local_readout_capture_transport" -> JString("stateless_sideband_64_bit_words_lsb0_zero_padded"),
       "local_readout_capture_target_cycle_authority" -> JBool(false),
+      "local_readout_capture_permission_withdrawal" -> JString(if (enableCapture)
+        "capture_hold_masks_local_permission_preserving_staging_owner" else "disabled"),
+      "local_readout_capture_permission_extra_storage_bits" -> JInt(0),
+      "global_capture_permission_owner_bound" -> JBool(false),
       "original_and_staging_restore_supported" -> JBool(false),
       "files" -> JObject(files.map(f => f.fileSuffix -> JString(sha256(f.body))).toList),
       "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
