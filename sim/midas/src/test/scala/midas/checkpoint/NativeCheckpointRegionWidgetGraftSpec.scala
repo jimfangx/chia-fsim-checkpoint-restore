@@ -171,6 +171,19 @@ class NativeCheckpointRegionWidgetGraftSpec extends AnyFlatSpec {
     save("live-transport-partition-binding.json", mixed.binding)
     save("live-transport-partition-identity.json", identity.manifest)
     save("live-transport-partition.fir", mixed.state.circuit.serialize)
+    // Stage the real compiler-selected local registers without freezing their
+    // MMIO/DMA execution. This remains separate from region/widget hookup:
+    // the staging owner, native reader and complete restore are still unowned.
+    val staged = NativeCheckpointLiveShellSnapshot.generate(shell)
+    NativeCheckpointLiveShellSnapshot.validate(staged)
+    val observation = parse(staged.binding)
+    assert((observation \ "bits") == JInt(228))
+    assert((observation \ "staging_owner_bits") == JInt(299))
+    assert((observation \ "state").asInstanceOf[JArray].arr.map(_ \ "state_id").toSet ==
+      owners.map(_ \ "state_id").toSet)
+    assert((observation \ "complete_fpga_capture") == JBool(false))
+    save("live-transport-staged.fir", staged.state.circuit.serialize)
+    save("live-transport-staged-binding.json", staged.binding)
     intercept[IllegalArgumentException] {
       NativeCheckpointLiveTransportSelection.registers(policyBefore, policyAfter,
         ModuleTarget("foreign", "FPGATop"))
