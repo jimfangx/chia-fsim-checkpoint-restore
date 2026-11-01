@@ -93,6 +93,34 @@ class NativeCheckpointLiveShellSnapshotSpec extends AnyFlatSpec {
     val s = shell(lower(memorySource))
     val result = NativeCheckpointLiveShellSnapshot.generate(s, stageNativeState = true)
     NativeCheckpointLiveShellSnapshot.validate(result)
+    val readout = NativeCheckpointLiveShellBankReadout.generate(result)
+    NativeCheckpointLiveShellBankReadout.validate(readout)
+    val descriptors = midas.widgets.CheckpointCaptureDescriptors.fromLiveShellSnapshotReadout(readout)
+    assert(descriptors.entries.dropRight(1) == s.entries)
+    assert(descriptors.entries.last == readout.entry && readout.entry.width == 64 && readout.entry.depth == 9)
+    assert(readout.entry.bank == s.entries.map(_.bank).max + 1)
+    assert(originalLive(s.state) == originalLive(readout.state))
+    assert((parse(readout.binding) \ "readout_owner_bits") == JInt(69))
+    intercept[IllegalArgumentException] {
+      NativeCheckpointLiveShellBankReadout.validate(readout.copy(entry = readout.entry.copy(depth = 1)))
+    }
+    val changedReadout = readout.state.copy(circuit = readout.state.circuit.copy(info = FileInfo(StringLit("changed"))))
+    val rehashedReadout = SemanticStateInventory.canonical(parse(readout.binding) merge JObject(List(
+      "wired_sha256" -> JString(SemanticStateInventory.sha256(changedReadout.circuit.serialize)))))
+    intercept[IllegalArgumentException] {
+      NativeCheckpointLiveShellBankReadout.validate(readout.copy(state = changedReadout, binding = rehashedReadout))
+    }
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { base =>
+      val out = java.nio.file.Paths.get(base, "live-shell-bank-readout"); java.nio.file.Files.createDirectories(out)
+      Seq("source.fir" -> s.host.circuit.serialize, "banked.fir" -> s.state.circuit.serialize,
+        "snapshot.fir" -> result.state.circuit.serialize, "snapshot-binding.json" -> result.binding,
+        "banked-binding.json" -> s.binding, "banked-mapping.json" -> s.mapping, "banks-binding.json" -> s.banks.binding,
+        "wired.fir" -> readout.state.circuit.serialize, "wired.sv" -> emit(readout.state),
+        "wired.anno.json" -> JsonProtocol.serialize(readout.state.annotations), "binding.json" -> readout.binding,
+        "descriptors.json" -> descriptors.manifest, "descriptor-binding.json" -> descriptors.binding)
+        .foreach { case (name,text) => java.nio.file.Files.write(out.resolve(name),
+          text.getBytes(java.nio.charset.StandardCharsets.UTF_8)) }
+    }
     assert(originalLive(s.state) == originalLive(result.state))
     val doc = parse(result.binding)
     val native = (doc \ "native_state").asInstanceOf[JArray].arr

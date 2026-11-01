@@ -24,6 +24,44 @@ final class CheckpointCaptureDescriptors private (
 }
 
 object CheckpointCaptureDescriptors {
+  /** Bind the unchanged original bank table and an immutable staged vector to
+    * the actual shared readout network. The packed vector has its own identity;
+    * the binding retains every constituent original/native StateID and offset.
+    * New live router/response state remains an explicit unsupported owner.
+    */
+  def fromLiveShellSnapshotReadout(readout: midas.checkpoint.NativeCheckpointLiveShellBankReadout.Result):
+      CheckpointCaptureDescriptors = {
+    midas.checkpoint.NativeCheckpointLiveShellBankReadout.validate(readout)
+    // This local readout need not contain physical clock gates. The production
+    // fromNativeShell path still requires its complete physical-cut discovery;
+    // reconstruct the local extraction above rather than weakening that path.
+    val shell = readout.snapshot.shell
+    val entries = shell.entries :+ readout.entry
+    require(entries.map(e => e.bank -> e.slot).distinct.size == entries.size &&
+      entries.map(_.stateID).distinct.size == entries.size, "live shell descriptor aliases original storage")
+    val flags = Seq("complete_fpga_capture", "deployable_capture_image", "production_freeze_owners_bound",
+      "metasim_restore_supported", "reserved_widget_descriptor_layout_installed").map(_ -> JBool(false))
+    val e = readout.entry
+    val manifest = SemanticStateInventory.canonical(JObject(List("descriptor_version" -> JInt(1),
+      "scope" -> JString("selected_live_shell_original_and_staged_payload_banks_only"),
+      "original_mapping" -> parse(shell.mapping),
+      "state" -> JArray(shell.entries.zipWithIndex.map { case (entry, i) => JObject(List(
+        "ordinal" -> JInt(i), "state_id" -> JString(entry.stateID), "bank" -> JInt(entry.bank),
+        "slot" -> JInt(entry.slot), "width" -> JInt(entry.width), "depth" -> JInt(entry.depth),
+        "domain" -> JString("original_shell_storage"))) }.toList :+
+        JObject(List("ordinal" -> JInt(shell.entries.size), "state_id" -> JString(e.stateID),
+          "bank" -> JInt(e.bank), "slot" -> JInt(e.slot), "width" -> JInt(e.width), "depth" -> JInt(e.depth),
+          "domain" -> JString("immutable_live_shell_and_native_payload")))),
+      "readout_binding_sha256" -> JString(SemanticStateInventory.sha256(readout.binding)),
+      "readout_binding" -> parse(readout.binding)) ++ flags))
+    val binding = SemanticStateInventory.canonical(JObject(List("binding_version" -> JInt(1),
+      "scope" -> JString("source_bound_live_shell_shared_bank_readout_only"),
+      "manifest_sha256" -> JString(SemanticStateInventory.sha256(manifest)),
+      "original_binding" -> parse(shell.binding), "manifest" -> parse(manifest)) ++ flags))
+    new CheckpointCaptureDescriptors(SemanticStateInventory.sha256(manifest), SemanticStateInventory.sha256(binding),
+      entries, manifest, binding, 0)
+  }
+
   /** Compose independently reconstructed regions of the SAME original host.
     * The returned ROM uses router-global selectors and enclosing StateIDs.
     * Missing owners remain explicit; this does not bind the shared freeze,
