@@ -27,6 +27,75 @@ class F2ClockResetCutWiringSpec extends AnyFlatSpec {
       s.copy(annotations = Seq(firrtl.EmitCircuitAnnotation(e.getClass)))).getEmittedCircuit.value
   }
   behavior.of("Compiler-connected F2 common-cut collector")
+  it should "stage collector and idle endpoint atomically before opening functional banks" in {
+    val s = lower(); val inv = SimulatorStateInventory.discover(s)
+    val plan = PhysicalClockCutPlan.discover(s, inv)
+    val deps = PhysicalClockCutDependencies.discover(s, inv, plan)
+    val banks = GeneratedStateBankAccess.generatePhysicalCompanion(s, inv, plan, deps)
+    val r = F2NativeCollectorSnapshot.generate(s, inv, plan, "reset", "count", 4, deps, banks)
+    val root = r.state.circuit.modules.collectFirst { case m: Module if m.name == s.circuit.main => m }.get
+    val text = root.body.serialize
+    assert(text.contains("checkpoint_f2_shadow_adapter.clock <= clock"))
+    assert(text.contains("checkpoint_f2_shadow_adapter.reader_idle <= not(ckpt_pending)"))
+    assert(text.contains("cat(checkpoint_f2_control_state, cat(ckpt_saved_error, cat(ckpt_saved_data, ckpt_pending)))"))
+    assert(text.contains("checkpoint_f2_shadow_permission <= and(checkpoint_f2_shadow_adapter.borrow_enable, checkpoint_f2_read_enable)"))
+    Seq("checkpoint_f2_bank_ckpt_req_valid", "ckpt_req_ready", "ckpt_resp_valid", "checkpoint_f2_bank_ckpt_resp_ready")
+      .foreach(n => assert(text.linesIterator.find(_.trim.startsWith(n + " <=")).get.contains("checkpoint_f2_shadow_permission")))
+    val binding = parse(r.binding)
+    assert((binding \ "bits") == JInt(147) && (binding \ "staging_owner_bits") == JInt(218))
+    assert((binding \ "words") == JInt(3) && (binding \ "state").asInstanceOf[JArray].arr.size == 4)
+    assert((binding \ "staging_restore_supported") == JBool(false))
+    assert((binding \ "deployable_capture_image") == JBool(false))
+    val endpoint = scala.collection.mutable.ArrayBuffer.empty[DefRegister]
+    val initialized = scala.collection.mutable.ArrayBuffer.empty[Connect]
+    def registers(s: Statement): Unit = { s match {
+      case r: DefRegister if Set("ckpt_saved_data", "ckpt_saved_error")(r.name) => endpoint += r
+      case c: Connect if Set("ckpt_saved_data", "ckpt_saved_error")(c.loc.serialize) => initialized += c
+      case _ => ()
+    }; s.foreachStmt(registers) }
+    registers(root.body)
+    assert(endpoint.size == 2 && endpoint.forall(_.clock.serialize == "ckpt_clock"))
+    assert(initialized.size == 2 && initialized.forall(c => c.expr match {
+      case Mux(cond, UIntLiteral(zero, _), _, _) => cond.serialize == "checkpoint_f2_controller_reset" && zero == 0
+      case _ => false
+    }))
+    assert((binding \ "endpoint_initialization") ==
+      JString("pending_data_and_error_synchronous_ungated_controller_reset_zero"))
+    val emitted = emit(r.state)
+    assert(emitted.contains(".RESTORE_ENABLE(0)"))
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { base =>
+      val out = Paths.get(base).resolve("f2-staged-collector").resolve("fixture"); Files.createDirectories(out)
+      Seq("reference.fir" -> s.circuit.serialize, "reference.sv" -> emit(s),
+        "wired.fir" -> r.state.circuit.serialize, "wired.sv" -> emitted,
+        "audit.json" -> r.collector.reset.audit, "binding.json" -> r.collector.binding,
+        "staging-binding.json" -> r.binding, "reset-binding.json" -> r.collector.reset.binding,
+        "banks-binding.json" -> banks.binding, "manifest.json" -> inv,
+        "plan.json" -> plan, "dependencies.json" -> deps).foreach { case (n, body) =>
+        Files.write(out.resolve(n), body.getBytes(UTF_8))
+      }
+    }
+  }
+
+  it should "reject staging namespace collisions and stale bank ownership without modifying the input" in {
+    def stage(s: CircuitState): Unit = {
+      val inv = SimulatorStateInventory.discover(s); val plan = PhysicalClockCutPlan.discover(s, inv)
+      val deps = PhysicalClockCutDependencies.discover(s, inv, plan)
+      val banks = GeneratedStateBankAccess.generatePhysicalCompanion(s, inv, plan, deps)
+      F2NativeCollectorSnapshot.generate(s, inv, plan, "reset", "count", 4, deps, banks)
+    }
+    val collision = lower(source.replace("    output count : UInt<64>",
+      "    output count : UInt<64>\n    input checkpoint_f2_shadow_request : UInt<1>"))
+    intercept[IllegalArgumentException] { stage(collision) }
+    val s = lower(); val original = s.circuit.serialize
+    val inv = SimulatorStateInventory.discover(s); val plan = PhysicalClockCutPlan.discover(s, inv)
+    val deps = PhysicalClockCutDependencies.discover(s, inv, plan)
+    val banks = GeneratedStateBankAccess.generatePhysicalCompanion(s, inv, plan, deps)
+    intercept[IllegalArgumentException] {
+      F2NativeCollectorSnapshot.generate(s, inv, plan, "reset", "count", 4, deps, banks.copy(entries = banks.entries.drop(1)))
+    }
+    assert(s.circuit.serialize == original)
+  }
+
   it should "connect native banks to an ungated endpoint and hold the collector cut through response drain" in {
     val s = lower(); val inv = SimulatorStateInventory.discover(s)
     val plan = PhysicalClockCutPlan.discover(s, inv)
