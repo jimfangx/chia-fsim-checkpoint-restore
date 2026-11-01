@@ -218,6 +218,7 @@ object PhysicalClockCutWiring {
       GoldenGateOutputFileAnnotation(canonical(JObject(List("wiring_binding_sha256" -> JString(sha256(result.binding)),
         "wired_verilog_sha256" -> JString(sha256(verilog))))), ".physical-clock-wiring-emission.json")) ++
       PhysicalClockStateBank.emit(state, manifest, plan, dependencies) ++
-      SynchronousResetCutWiring.emit(state, manifest, plan) ++ F2ClockResetCutWiring.emit(state, manifest, plan)
+      SynchronousResetCutWiring.emit(state, manifest, plan) ++ F2ClockResetCutWiring.emit(state, manifest, plan) ++
+      FAMEClockCutWiring.emit(state, manifest, plan)
   }
 }

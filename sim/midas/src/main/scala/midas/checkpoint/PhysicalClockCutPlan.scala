@@ -31,6 +31,7 @@ object PhysicalClockCutPlan {
     PhysicalClockCutWiring.validateRequest(annotations)
     SynchronousResetCutWiring.validateRequest(annotations)
     F2ClockResetCutWiring.validateRequest(annotations)
+    FAMEClockCutWiring.validateRequest(annotations)
     val n = annotations.count(_ == PhysicalClockCutPlanAnnotation)
     if (n == 0) return
     if (n != 1) fail("exactly one clock-plan request is required")

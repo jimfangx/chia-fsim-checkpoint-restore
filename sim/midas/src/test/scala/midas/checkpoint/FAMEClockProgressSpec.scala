@@ -109,6 +109,100 @@ class FAMEClockProgressSpec extends AnyFlatSpec {
     }))
   }
   behavior.of("FAME construction-site clock progress")
+  it should "bind the applied-edge label and checked local owner into the generated raw-clock collector" in {
+    val state = emit(transform(true))._1.copy(form = LowForm)
+    val inv = SimulatorStateInventory.discover(state)
+    val plan = PhysicalClockCutPlan.discover(state, inv)
+    val result = FAMEClockCutWiring.generate(state, inv, plan, "hostReset", "clockA", 3)
+    FAMEClockCutWiring.validate(state, inv, plan, "hostReset", "clockA", 3, result)
+    val root = result.state.circuit.modules.collectFirst { case m: Module if m.name == "Top" => m }.get
+    val text = result.state.circuit.serialize
+    assert(root.ports.find(_.name == "checkpoint_f2_owner_present").get.tpe == UIntType(IntWidth(3)))
+    assert(text.contains("checkpoint_f2_adapter.target_cycle <= checkpoint_fame_cut_applied_cycle"))
+    assert(text.contains("cat(checkpoint_fame_cut_consistent, checkpoint_f2_owner_present)"))
+    assert(text.contains("checkpoint_fame_cut_applied_cycle <= checkpoint_fame_clockA_applied"))
+    assert(text.contains("eq(checkpoint_fame_clockB_consumed, add(checkpoint_fame_clockB_applied, clockB_enabled))"))
+    assert(text.contains("checkpoint_f2_adapter.clock <= hostClock"))
+    val binding = org.json4s.native.JsonMethods.parse(result.binding)
+    assert((binding \ "label_role") == org.json4s.JString("applied"))
+    assert((binding \ "fame_owner_bit") == org.json4s.JInt(3))
+    assert((binding \ "global_target_cut_proven") == org.json4s.JBool(false))
+    assert((binding \ "deployable_capture_image") == org.json4s.JBool(false))
+    def storage(s: CircuitState) = s.circuit.modules.collect { case m: Module =>
+      val names = scala.collection.mutable.ArrayBuffer.empty[String]
+      def visit(x: Statement): Unit = { x match { case r: DefRegister => names += r.serialize; case _ => () }; x.foreachStmt(visit) }
+      visit(m.body); names.size
+    }.sum
+    assert(storage(state) == storage(result.state))
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { base =>
+      val out = Paths.get(base).resolve("fame-cut"); Files.createDirectories(out)
+      val e = new SemanticCleanEmitter
+      val rtl = new Compiler(Seq(firrtl.options.Dependency.fromTransform(e)), Forms.LowForm, Set(e)).execute(
+        result.state.copy(annotations = Seq(EmitCircuitAnnotation(e.getClass)))).getEmittedCircuit.value
+      Seq("reference.fir" -> state.circuit.serialize, "reference.sv" -> emit(transform(false))._2,
+        "wired.fir" -> result.state.circuit.serialize, "wired.sv" -> rtl,
+        "binding.json" -> result.binding, "collector-binding.json" -> result.collector.binding,
+        "manifest.json" -> inv, "plan.json" -> plan).foreach { case (n, body) =>
+        Files.write(out.resolve(n), body.getBytes(UTF_8))
+      }
+    }
+  }
+
+  it should "reject incomplete roles domains stale inputs and coherently rehashed missing witness wiring" in {
+    import org.json4s._
+    import org.json4s.native.JsonMethods.parse
+    val s = emit(transform(true))._1.copy(form = LowForm); val inv = SimulatorStateInventory.discover(s)
+    val plan = PhysicalClockCutPlan.discover(s, inv)
+    def generate(state: CircuitState = s, domain: String = "clockA", owners: Int = 3) =
+      FAMEClockCutWiring.generate(state, inv, plan, "hostReset", domain, owners)
+    for (domain <- Seq("", "missing")) intercept[IllegalArgumentException](generate(domain = domain))
+    for (owners <- Seq(0, 65536)) intercept[IllegalArgumentException](generate(owners = owners))
+    intercept[IllegalArgumentException](FAMEClockCutWiring.generate(s, inv + " ", plan, "hostReset", "clockA", 3))
+    intercept[IllegalArgumentException](FAMEClockCutWiring.generate(s, inv, plan + " ", "hostReset", "clockA", 3))
+    for (role <- Seq("applied", "pending_flag", "overflow", "gate_ce")) {
+      val first = s.annotations.collectFirst { case a: FAMEClockProgressSignalAnnotation if a.role == role => a }.get
+      intercept[IllegalArgumentException](generate(s.copy(annotations = s.annotations.filterNot(_ == first))))
+    }
+    val result = generate()
+    val changedCircuit = result.state.circuit.copy(modules = result.state.circuit.modules.map {
+      case m: Module if m.name == "Top" =>
+        def change(x: Statement): Statement = x match {
+          case c: Connect if c.loc.serialize == "checkpoint_f2_adapter.target_cycle" =>
+            c.copy(expr = UIntLiteral(0, IntWidth(64)))
+          case other => other.mapStmt(change)
+        }
+        m.copy(body = change(m.body))
+      case m => m
+    })
+    val changedBinding = SemanticStateInventory.canonical(parse(result.binding).transformField {
+      case ("wired_reference_sha256", _) => "wired_reference_sha256" -> JString(SemanticStateInventory.sha256(changedCircuit.serialize))
+    })
+    intercept[IllegalArgumentException](FAMEClockCutWiring.validate(s, inv, plan, "hostReset", "clockA", 3,
+      result.copy(state = result.state.copy(circuit = changedCircuit), binding = changedBinding)))
+    intercept[IllegalArgumentException](FAMEClockCutWiring.validate(s, inv, plan, "hostReset", "clockB", 3, result))
+  }
+
+  it should "require an isolated FAME collector request and emit source-bound siblings only" in {
+    import org.json4s._
+    import org.json4s.native.JsonMethods.parse
+    val s = emit(transform(true))._1.copy(form = LowForm)
+    val as = Seq(SimulatorCheckpointInventoryAnnotation("Top"), PhysicalClockCutPlanAnnotation,
+      PhysicalClockCutWiringProbeAnnotation, SynchronousResetCutWiringAnnotation("hostReset"),
+      FAMEClockCutWiringAnnotation("clockA", 3))
+    val input = s.copy(annotations = s.annotations ++ as)
+    PhysicalClockCutPlan.validateCardinality(input.annotations)
+    for (bad <- Seq(as :+ as.last, as :+ F2ClockResetCutWiringAnnotation("bad", 3), as.dropRight(2) :+ as.last,
+        as.dropRight(1) :+ FAMEClockCutWiringAnnotation("bad:domain", 3)))
+      intercept[IllegalArgumentException](FAMEClockCutWiring.validateRequest(bad))
+    val inv = SimulatorStateInventory.discover(input); val plan = PhysicalClockCutPlan.discover(input, inv)
+    val files = FAMEClockCutWiring.emit(input, inv, plan)
+    assert(files.size == 5 && files.forall(_.fileSuffix.startsWith(".f2-fame-clock-cut")))
+    val binding = parse(files.find(_.fileSuffix.endsWith("-binding.json")).get.body)
+    assert((binding \ "deployable_capture_image") == JBool(false))
+    intercept[IllegalArgumentException](FAMEClockCutWiring.emit(input.copy(annotations = input.annotations ++ files), inv, plan))
+    assert(FAMEClockCutWiring.emit(s, inv, plan).isEmpty)
+  }
+
   it should "observe actual clock consumption and delayed native launches without changing original rules" in {
     val reference = transform(false); val observed = transform(true)
     assert(!observed.annotations.contains(FAMEClockProgressAnnotation))
