@@ -2,13 +2,20 @@
 // bits. This does not freeze or discover state. read_enable must certify the
 // complete immutable vector and its common cut for the entire transaction.
 // The response registers below are a separate live readout owner; they are
-// not silently appended to the staged vector or claimed to be restorable.
+// not silently appended to the staged vector. Opt-in restore below covers
+// only this response owner; it cannot restore or freeze the staged vector.
 module CheckpointSnapshotStateBank #(
     parameter integer BITS = 6727,
     parameter [7:0] BANK = 8'd254,
-    parameter [15:0] SLOT = 16'd0
+    parameter [15:0] SLOT = 16'd0,
+    parameter integer RESTORE_ENABLE = 0
 ) (
     input wire clock, reset, read_enable,
+    // Local response-owner restore only. The caller parks all bank traffic
+    // and separately restores the immutable payload and original endpoint.
+    input wire restore_hold, restore_load,
+    input wire [66:0] restore_state,
+    output wire restore_ready,
     input wire [BITS-1:0] snapshot_state,
     input wire request_valid,
     output wire request_ready,
@@ -20,7 +27,7 @@ module CheckpointSnapshotStateBank #(
     output wire [63:0] response_data,
     output wire response_error,
     output reg failed,
-    // Exact new storage, LSB first: data, error, pending, failed. No restore.
+    // Exact storage, LSB first: data, error, pending, failed.
     output wire [66:0] control_state
 );
     localparam integer WORDS = (BITS + 63) / 64;
@@ -29,8 +36,13 @@ module CheckpointSnapshotStateBank #(
     reg [63:0] saved_data;
     reg saved_error;
     wire [PAD_BITS-1:0] padded = {{(PAD_BITS-BITS){1'b0}}, snapshot_state};
-    wire fault = pending && !read_enable;
-    wire permission = read_enable && !failed && !fault && !reset;
+    wire restoring = RESTORE_ENABLE != 0 && restore_hold;
+    wire load_attempt = RESTORE_ENABLE != 0 && restore_load;
+    wire unsafe_restore = (load_attempt && !restoring) ||
+        (restoring && (read_enable || request_valid || response_ready));
+    wire fault = (pending && !read_enable && !restoring) || unsafe_restore;
+    wire permission = read_enable && !failed && !fault && !reset && !restoring && !load_attempt;
+    assign restore_ready = restoring && !unsafe_restore && !reset;
     wire invalid = bank != BANK || slot != SLOT || address >= WORDS;
     assign request_ready = permission && !pending;
     assign response_valid = permission && pending;
@@ -43,6 +55,11 @@ module CheckpointSnapshotStateBank #(
             saved_data <= 0;
             saved_error <= 0;
             failed <= 0;
+        end else if (load_attempt && restore_ready) begin
+            saved_data <= restore_state[63:0];
+            saved_error <= restore_state[64];
+            pending <= restore_state[65];
+            failed <= restore_state[66];
         end else begin
             if (fault) failed <= 1;
             if (request_valid && request_ready) begin

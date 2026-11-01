@@ -96,6 +96,25 @@ class NativeCheckpointLiveShellSnapshotSpec extends AnyFlatSpec {
     val readout = NativeCheckpointLiveShellBankReadout.generate(result)
     NativeCheckpointLiveShellBankReadout.validate(readout)
     val descriptors = midas.widgets.CheckpointCaptureDescriptors.fromLiveShellSnapshotReadout(readout)
+    val restorable = NativeCheckpointLiveShellBankReadout.generate(result, enableRestore = true)
+    NativeCheckpointLiveShellBankReadout.validate(restorable)
+    assert(restorable.entry == readout.entry && originalLive(s.state) == originalLive(restorable.state))
+    assert((parse(restorable.binding) \ "local_readout_restore_enabled") == JBool(true))
+    assert((parse(restorable.binding) \ "original_and_staging_restore_supported") == JBool(false))
+    assert((parse(restorable.binding) \ "metasim_restore_supported") == JBool(false))
+    assert(restorable.state.circuit.modules.collect { case m: ExtModule if m.name ==
+      NativeCheckpointLiveShellBankReadout.definition => m.params }.head.contains(IntParam("RESTORE_ENABLE", 1)))
+    assert(readout.state.circuit.modules.collect { case m: ExtModule if m.name ==
+      NativeCheckpointLiveShellBankReadout.definition => m.params }.head.contains(IntParam("RESTORE_ENABLE", 0)))
+    intercept[IllegalArgumentException] {
+      NativeCheckpointLiveShellBankReadout.validate(restorable.copy(enableRestore = false))
+    }
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { base =>
+      val out = java.nio.file.Paths.get(base, "live-shell-bank-readout-restore"); java.nio.file.Files.createDirectories(out)
+      Seq("wired.fir" -> restorable.state.circuit.serialize, "wired.sv" -> emit(restorable.state),
+        "binding.json" -> restorable.binding).foreach { case (name,text) =>
+          java.nio.file.Files.write(out.resolve(name), text.getBytes(java.nio.charset.StandardCharsets.UTF_8)) }
+    }
     assert(descriptors.entries.dropRight(1) == s.entries)
     assert(descriptors.entries.last == readout.entry && readout.entry.width == 64 && readout.entry.depth == 9)
     assert(readout.entry.bank == s.entries.map(_.bank).max + 1)
