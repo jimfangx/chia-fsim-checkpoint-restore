@@ -62,8 +62,23 @@ object F2ClockResetCutWiring {
 
   def generate(input: CircuitState, manifest: String, plan: String, resetPort: String,
       cyclePort: String, owners: Int): Result = {
+    generateImpl(input, manifest, plan, resetPort, cyclePort, owners,
+      SynchronousResetCutWiring.generate(input, manifest, plan, resetPort), None)
+  }
+
+  /** Connect native readout to the collector, not to independently driven mask,
+    * freeze, reset or access-clock ports. This remains an isolated sibling:
+    * external owners, target-time authority and production transport are pending.
+    */
+  def generateNative(input: CircuitState, manifest: String, plan: String, resetPort: String,
+      cyclePort: String, owners: Int, dependencies: String, banks: GeneratedStateBankAccess.Result): Result =
+    generateImpl(input, manifest, plan, resetPort, cyclePort, owners,
+      SynchronousResetCutWiring.generateNative(input, manifest, plan, resetPort, dependencies, banks), Some(banks))
+
+  private def generateImpl(input: CircuitState, manifest: String, plan: String, resetPort: String,
+      cyclePort: String, owners: Int, reset: SynchronousResetCutWiring.Result,
+      banks: Option[GeneratedStateBankAccess.Result]): Result = {
     if (owners < 1 || owners > 65536) fail("owner count outside 1..65536")
-    val reset = SynchronousResetCutWiring.generate(input, manifest, plan, resetPort)
     val root = reset.state.circuit.modules.collectFirst { case m: Module if m.name == input.circuit.main => m }.get
     val declarations = root.ports.map(_.name) ++ all(root.body).collect { case d: IsDeclaration => d.name }
     if (declarations.exists(_.startsWith(prefix)) || reset.state.circuit.modules.exists {
@@ -71,8 +86,11 @@ object F2ClockResetCutWiring {
       case m => m.name == definition
     })
       fail("reserved collector identifier collision")
-    if (!root.ports.exists(p => p.name == cyclePort && p.direction == Output && p.tpe == UIntType(IntWidth(64))) ||
-        !all(root.body).exists { case c: Connect => c.loc.serialize == cyclePort; case _ => false })
+    val originalRoot = input.circuit.modules.collectFirst {
+      case m: Module if m.name == input.circuit.main => m
+    }.get
+    if (!originalRoot.ports.exists(p => p.name == cyclePort && p.direction == Output && p.tpe == UIntType(IntWidth(64))) ||
+        !all(originalRoot.body).exists { case c: Connect => c.loc.serialize == cyclePort; case _ => false })
       fail("cycle source must be an existing driven scalar UInt<64> root output")
     val gates = (parse(plan) \ "physical_gates").asInstanceOf[JArray].arr.size
     val clock = (parse(plan) \ "common_source_clock").asInstanceOf[JString].s
@@ -114,10 +132,11 @@ object F2ClockResetCutWiring {
       Connect(NoInfo, pin("owner_present"), checkedOwners)) ++
       inputs.filterNot(_._1 == "owner_present").map { case (n, _) => Connect(NoInfo, pin(n), WRef(prefix + n)) } ++
       exported.map { case (n, _) => Connect(NoInfo, WRef(prefix + n), pin(n)) }
-    val finalRoot = root.copy(ports = root.ports.filterNot(p => internal.contains(p.name)) ++
+    val collectorRoot = root.copy(ports = root.ports.filterNot(p => internal.contains(p.name)) ++
       inputs.map { case (n, w) => port(prefix + n, Input, w) } ++
       exported.map { case (n, w) => port(prefix + n, Output, w) },
       body = Block(before ++ Seq(root.body) ++ connections))
+    val finalRoot = banks.map(_ => connectNativeEndpoint(collectorRoot, clock)).getOrElse(collectorRoot)
     val circuit = reset.state.circuit.copy(modules = reset.state.circuit.modules.map {
       case m if m.name == root.name => finalRoot
       case m => m
@@ -128,7 +147,8 @@ object F2ClockResetCutWiring {
     firrtl.passes.CheckTypes.run(flowed); firrtl.passes.CheckFlows.run(flowed)
     val state = reset.state.copy(circuit = flowed)
     val binding = canonical(JObject(List("f2_cut_wiring_version" -> JInt(1),
-      "scope" -> JString("compiler_connected_f2_collector_sibling_only"),
+      "scope" -> JString(if (banks.nonEmpty) "compiler_connected_native_bank_collector_sibling_only"
+        else "compiler_connected_f2_collector_sibling_only"),
       "reference_sha256" -> JString(sha256(input.circuit.serialize)),
       "simulator_manifest_sha256" -> JString(sha256(manifest)), "plan_sha256" -> JString(sha256(plan)),
       "reset_wiring_sha256" -> JString(sha256(reset.binding)),
@@ -142,8 +162,57 @@ object F2ClockResetCutWiring {
       "external_inputs" -> JArray(inputs.map { case (n, _) => JString(prefix + n) }.toList),
       "target_time_authority_proven" -> JBool(false), "production_shell_installed" -> JBool(false),
       "production_freeze_owners_bound" -> JBool(false), "collector_state_atomically_owned" -> JBool(false),
-      "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false))))
+      "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false)) ++ banks.toList.flatMap { b => List(
+        "bank_binding_sha256" -> JString(sha256(b.binding)),
+        "functional_entries" -> JInt(b.entries.size),
+        "endpoint_clock" -> JString(root.name + "." + clock),
+        "endpoint_reset" -> JString(prefix + "controller_reset"),
+        "endpoint_freeze" -> JString(prefix + "clock_mask"),
+        "read_permission" -> JString(prefix + "read_enable"),
+        "release_contract" -> JString("block_new_requests_and_hold_cut_until_accepted_response_drains"),
+        "cancellation_contract" -> JString("revoke_both_handshakes_and_keep_failed_cut_stopped_until_controller_reset")) }))
     Result(state, reset, binding)
+  }
+
+  private def connectNativeEndpoint(root: Module, clock: String): Module = {
+    val bit = UIntType(IntWidth(1))
+    val owned = Map("ckpt_clock" -> ClockType, "ckpt_reset" -> bit, "ckpt_freeze" -> bit,
+      "ckpt_match" -> bit, "ckpt_data" -> UIntType(IntWidth(64)))
+    owned.foreach { case (n, t) =>
+      if (!root.ports.exists(p => p.name == n && p.tpe == t)) fail("missing native endpoint pin " + n)
+    }
+    val gated = Seq("ckpt_req_valid", "ckpt_req_ready", "ckpt_resp_valid", "ckpt_resp_ready")
+    gated.foreach(n => if (!root.ports.exists(p => p.name == n && p.tpe == bit))
+      fail("missing native endpoint handshake " + n))
+    def ref(n: String): Expression = WRef(n, bit)
+    def and(a: Expression, b: Expression): Expression = DoPrim(firrtl.PrimOps.And, Seq(a,b), Nil, bit)
+    val permission = ref(prefix + "read_enable")
+    val requested = ref(prefix + "freeze_request")
+    val internal = gated.map(n => n -> (prefix + "bank_" + n)).toMap
+    def expr(e: Expression): Expression = e match {
+      case r: WRef if internal.contains(r.name) => r.copy(name = internal(r.name))
+      case x => x.mapExpr(expr)
+    }
+    def stmt(s: Statement): Statement = s match {
+      case c: Connect if c.loc.serialize == adapter + ".freeze_request" =>
+        // Keep the cut through an already accepted response, including host
+        // withdrawal during backpressure. Never accept another request then.
+        val pending = DoPrim(firrtl.PrimOps.Not, Seq(ref(internal("ckpt_req_ready"))), Nil, bit)
+        val initialized = DoPrim(firrtl.PrimOps.Not, Seq(ref(prefix + "controller_reset")), Nil, bit)
+        c.copy(expr = DoPrim(firrtl.PrimOps.Or, Seq(requested, and(initialized, pending)), Nil, bit))
+      case x => x.mapStmt(stmt).mapExpr(expr)
+    }
+    val wiring = Seq(
+      Connect(NoInfo, WRef("ckpt_clock", ClockType), WRef(clock, ClockType)),
+      Connect(NoInfo, ref("ckpt_reset"), ref(prefix + "controller_reset")),
+      Connect(NoInfo, ref("ckpt_freeze"), ref(prefix + "clock_mask")),
+      Connect(NoInfo, ref(internal("ckpt_req_valid")), and(and(ref("ckpt_req_valid"), permission), requested)),
+      Connect(NoInfo, ref("ckpt_req_ready"), and(and(ref(internal("ckpt_req_ready")), permission), requested)),
+      Connect(NoInfo, ref("ckpt_resp_valid"), and(ref(internal("ckpt_resp_valid")), permission)),
+      Connect(NoInfo, ref(internal("ckpt_resp_ready")), and(ref("ckpt_resp_ready"), permission)))
+    root.copy(ports = root.ports.filterNot(p => owned.contains(p.name)),
+      body = Block(owned.toSeq.sortBy(_._1).map { case (n,t) => DefWire(NoInfo,n,t) } ++
+        gated.map(n => DefWire(NoInfo, internal(n), bit)) ++ Seq(stmt(root.body)) ++ wiring))
   }
 
   def emit(input: CircuitState, manifest: String, plan: String): Seq[GoldenGateOutputFileAnnotation] = {

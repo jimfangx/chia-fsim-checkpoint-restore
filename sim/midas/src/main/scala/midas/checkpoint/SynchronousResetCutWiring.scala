@@ -220,8 +220,20 @@ object SynchronousResetCutWiring {
   }
 
   def generate(input: CircuitState, manifest: String, plan: String, resetPort: String): Result = {
+    generateImpl(input, manifest, plan, resetPort, PhysicalClockCutWiring.generate(input, manifest, plan))
+  }
+
+  /** The same reset-fanout audit applies before native banking. Reconstruct the
+    * banks and mask from that exact reference; retain their annotation contracts.
+    */
+  private[checkpoint] def generateNative(input: CircuitState, manifest: String, plan: String,
+      resetPort: String, dependencies: String, banks: GeneratedStateBankAccess.Result): Result =
+    generateImpl(input, manifest, plan, resetPort,
+      PhysicalClockCutWiring.generateNative(input, manifest, plan, dependencies, banks))
+
+  private def generateImpl(input: CircuitState, manifest: String, plan: String, resetPort: String,
+      wired: PhysicalClockCutWiring.Result): Result = {
     val audit = discover(input, manifest, plan, resetPort)
-    val wired = PhysicalClockCutWiring.generate(input, manifest, plan)
     val root = wired.state.circuit.modules.collectFirst { case m: Module if m.name == input.circuit.main => m }.get
     if ((root.ports.map(_.name) ++ statements(root.body).collect { case d: IsDeclaration => d.name }).contains(heldReset))
       fail("held-reset identifier collision")

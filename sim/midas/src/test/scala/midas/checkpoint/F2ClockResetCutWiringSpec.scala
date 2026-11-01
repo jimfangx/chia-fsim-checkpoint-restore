@@ -27,6 +27,61 @@ class F2ClockResetCutWiringSpec extends AnyFlatSpec {
       s.copy(annotations = Seq(firrtl.EmitCircuitAnnotation(e.getClass)))).getEmittedCircuit.value
   }
   behavior.of("Compiler-connected F2 common-cut collector")
+  it should "connect native banks to an ungated endpoint and hold the collector cut through response drain" in {
+    val s = lower(); val inv = SimulatorStateInventory.discover(s)
+    val plan = PhysicalClockCutPlan.discover(s, inv)
+    val deps = PhysicalClockCutDependencies.discover(s, inv, plan)
+    val banks = GeneratedStateBankAccess.generatePhysicalCompanion(s, inv, plan, deps)
+    val r = F2ClockResetCutWiring.generateNative(s, inv, plan, "reset", "count", 4, deps, banks)
+    val root = r.state.circuit.modules.collectFirst { case m: Module if m.name == s.circuit.main => m }.get
+    val text = root.body.serialize
+    Seq("ckpt_clock", "ckpt_reset", "ckpt_freeze", "ckpt_match", "ckpt_data",
+      PhysicalClockCutWiring.mask, SynchronousResetCutWiring.heldReset).foreach { n =>
+      assert(!root.ports.exists(_.name == n))
+    }
+    assert(text.contains("ckpt_clock <= clock"))
+    assert(text.contains("ckpt_reset <= checkpoint_f2_controller_reset"))
+    assert(text.contains("ckpt_freeze <= checkpoint_f2_clock_mask"))
+    assert(text.contains("checkpoint_f2_adapter.freeze_request <= or(checkpoint_f2_freeze_request, and("))
+    assert(text.contains("not(checkpoint_f2_bank_ckpt_req_ready)"))
+    assert(text.contains("ckpt_resp_valid <= and(checkpoint_f2_bank_ckpt_resp_valid, checkpoint_f2_read_enable)"))
+    assert((parse(r.binding) \ "functional_entries") == JInt(3))
+    assert((parse(r.binding) \ "bank_binding_sha256") == JString(SemanticStateInventory.sha256(banks.binding)))
+    assert((parse(r.binding) \ "production_freeze_owners_bound") == JBool(false))
+    assert((parse(r.binding) \ "target_time_authority_proven") == JBool(false))
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { base =>
+      val out = Paths.get(base).resolve("f2-native-collector").resolve("fixture"); Files.createDirectories(out)
+      Seq("reference.fir" -> s.circuit.serialize, "reference.sv" -> emit(s),
+        "wired.fir" -> r.state.circuit.serialize, "wired.sv" -> emit(r.state),
+        "audit.json" -> r.reset.audit, "binding.json" -> r.binding,
+        "reset-binding.json" -> r.reset.binding, "banks-binding.json" -> banks.binding,
+        "manifest.json" -> inv, "plan.json" -> plan, "dependencies.json" -> deps).foreach {
+        case (n, text) => Files.write(out.resolve(n), text.getBytes(UTF_8))
+      }
+    }
+  }
+
+  it should "reject stale native collector banks and missing reset ownership before composition" in {
+    val s = lower(); val inv = SimulatorStateInventory.discover(s)
+    val plan = PhysicalClockCutPlan.discover(s, inv)
+    val deps = PhysicalClockCutDependencies.discover(s, inv, plan)
+    val banks = GeneratedStateBankAccess.generatePhysicalCompanion(s, inv, plan, deps)
+    Seq(banks.copy(binding = banks.binding + " "), banks.copy(entries = banks.entries.drop(1)),
+      banks.copy(state = banks.state.copy(circuit = banks.state.circuit.copy(info = FileInfo("changed"))))).foreach { bad =>
+      intercept[IllegalArgumentException] {
+        F2ClockResetCutWiring.generateNative(s, inv, plan, "reset", "count", 4, deps, bad)
+      }
+    }
+    intercept[IllegalArgumentException] {
+      F2ClockResetCutWiring.generateNative(s, inv, plan, "missing", "count", 4, deps, banks)
+    }
+    for (cycle <- Seq("ckpt_data", "ckpt_resp_data"))
+      assert(intercept[IllegalArgumentException] {
+        F2ClockResetCutWiring.generateNative(s, inv, plan, "reset", cycle, 4, deps, banks)
+      }.getMessage.contains("existing driven scalar UInt<64> root output"))
+    assert(s.circuit.serialize == lower().circuit.serialize)
+  }
+
   it should "own mask and held reset internally and leave the raw collector clock ungated" in {
     val s = lower(); val original = s.circuit.serialize; val r = generate(s)
     val root = r.state.circuit.modules.collectFirst { case m: Module if m.name == s.circuit.main => m }.get
