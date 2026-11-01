@@ -17,7 +17,7 @@ object NativeCheckpointLiveShellSnapshot {
   import SemanticStateInventory.{canonical, sha256}
   val definition = "CheckpointNativeStateSnapshot"
   case class Result(state: CircuitState, shell: NativeCheckpointShellStateAccess.Result, binding: String,
-      stageNativeState: Boolean = false)
+      stageNativeState: Boolean = false, enableRestore: Boolean = false)
   private def check(ok: Boolean, why: String): Unit =
     require(ok, "native live shell snapshot: " + why)
   private def statements(s: Statement): Seq[Statement] = {
@@ -25,7 +25,8 @@ object NativeCheckpointLiveShellSnapshot {
     def visit(x: Statement): Unit = { out += x; x.foreachStmt(visit) }
     visit(s); out.toSeq
   }
-  def generate(shell: NativeCheckpointShellStateAccess.Result, stageNativeState: Boolean = false): Result = {
+  def generate(shell: NativeCheckpointShellStateAccess.Result, stageNativeState: Boolean = false,
+      enableRestore: Boolean = false): Result = {
     NativeCheckpointShellStateAccess.validate(shell)
     check(shell.liveRegisters.nonEmpty, "explicit live register partition required")
     val doc = parse(shell.mapping)
@@ -155,8 +156,14 @@ object NativeCheckpointLiveShellSnapshot {
     val outputs = Seq("ready" -> 1, "valid" -> 1, "borrow_enable" -> 1, "failed" -> 1,
       "word_data" -> 64, "word_error" -> 1, "cut_cycle" -> 64, "error" -> 6,
       "control_state" -> (bits + 71))
-    val extraPorts = inputs.map { case (n,w) => port(prefix + n, Input, w) } ++
-      outputs.map { case (n,w) => port(prefix + n, Output, w) }
+    // Loading this local owner is independent of restoring the original live
+    // registers/native reader. Keep those deficits explicit. Hold must span
+    // the complete load/readback interval, even for an empty donor owner.
+    val restoreInputs = if (enableRestore) Seq("restore_hold" -> 1, "restore_load" -> 1,
+      "restore_state" -> (bits + 71)) else Nil
+    val restoreOutputs = if (enableRestore) Seq("restore_ready" -> 1) else Nil
+    val extraPorts = (inputs ++ restoreInputs).map { case (n,w) => port(prefix + n, Input, w) } ++
+      (outputs ++ restoreOutputs).map { case (n,w) => port(prefix + n, Output, w) }
     val ext = ExtModule(NoInfo, definition, Seq(Port(NoInfo, "clock", Input, ClockType)) ++
       Seq("reset" -> 1, "restore_hold" -> 1, "restore_load" -> 1, "restore_state" -> (bits + 71),
         "request" -> 1, "release_snapshot" -> 1, "owners_present" -> 1,
@@ -166,7 +173,7 @@ object NativeCheckpointLiveShellSnapshot {
         "failed" -> 1, "word_data" -> 64, "word_error" -> 1, "snapshot_state" -> bits,
         "cut_cycle" -> 64, "error" -> 6, "control_state" -> (bits + 71))
         .map { case (n,w) => port(n, Output, w) }, definition,
-      Seq(IntParam("BITS", bits), IntParam("RESTORE_ENABLE", 0)))
+      Seq(IntParam("BITS", bits), IntParam("RESTORE_ENABLE", if (enableRestore) 1 else 0)))
     val vector = (rows ++ nativeRows).reverse.map { row =>
       val JString(name) = row \ "expression"
       if ((row \ "signed") == JBool(true)) s"asUInt($name)" else name
@@ -175,9 +182,9 @@ object NativeCheckpointLiveShellSnapshot {
   module W :
     $instance.clock <= $rawClock
     $instance.reset <= ${prefix}reset
-    $instance.restore_hold <= UInt<1>(0)
-    $instance.restore_load <= UInt<1>(0)
-    $instance.restore_state <= UInt<${bits + 71}>(0)
+    $instance.restore_hold <= ${if (enableRestore) prefix + "restore_hold" else "UInt<1>(0)"}
+    $instance.restore_load <= ${if (enableRestore) prefix + "restore_load" else "UInt<1>(0)"}
+    $instance.restore_state <= ${if (enableRestore) prefix + "restore_state" else s"UInt<${bits + 71}>(0)"}
     $instance.request <= ${prefix}request
     $instance.release_snapshot <= ${prefix}release
     $instance.owners_present <= and(${prefix}owners_present, not(${p}ckpt_reset))
@@ -191,7 +198,7 @@ object NativeCheckpointLiveShellSnapshot {
     ${prefix}gated_resp_ready <= and(${p}ckpt_resp_ready, $instance.borrow_enable)
     ${p}ckpt_req_ready <= and(${prefix}raw_req_ready, $instance.borrow_enable)
     ${p}ckpt_resp_valid <= and(${prefix}raw_resp_valid, $instance.borrow_enable)
-    ${prefix}functional_hold <= or(${p}ckpt_freeze, or(${prefix}request, or(bits($instance.control_state, $bits, $bits), orr($instance.error))))
+    ${prefix}functional_hold <= ${if (enableRestore) s"or(${prefix}restore_hold, " else ""}or(${p}ckpt_freeze, or(${prefix}request, or(bits($instance.control_state, $bits, $bits), orr($instance.error))))${if (enableRestore) ")" else ""}
 """
     val wires = Seq("gated_req_valid", "gated_resp_ready", "raw_req_ready", "raw_resp_valid", "functional_hold")
       .map(n => DefWire(NoInfo, prefix + n, UIntType(IntWidth(1))))
@@ -219,7 +226,7 @@ object NativeCheckpointLiveShellSnapshot {
         c.copy(loc = WRef(replaceOutputs(c.loc.serialize), c.loc.tpe), expr = expr(c.expr))
       case x => x.mapStmt(bank).mapExpr(expr)
     }
-    val outputWiring = outputs.map { case (name,_) =>
+    val outputWiring = (outputs ++ restoreOutputs).map { case (name,_) =>
       val pin = if (name == "ready") "request_ready" else name
       Connect(NoInfo, WRef(prefix + name), WSubField(WRef(instance), pin))
     }
@@ -269,15 +276,21 @@ object NativeCheckpointLiveShellSnapshot {
       "bits" -> JInt(bits), "words" -> JInt((bits.toLong + 63) / 64), "state" -> JArray(rows),
       "staging_owner" -> JString(path + "." + instance), "staging_owner_bits" -> JInt(bits + 71),
       "sampling_contract" -> JString("one_raw_preedge_after_caller_certified_freeze_before_first_bank_handshake"),
+      "local_staging_restore_enabled" -> JBool(enableRestore),
+      "local_staging_restore_scope" -> JString("complete_payload_occupied_cut_cycle_and_sticky_error_only"),
+      "local_staging_restore_bits" -> JInt(bits + 71),
+      "local_staging_restore_extra_storage_bits" -> JInt(0),
+      "local_staging_restore_hold_contract" -> JString("hold_parks_functional_bank_and_revokes_borrow_before_load"),
+      "original_live_and_native_restore_supported" -> JBool(false),
       "bank_clock_contract" -> JString("independent_access_clock_removed_endpoint_tied_to_original_live_raw_clock"),
       "hold_contract" -> JString("request_or_occupied_or_retained_error_without_live_fault_feedback"),
       "unowned_native_state" -> (parse(shell.banks.binding) \ "native_state_observation"),
       "original_unsupported_live_owners" -> JArray(owners)) ++ nativeBinding ++ flags))
-    Result(state, shell, binding, stageNativeState)
+    Result(state, shell, binding, stageNativeState, enableRestore)
   }
 
   def validate(result: Result): Unit = {
-    val expected = generate(result.shell, result.stageNativeState)
+    val expected = generate(result.shell, result.stageNativeState, result.enableRestore)
     check(result.state == expected.state && result.binding == expected.binding,
       "changed live owners, packing, read permission, raw clock, staging or binding")
   }

@@ -62,6 +62,54 @@ class NativeCheckpointLiveShellSnapshotSpec extends AnyFlatSpec {
     case c: Connect => liveNames(c.loc.serialize)
     case _ => false
   }
+  private def verifyRestore(s: NativeCheckpointShellStateAccess.Result, native: Boolean): Unit = {
+    val disabled = NativeCheckpointLiveShellSnapshot.generate(s, stageNativeState = native)
+    val restored = NativeCheckpointLiveShellSnapshot.generate(s, stageNativeState = native, enableRestore = true)
+    NativeCheckpointLiveShellSnapshot.validate(restored)
+    val doc = parse(restored.binding)
+    val bits = (doc \ "bits").asInstanceOf[JInt].num
+    assert(originalLive(s.state) == originalLive(restored.state))
+    assert((doc \ "local_staging_restore_enabled") == JBool(true))
+    assert((doc \ "local_staging_restore_bits") == JInt(bits + 71))
+    assert((doc \ "local_staging_restore_extra_storage_bits") == JInt(0))
+    Seq("staging_restore_supported", "original_live_and_native_restore_supported", "metasim_restore_supported",
+      "complete_fpga_capture", "deployable_capture_image").foreach(k => assert((doc \ k) == JBool(false)))
+    val roles = Set("restore_hold", "restore_load", "restore_state", "restore_ready")
+    Seq("Shell", "LiveTop").foreach { name =>
+      val ports = restored.state.circuit.modules.find(_.name == name).get.ports
+      roles.foreach(role => assert(ports.count(_.name == "checkpoint_shell_live_snapshot_" + role) == 1))
+      assert(disabled.state.circuit.modules.find(_.name == name).get.ports.forall(p =>
+        !roles.exists(r => p.name == "checkpoint_shell_live_snapshot_" + r)))
+    }
+    val leaf = restored.state.circuit.modules.find(_.name == "Shell").get
+    assert(leaf.serialize.contains("functional_hold <= or(checkpoint_shell_live_snapshot_restore_hold,"))
+    assert(restored.state.circuit.modules.collect { case e: ExtModule if e.name ==
+      NativeCheckpointLiveShellSnapshot.definition => e.params }.head.contains(IntParam("RESTORE_ENABLE", 1)))
+    intercept[IllegalArgumentException] { NativeCheckpointLiveShellSnapshot.validate(restored.copy(enableRestore = false)) }
+    val broken = restored.state.copy(circuit = restored.state.circuit.copy(modules =
+      restored.state.circuit.modules.map {
+        case m: Module if m.name == "Shell" =>
+          def alter(s: Statement): Statement = s match {
+            case c: Connect if c.loc.serialize == "checkpoint_shell_live_snapshot_functional_hold" =>
+              c.copy(expr = firrtl.WRef("checkpoint_shell_ckpt_freeze", UIntType(IntWidth(1))))
+            case x => x.mapStmt(alter)
+          }
+          m.copy(body = alter(m.body))
+        case x => x
+      }))
+    val rehashed = SemanticStateInventory.canonical(doc merge JObject(List(
+      "wired_sha256" -> JString(SemanticStateInventory.sha256(broken.circuit.serialize)))))
+    intercept[IllegalArgumentException] {
+      NativeCheckpointLiveShellSnapshot.validate(restored.copy(state = broken, binding = rehashed))
+    }
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { base =>
+      val out = java.nio.file.Paths.get(base, "live-shell-staging-restore-" + bits)
+      java.nio.file.Files.createDirectories(out)
+      Seq("wired.fir" -> restored.state.circuit.serialize, "wired.sv" -> emit(restored.state),
+        "binding.json" -> restored.binding, "mapping.json" -> s.mapping).foreach { case (name,text) =>
+          java.nio.file.Files.write(out.resolve(name), text.getBytes(java.nio.charset.StandardCharsets.UTF_8)) }
+    }
+  }
   behavior.of("Atomic original live shell register staging")
   it should "stage all original live and derived synchronous reader owners at the same preedge" in {
     val memorySource = source.replace("    input reset : UInt<1>",
@@ -93,6 +141,7 @@ class NativeCheckpointLiveShellSnapshotSpec extends AnyFlatSpec {
     val s = shell(lower(memorySource))
     val result = NativeCheckpointLiveShellSnapshot.generate(s, stageNativeState = true)
     NativeCheckpointLiveShellSnapshot.validate(result)
+    verifyRestore(s, native = true)
     val readout = NativeCheckpointLiveShellBankReadout.generate(result)
     NativeCheckpointLiveShellBankReadout.validate(readout)
     val descriptors = midas.widgets.CheckpointCaptureDescriptors.fromLiveShellSnapshotReadout(readout)
@@ -226,6 +275,7 @@ class NativeCheckpointLiveShellSnapshotSpec extends AnyFlatSpec {
   }
   it should "stage all eight original owners while preserving their equations and tying all reads to the raw clock" in {
     val s = shell(); val result = NativeCheckpointLiveShellSnapshot.generate(s)
+    verifyRestore(s, native = false)
     NativeCheckpointLiveShellSnapshot.validate(result)
     assert(originalLive(s.state) == originalLive(result.state))
     val doc = parse(result.binding)
