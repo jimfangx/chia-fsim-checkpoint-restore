@@ -25,7 +25,8 @@ object NativeCheckpointShellStateAccess {
   val prefix = "checkpoint_shell_"
   case class Result(host: CircuitState, target: IsModule, sidebandPrefix: String,
       reference: CircuitState, manifest: String, banks: GeneratedStateBankAccess.Result,
-      state: CircuitState, entries: Seq[StateAccessEntry], mapping: String, binding: String)
+      state: CircuitState, entries: Seq[StateAccessEntry], mapping: String, binding: String,
+      liveRegisters: Set[String] = Set.empty)
   private def check(ok: Boolean, why: String): Unit =
     require(ok, "Native checkpoint shell state: " + why)
   private def statements(s: Statement): Seq[Statement] = {
@@ -55,7 +56,8 @@ object NativeCheckpointShellStateAccess {
     case _ => false
   }
 
-  def generate(host: CircuitState, target: IsModule, sidebandPrefix: String = prefix): Result = {
+  def generate(host: CircuitState, target: IsModule, sidebandPrefix: String = prefix,
+      liveRegisters: Set[String] = Set.empty): Result = {
     check(host.form == LowForm, "resolved LowForm required")
     check(sidebandPrefix.matches("checkpoint_shell_[A-Za-z0-9_]*"), "invalid sideband namespace")
     check(target.circuit == host.circuit.main, "foreign selected circuit")
@@ -90,6 +92,60 @@ object NativeCheckpointShellStateAccess {
       case Some(m: Module) => m
       case _ => throw new IllegalArgumentException("Native checkpoint shell state: concrete selected module required")
     }
+    // A transport must continue executing while these banks drain. Partition
+    // explicit original registers into separate, UNSUPPORTED owners instead
+    // of silently freezing them or pretending the reduced manifest is complete.
+    // Only ordinary local registers are eligible; memories and emitter-hidden
+    // pipeline state need their own ownership protocol.
+    val selectedStatements = statements(selected.body)
+    val clockAliases = selectedStatements.collect {
+      case n: DefNode if n.value.tpe == ClockType => n.name
+      case w: DefWire if w.tpe == ClockType => w.name
+    }.toSet
+    val localDrivers = selectedStatements.collect {
+      case n: DefNode => n.name -> n.value
+      case c: Connect => c.loc.serialize -> c.expr
+    }.groupBy(_._1)
+    val liveClockAliases = mutable.Set.empty[String]
+    def liveClock(e: Expression, seen: Set[String] = Set.empty): String = {
+      check(!seen(e.serialize), "live register clock alias cycle")
+      e match {
+        case r: WRef if r.tpe == ClockType &&
+            selected.ports.exists(p => p.name == r.name && p.direction == Input && p.tpe == ClockType) => r.name
+        case r: WRef if r.tpe == ClockType && clockAliases(r.name) =>
+          liveClockAliases += r.name
+          val drivers = localDrivers.getOrElse(r.name, Nil)
+          check(drivers.size == 1, "live register clock alias must have one driver")
+          liveClock(drivers.head._2, seen + r.name)
+        case _ => throw new IllegalArgumentException(
+          "Native checkpoint shell state: live register requires a transparent original input clock: " + e.serialize)
+      }
+    }
+    val liveState = liveRegisters.toSeq.sorted.map { name =>
+      check(name.matches("[A-Za-z_][A-Za-z0-9_$]*") && !name.startsWith("ckpt_"),
+        "invalid live register selection " + name)
+      val matches = selectedStatements.collect { case r: DefRegister if r.name == name => r }
+      check(matches.size == 1 && ground(matches.head.tpe), "live owner is not one local register: " + name)
+      val r = matches.head
+      liveClock(r.clock)
+      def closed(e: Expression): Boolean = e match {
+        case ref: WRef => ref.name == r.name || selected.ports.exists(p =>
+          p.name == ref.name && p.direction == Input)
+        case _ =>
+          var okay = true
+          e.foreachExpr(x => if (!closed(x)) okay = false)
+          okay
+      }
+      check(r.reset.tpe == UIntType(IntWidth(1)) && closed(r.reset) && closed(r.init),
+        "live register declaration requires synchronous input/self reset and initialization: " + name)
+      check(selectedStatements.count { case c: Connect => c.loc.serialize == name; case _ => false } == 1,
+        "live register requires one complete next-state driver: " + name)
+      r
+    }
+    val livePins = liveState.map(r => r.name -> Port(NoInfo, sidebandPrefix + "live_" + r.name, Input, r.tpe)).toMap
+    check(!livePins.values.exists(p => (selected.ports.map(_.name) ++ selectedStatements.collect {
+      case d: IsDeclaration => d.name
+    }).contains(p.name)), "live owner boundary identifier collision")
     val shared = live.count(_._2.name == selected.name) > 1
     val emittedName = if (shared) sidebandPrefix + "selected_" + selected.name else selected.name
     check(!shared || !modules.contains(emittedName), "specialized definition collision " + emittedName)
@@ -118,6 +174,7 @@ object NativeCheckpointShellStateAccess {
     check(boundary.map(_._2.name).distinct.size == boundary.size, "ambiguous flattened child boundary")
     val pins = boundary.toMap
     def extractExpr(e: Expression): Expression = e match {
+      case r: WRef if livePins.contains(r.name) => r.copy(name = livePins(r.name).name)
       case p: WSubField => p.expr match {
         case r: WRef if childNames(r.name) =>
           val port = pins.getOrElse((r.name, p.name), throw new IllegalArgumentException("unknown child pin"))
@@ -130,9 +187,12 @@ object NativeCheckpointShellStateAccess {
     }
     def extract(s: Statement): Statement = s match {
       case _: WDefInstance => EmptyStmt
+      case r: DefRegister if liveRegisters(r.name) => EmptyStmt
+      case c: Connect if liveRegisters(c.loc.serialize) => EmptyStmt
       case _ => s.mapStmt(extract).mapExpr(extractExpr)
     }
-    val local = selected.copy(ports = selected.ports ++ boundary.map(_._2), body = extract(selected.body))
+    val local = selected.copy(ports = selected.ports ++ boundary.map(_._2) ++ liveState.map(r => livePins(r.name)),
+      body = extract(selected.body))
     // Synthetic boundary clocks cannot create a functional-clock authority.
     // Reject their use by any sequential consumer, following local aliases.
     val all = statements(local.body)
@@ -190,6 +250,8 @@ object NativeCheckpointShellStateAccess {
     check(sidebands.nonEmpty, "missing local access ports")
     val reversePins = boundary.map { case ((instance, pin), p) => p.name -> (instance, pin, p.tpe) }.toMap
     def graftExpr(e: Expression): Expression = e match {
+      case r: WRef if livePins.values.exists(_.name == r.name) =>
+        r.copy(name = liveState.find(x => livePins(x.name).name == r.name).get.name)
       case r: WRef if reversePins.contains(r.name) =>
         val (instance, pin, tpe) = reversePins(r.name)
         WSubField(WRef(instance), pin, tpe)
@@ -205,8 +267,26 @@ object NativeCheckpointShellStateAccess {
         case _ => rewritten
       }
     }
+    val liveDrivers = selectedStatements.collect { case c: Connect if liveRegisters(c.loc.serialize) => c }
+    val graftedBody = graft(generated.body)
+    // ResolveKinds visits declarations in order. The retained live registers
+    // must precede generated references to them, while their clock aliases
+    // must already exist. Keep the exact alias declarations and put original
+    // live drivers AFTER all original/generated combinational declarations.
+    val aliasDeclarations = statements(graftedBody).collect {
+      case w: DefWire if liveClockAliases(w.name) => w
+      case n: DefNode if liveClockAliases(n.name) => n
+    }
+    check(aliasDeclarations.map(_.name).toSet == liveClockAliases.toSet &&
+      aliasDeclarations.map(_.name).distinct.size == aliasDeclarations.size,
+      "live clock alias declarations changed during banking")
+    def withoutAliases(s: Statement): Statement = s match {
+      case w: DefWire if liveClockAliases(w.name) => EmptyStmt
+      case n: DefNode if liveClockAliases(n.name) => EmptyStmt
+      case x => x.mapStmt(withoutAliases)
+    }
     val bankedLocal = selected.copy(name = emittedName, ports = selected.ports ++ sidebands,
-      body = Block(children ++ Seq(graft(generated.body))))
+      body = Block(children ++ aliasDeclarations ++ liveState ++ Seq(withoutAliases(graftedBody)) ++ liveDrivers))
     val rewritten = host.circuit.modules.map {
       case m if m.name == selected.name && !shared => bankedLocal
       case m: Module if ancestors.contains(m.name) =>
@@ -267,8 +347,25 @@ object NativeCheckpointShellStateAccess {
         "transfer_depth" -> JInt(e.depth)))
       (e.copy(stateID = id), mapping)
     }
+    val liveOwners = liveState.map { r =>
+      val path = selectedPath + "." + r.name
+      val width = r.tpe match {
+        case UIntType(IntWidth(w)) => w
+        case SIntType(IntWidth(w)) => w
+        case _ => throw new IllegalArgumentException("Native checkpoint shell state: live owner must be integer storage")
+      }
+      JObject(List("state_id" -> JString(SimulatorStateInventory.stateID(path, "register")),
+        "hierarchy" -> JString(path), "kind" -> JString("register"), "width" -> JInt(width), "depth" -> JInt(1),
+        "clock" -> JString(r.clock.serialize), "raw_clock" -> JString(liveClock(r.clock)),
+        "declaration_sha256" -> JString(sha256(r.serialize)),
+        "driver_sha256" -> JString(sha256(liveDrivers.find(_.loc.serialize == r.name).get.serialize)),
+        "ownership" -> JString("unsupported_live_local_register_requires_separate_atomic_owner"),
+        "capture_supported" -> JBool(false), "restore_supported" -> JBool(false)))
+    }
+    val partition = if (liveOwners.isEmpty) Nil else List("unsupported_live_owners" -> JArray(liveOwners.toList),
+      "local_partition_contract" -> JString("banked_local_storage_plus_exact_unmodified_live_registers"))
     val mapping = canonical(JObject(List("mapping_version" -> JInt(1),
-      "selected_execution" -> JString(selectedPath), "state" -> JArray(mappings.map(_._2).toList))))
+      "selected_execution" -> JString(selectedPath), "state" -> JArray(mappings.map(_._2).toList)) ++ partition))
     val binding = canonical(JObject(List("shell_access_version" -> JInt(1),
       "scope" -> JString(if (shared) "existing_concrete_execution_local_state_readout_only" else
         "existing_unique_execution_local_state_readout_only"),
@@ -293,8 +390,8 @@ object NativeCheckpointShellStateAccess {
       "context" -> parse(snapshot), "local_entries" -> JInt(mappings.size),
       "child_executions_frozen" -> JBool(false), "transport_state_supported" -> JBool(false),
       "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
-      "production_freeze_owners_bound" -> JBool(false), "metasim_restore_supported" -> JBool(false))))
-    Result(host, target, sidebandPrefix, reference, manifest, banks, state, mappings.map(_._1), mapping, binding)
+      "production_freeze_owners_bound" -> JBool(false), "metasim_restore_supported" -> JBool(false)) ++ partition))
+    Result(host, target, sidebandPrefix, reference, manifest, banks, state, mappings.map(_._1), mapping, binding, liveRegisters)
   }
 
   /** Reconstruct all equations, annotation contracts and descriptor identities
@@ -302,7 +399,7 @@ object NativeCheckpointShellStateAccess {
     * a modified result or replacing a sidecar digest.
     */
   def validate(result: Result): Unit = {
-    val expected = generate(result.host, result.target, result.sidebandPrefix)
+    val expected = generate(result.host, result.target, result.sidebandPrefix, result.liveRegisters)
     def same(a: CircuitState, b: CircuitState): Boolean = a.form == b.form && a.renames == b.renames &&
       a.circuit == b.circuit && a.annotations.toVector == b.annotations.toVector
     check(same(result.state, expected.state) && same(result.reference, expected.reference) &&

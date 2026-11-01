@@ -119,6 +119,65 @@ class NativeCheckpointShellStateAccessSpec extends AnyFlatSpec {
   }
 
   behavior.of("Existing enclosing-module local state access")
+  it should "keep separately declared live owners unchanged while banking every remaining local word" in {
+    val host = lower()
+    val result = NativeCheckpointShellStateAccess.generate(host, selected, liveRegisters = Set("cycles"))
+    NativeCheckpointShellStateAccess.validate(result)
+    assert(result.entries.size == 3 && result.liveRegisters == Set("cycles"))
+    val rows = (parse(result.mapping) \ "state").asInstanceOf[JArray].arr
+    val live = (parse(result.mapping) \ "unsupported_live_owners").asInstanceOf[JArray].arr
+    assert(live.size == 1 && (live.head \ "hierarchy") == JString("ShellTop.enclosing.cycles"))
+    assert((live.head \ "state_id") == JString(SimulatorStateInventory.stateID("ShellTop.enclosing.cycles", "register")))
+    assert((live.head \ "capture_supported") == JBool(false) && (live.head \ "restore_supported") == JBool(false))
+    assert(rows.forall(r => (r \ "hierarchy") != JString("ShellTop.enclosing.cycles")))
+    def all(s: Statement): Seq[Statement] = Seq(s) ++ { val b = scala.collection.mutable.ArrayBuffer.empty[Statement]
+      s.foreachStmt(x => b ++= all(x)); b.toSeq }
+    def liveOriginal(s: CircuitState) = all(module(s, "Shell").body).filter {
+      case r: DefRegister => r.name == "cycles"
+      case c: Connect => c.loc.serialize == "cycles"
+      case _ => false
+    }
+    assert(liveOriginal(result.state) == liveOriginal(host))
+    assert(!result.state.circuit.serialize.contains("checkpoint_shell_live_cycles"))
+    assert(module(result.state, "Child") == module(host, "Child"))
+    for (bad <- Seq(result.copy(liveRegisters = Set.empty), result.copy(liveRegisters = Set("saved")),
+        result.copy(mapping = result.mapping.replace("unsupported_live", "claimed_complete"))))
+      intercept[IllegalArgumentException] { NativeCheckpointShellStateAccess.validate(bad) }
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { root =>
+      val out = java.nio.file.Paths.get(root, "live-shell-state-access"); java.nio.file.Files.createDirectories(out)
+      Seq("source.fir" -> host.circuit.serialize, "generated.fir" -> result.state.circuit.serialize,
+        "source.sv" -> emit(host), "source.anno.json" -> JsonProtocol.serialize(host.annotations),
+        "reference.fir" -> result.reference.circuit.serialize,
+        "reference.anno.json" -> JsonProtocol.serialize(result.reference.annotations),
+        "manifest.json" -> result.manifest, "generated.anno.json" -> JsonProtocol.serialize(result.state.annotations),
+        "generated.sv" -> emit(result.state), "mapping.json" -> result.mapping,
+        "binding.json" -> result.binding, "banks-binding.json" -> result.banks.binding).foreach { case (name, text) =>
+        java.nio.file.Files.write(out.resolve(name), text.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+      }
+    }
+  }
+  it should "reject live selections of memories pipelines children missing or gated-clock storage" in {
+    for (name <- Seq("mem", "mem_r_data", "child.count", "absent", "ckpt_pending", "cycles.value"))
+      intercept[IllegalArgumentException] {
+        NativeCheckpointShellStateAccess.generate(lower(), selected, liveRegisters = Set(name))
+      }
+    val changed = lower(source.replace("reg cycles : UInt<8>, clock with :", "reg cycles : UInt<8>, asClock(bits(data, 0, 0)) with :"))
+    assert(intercept[IllegalArgumentException] {
+      NativeCheckpointShellStateAccess.generate(changed, selected, liveRegisters = Set("cycles"))
+    }.getMessage.contains("transparent original input clock"))
+  }
+  it should "resolve the original live owner's transparent clock aliases without following data drivers" in {
+    val alias = source.replace("reg cycles : UInt<8>, clock with :",
+      "wire liveClock : Clock\n    liveClock <= clock\n    reg cycles : UInt<8>, liveClock with :")
+    val result = NativeCheckpointShellStateAccess.generate(lower(alias), selected, liveRegisters = Set("cycles"))
+    val owner = (parse(result.mapping) \ "unsupported_live_owners").asInstanceOf[JArray].arr.head
+    assert((owner \ "clock") == JString("liveClock") && (owner \ "raw_clock") == JString("clock"))
+    NativeCheckpointShellStateAccess.validate(result)
+    val dataClock = alias.replace("liveClock <= clock", "liveClock <= asClock(bits(data, 0, 0))")
+    intercept[IllegalArgumentException] {
+      NativeCheckpointShellStateAccess.generate(lower(dataClock), selected, liveRegisters = Set("cycles"))
+    }
+  }
   it should "bank every local register, wide word, memory and synchronous pipeline without banking children" in {
     val result = generated
     assert(result.entries.size == 4)

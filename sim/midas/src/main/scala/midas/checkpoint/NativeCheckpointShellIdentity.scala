@@ -127,7 +127,8 @@ object NativeCheckpointShellIdentity {
     val flags = List("complete_fpga_capture", "deployable_capture_image", "production_freeze_owners_bound",
       "metasim_restore_supported").map(_ -> JBool(false))
     val external = inventory.toList.flatMap(i => List("unsupported_external_owners" -> i.unsupportedOwners,
-      "reserved_inventory_binding_sha256" -> JString(sha256(i.binding))))
+      "reserved_inventory_binding_sha256" -> JString(sha256(i.binding)))) ++
+      (if (shell.liveRegisters.isEmpty) Nil else List("unsupported_live_owners" -> (source \ "unsupported_live_owners")))
     val manifest = canonical(JObject(List("identity_version" -> JInt(1),
       "scope" -> JString("selected_shell_global_identities_only"), "ownership_scope" -> JString("local_storage_only"),
       "selected_scope" -> JString(scope), "state" -> JArray(state.toList),

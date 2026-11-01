@@ -50,10 +50,12 @@ object NativeCheckpointRegions {
   }
 
   def generate(host: CircuitState, targets: Seq[InstanceTarget],
-      inventory: Option[ReservedCheckpointInventory] = None, shellTargets: Seq[IsModule] = Seq.empty): Result = {
+      inventory: Option[ReservedCheckpointInventory] = None, shellTargets: Seq[IsModule] = Seq.empty,
+      liveShellRegisters: Map[IsModule, Set[String]] = Map.empty): Result = {
     check(host.form == LowForm, "resolved LowForm required")
     inventory.foreach(_.validateSource(host))
     check(targets.size + shellTargets.size > 0 && targets.size + shellTargets.size <= 255, "invalid region count")
+    check(liveShellRegisters.keySet.subsetOf(shellTargets.toSet), "live owner selection has no shell execution")
     val paths = targets.map(_.asPath.map(_._1.value))
     check(!paths.indices.exists(i => paths.indices.exists(j => i != j && paths(i).startsWith(paths(j)))),
       "overlapping selected executions")
@@ -61,7 +63,7 @@ object NativeCheckpointRegions {
       NativeCheckpointInPlaceContext.generate(host, t, prefix(i), inventory)
     }
     val shells = shellTargets.zipWithIndex.map { case (t, i) =>
-      NativeCheckpointShellStateAccess.generate(host, t, shellPrefix(i))
+      NativeCheckpointShellStateAccess.generate(host, t, shellPrefix(i), liveShellRegisters.getOrElse(t, Set.empty))
     }
     val regionalDescriptors = regions.zip(targets).map { case (r, t) =>
       CheckpointCaptureDescriptors.fromNativeInPlace(host.copy(annotations = host.annotations.filterNot(
@@ -213,7 +215,9 @@ object NativeCheckpointRegions {
     val shellBindings = if (shells.isEmpty) Nil else List("local_shells" -> JArray(shells.zipWithIndex.map { case (r, i) =>
       JObject(List("index" -> JInt(targets.size + i), "target" -> JString(r.target.serialize),
         "sideband_prefix" -> JString(r.sidebandPrefix), "shell_binding_sha256" -> JString(sha256(r.binding)),
-        "identity_binding_sha256" -> JString(shellDescriptors(i).bindingSha256)))
+        "identity_binding_sha256" -> JString(shellDescriptors(i).bindingSha256)) ++
+        (if (r.liveRegisters.isEmpty) Nil else List("unsupported_live_owners" ->
+          (parse(r.binding) \ "unsupported_live_owners"))))
     }.toList))
     val binding = canonical(JObject(List(
       "regions_version" -> JInt(1), "scope" -> JString("existing_disjoint_native_executions_only"),
@@ -239,7 +243,8 @@ object NativeCheckpointRegions {
   /** Reconstruct from the original, including annotation/context semantics;
     * caller-rehashed circuits or metadata cannot establish coverage. */
   def validate(result: Result): Unit = {
-    val rebuilt = generate(result.host, result.targets, result.inventory, result.shells.map(_.target))
+    val rebuilt = generate(result.host, result.targets, result.inventory, result.shells.map(_.target),
+      result.shells.filter(_.liveRegisters.nonEmpty).map(s => s.target -> s.liveRegisters).toMap)
     def sameState(a: CircuitState, b: CircuitState): Boolean = a.form == b.form && a.renames == b.renames &&
       a.circuit == b.circuit && a.annotations.toVector == b.annotations.toVector
     check(sameState(result.state, rebuilt.state) &&
@@ -255,6 +260,7 @@ object NativeCheckpointRegions {
           a.native.generatedAnnotations.toVector == b.native.generatedAnnotations.toVector
       } && result.shells.size == rebuilt.shells.size && result.shells.zip(rebuilt.shells).forall { case (a, b) =>
         a.binding == b.binding && a.mapping == b.mapping && a.entries == b.entries && a.target == b.target &&
+          a.liveRegisters == b.liveRegisters &&
           a.sidebandPrefix == b.sidebandPrefix && a.manifest == b.manifest && a.banks.binding == b.banks.binding &&
           a.banks.entries == b.banks.entries && sameState(a.banks.state, b.banks.state) &&
           sameState(a.host, b.host) && sameState(a.state, b.state) && sameState(a.reference, b.reference)

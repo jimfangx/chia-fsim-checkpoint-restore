@@ -145,6 +145,42 @@ class NativeCheckpointRegionWidgetGraftSpec extends AnyFlatSpec {
     assert(NativeCheckpointRegionWidgetGraft.liveTransportConflicts(policyBefore, policyAfter, policySource).arr.isEmpty)
   }
 
+  it should "partition the actual eight inlined transport registers without freezing or claiming them" in {
+    val target = ModuleTarget("ReservationShell", "FPGATop")
+    val live = NativeCheckpointLiveTransportSelection.registers(policyBefore, policyAfter, target)
+    assert(live.size == 8)
+    val mixed = NativeCheckpointRegions.generate(policyInventory.source, targets, Some(policyInventory),
+      Seq(target), Map(target -> live))
+    NativeCheckpointRegions.validate(mixed)
+    val shell = mixed.shells.head
+    val owners = (parse(shell.mapping) \ "unsupported_live_owners").asInstanceOf[JArray].arr
+    assert(owners.size == 8 && owners.forall(r => (r \ "capture_supported") == JBool(false)))
+    val identity = NativeCheckpointShellIdentity.discover(shell, Some(policyInventory))
+    val uncovered = (parse(identity.manifest) \ "uncovered_functional_state").asInstanceOf[JArray].arr
+      .map(r => r \ "state_id").toSet
+    assert(owners.forall(r => uncovered(r \ "state_id")))
+    assert(NativeCheckpointRegionWidgetGraft.liveTransportConflicts(policyBefore, policyAfter, mixed).arr.isEmpty)
+    // Selective banking removes the transport deadlock. This fixture's old
+    // reservation describes only its original subtree banks; adding six local
+    // owners still requires a newly bound descriptor ROM before connection.
+    val error = intercept[IllegalArgumentException] {
+      NativeCheckpointRegionWidgetGraft.connect(policyBefore, policyAfter, mixed)
+    }
+    assert(error.getMessage.contains("reserved entry/gate count differs from reconstructed descriptors"))
+    save("live-transport-partition.json", shell.mapping)
+    save("live-transport-partition-binding.json", mixed.binding)
+    save("live-transport-partition-identity.json", identity.manifest)
+    save("live-transport-partition.fir", mixed.state.circuit.serialize)
+    intercept[IllegalArgumentException] {
+      NativeCheckpointLiveTransportSelection.registers(policyBefore, policyAfter,
+        ModuleTarget("foreign", "FPGATop"))
+    }
+    intercept[IllegalArgumentException] {
+      NativeCheckpointRegions.generate(policyInventory.source, targets, Some(policyInventory),
+        Seq.empty, Map(target -> live))
+    }
+  }
+
   it should "project whole-host typed source policy and compiler history without dropping the original context" in {
     val result = NativeCheckpointRegionWidgetGraft.connect(policyBefore, policyAfter, policySource)
     val approved = policyAfter.annotations.filter(a => GeneratedStateBankAnnotations.supported(a) ||
