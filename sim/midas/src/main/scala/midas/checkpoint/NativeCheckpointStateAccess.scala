@@ -56,7 +56,7 @@ object NativeCheckpointStateAccess {
     Seq(GoldenGateOutputFileAnnotation(rtl, ".native-state-access.sv"),
       GoldenGateOutputFileAnnotation(router, ".native-state-access-router.sv"),
       GoldenGateOutputFileAnnotation(binding, ".native-state-access.json")) ++
-      NativeCheckpointConstraints.emit(wired.state, name, placement)
+      NativeCheckpointConstraints.emitNative(reference, manifest, plan, dependencies, banks, wired, name, placement)
   }
   /** Reuse transaction routing without reconstructing or duplicating the
     * functional execution. A nonempty prefix denotes sidebands already carried

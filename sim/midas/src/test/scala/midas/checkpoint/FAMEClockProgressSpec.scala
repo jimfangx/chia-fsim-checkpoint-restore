@@ -239,6 +239,97 @@ class FAMEClockProgressSpec extends AnyFlatSpec {
     }
   }
 
+  it should "bind native bank roles and original StateIDs through the companion's actual final emitter" in {
+    import org.json4s._
+    import org.json4s.native.JsonMethods.parse
+    val reference = bankReference()
+    val manifest = SimulatorStateInventory.discover(reference)
+    val plan = PhysicalClockCutPlan.discover(reference, manifest)
+    val deps = PhysicalClockCutDependencies.discover(reference, manifest, plan)
+    val banks = GeneratedStateBankAccess.generatePhysicalCompanion(reference, manifest, plan, deps)
+    val emitter = new SemanticCleanEmitter
+    val emitted = new Compiler(Seq(firrtl.options.Dependency.fromTransform(emitter)), Forms.LowForm, Set(emitter))
+      .execute(banks.state.copy(annotations = banks.state.annotations :+ EmitCircuitAnnotation(emitter.getClass)))
+    val actual = emitter.preparedState.get
+    val rtl = emitted.getEmittedCircuit.value
+    val files = FAMEClockProgressBindings.emitNativeBanked(banks, actual, rtl)
+    assert(files.size == 1)
+    val binding = parse(files.head.body)
+    assert((binding \ "emitted_verilog_sha256") == JString(SemanticStateInventory.sha256(rtl)))
+    assert((binding \ "emission_reference_sha256") == JString(SemanticStateInventory.sha256(actual.circuit.serialize)))
+    assert((binding \ "bank_binding_sha256") == JString(SemanticStateInventory.sha256(banks.binding)))
+    val roles = (binding \ "signals").asInstanceOf[JArray].arr
+    assert(roles.size == 21 && roles.filter(r => (r \ "storage") == JBool(true)).size == 8)
+    val inventory = (parse(banks.binding) \ "state").asInstanceOf[JArray].arr
+    roles.filter(r => (r \ "storage") == JBool(true)).foreach { role =>
+      val entry = inventory.find(e => (e \ "state_id") == (role \ "generated_state_id")).get
+      assert((role \ "bank") == (entry \ "bank") && (role \ "slot") == (entry \ "slot"))
+      assert((role \ "input_storage_hierarchy") == (entry \ "storage_hierarchy"))
+    }
+    val requested = reference.copy(annotations = reference.annotations ++ Seq(
+      NativeFunctionalBankProbeAnnotation, PhysicalClockCutPlanAnnotation,
+      SimulatorCheckpointInventoryAnnotation(reference.circuit.main),
+      midas.targetutils.xdc.XDCPathToCircuitAnnotation(None, None)))
+    val companion = NativeFunctionalBankProbe(requested)
+    assert(companion.circuit == reference.circuit)
+    val outputs = companion.annotations.collect { case a: midas.stage.GoldenGateOutputFileAnnotation => a }
+    val receipt = parse(outputs.find(_.fileSuffix == ".native-functional-emission.json").get.body)
+    Seq(".native-functional-fame-clock-progress.json", ".native-functional-emitted.fir",
+      ".native-functional-emitted-progress.anno.json").foreach { name =>
+      val file = outputs.find(_.fileSuffix == name).get
+      assert((receipt \ "inputs" \ name) == JString(SemanticStateInventory.sha256(file.body)))
+    }
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { base =>
+      val out = Paths.get(base).resolve("fame-progress-companion"); Files.createDirectories(out)
+      outputs.foreach(a => Files.write(out.resolve("Top" + a.fileSuffix), a.body.getBytes(UTF_8)))
+    }
+  }
+
+  it should "reject role loss and retargeting at the native bank emitter boundary" in {
+    val reference = bankReference()
+    val manifest = SimulatorStateInventory.discover(reference)
+    val plan = PhysicalClockCutPlan.discover(reference, manifest)
+    val deps = PhysicalClockCutDependencies.discover(reference, manifest, plan)
+    val banks = GeneratedStateBankAccess.generatePhysicalCompanion(reference, manifest, plan, deps)
+    val emitter = new SemanticCleanEmitter
+    val emitted = new Compiler(Seq(firrtl.options.Dependency.fromTransform(emitter)), Forms.LowForm, Set(emitter))
+      .execute(banks.state.copy(annotations = banks.state.annotations :+ EmitCircuitAnnotation(emitter.getClass)))
+    val actual = emitter.preparedState.get
+    val roles = actual.annotations.collect { case a: FAMEClockProgressSignalAnnotation => a }
+    roles.foreach { role =>
+      Seq(actual.annotations.filterNot(_ == role), actual.annotations.map {
+        case a: FAMEClockProgressSignalAnnotation if a == role => a.copy(target = a.target.copy(ref = "missing"))
+        case a => a
+      }).foreach { annotations =>
+        intercept[IllegalArgumentException] {
+          FAMEClockProgressBindings.emitNativeBanked(banks, actual.copy(annotations = annotations), emitted.getEmittedCircuit.value)
+        }
+      }
+    }
+    intercept[IllegalArgumentException] {
+      FAMEClockProgressBindings.emitNativeBanked(banks, actual.copy(annotations = actual.annotations.filterNot {
+        case _: FAMEClockProgressModelAnnotation | _: FAMEClockProgressSignalAnnotation => true
+        case _ => false
+      }), emitted.getEmittedCircuit.value)
+    }
+    val wired = PhysicalClockCutWiring.generateNative(reference, manifest, plan, deps, banks)
+    val placement = midas.targetutils.xdc.XDCPathToCircuitAnnotation(None, None)
+    val missing = wired.state.annotations.filterNot(_.isInstanceOf[FAMEClockProgressSignalAnnotation])
+    val changed = wired.state.copy(circuit = wired.state.circuit.copy(info = FileInfo("changed")))
+    Seq(wired.copy(state = wired.state.copy(annotations = missing)), wired.copy(state = changed),
+      wired.copy(binding = wired.binding + " ")).foreach { bad =>
+      assert(intercept[IllegalArgumentException] {
+        NativeCheckpointConstraints.emitNative(reference, manifest, plan, deps, banks, bad,
+          reference.circuit.main + "CheckpointStateAccess", placement)
+      }.getMessage.contains("changed clock-mask circuit or annotations"))
+    }
+    // The ordinary constraint path still rejects masked bank roles. Only the
+    // same-reference, independently reconstructed native path may emit them.
+    intercept[IllegalArgumentException] {
+      NativeCheckpointConstraints.emit(wired.state, reference.circuit.main + "CheckpointStateAccess", placement)
+    }
+  }
+
   it should "reject changed bank freeze condition hold value and inner reset ownership" in {
     val reference = bankReference()
     val manifest = SimulatorStateInventory.discover(reference)

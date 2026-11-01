@@ -280,6 +280,52 @@ object FAMEClockProgressBindings {
     }
   }
 
+  /** Bind native-bank roles to this companion emitter's actual prepared IR.
+    * StateIDs and selectors come from the independently validated input bank,
+    * while RTL paths follow the emitter's real renames. No inventory of added
+    * transport registers is confused with the original functional inventory.
+    */
+  private[checkpoint] def emitNativeBanked(banks: GeneratedStateBankAccess.Result,
+      actual: CircuitState, rtl: String): Seq[GoldenGateOutputFileAnnotation] = {
+    GeneratedStateBankAccess.validateAnnotationBinding(banks)
+    validatePreserved(banks.state, actual)
+    val before = resolveBanked(banks.state)
+    val after = resolveBanked(actual)
+    if (before.isEmpty) return Nil
+    val binding = parse(banks.binding)
+    if ((binding \ "scope") != JString("native_functional_readout_companion_only"))
+      fail("native companion bank binding required")
+    val inventory = (binding \ "state").asInstanceOf[JArray].arr
+    val byPath = inventory.groupBy(r => (r \ "storage_hierarchy").values.toString)
+    def identity(r: JValue) = Seq("model_identity", "domain_identity", "role").map(k => r \ k)
+    val originals = before.map(r => identity(r) -> r).toMap
+    val bound = after.map { row =>
+      val original = originals(identity(row))
+      if ((row \ "storage") != JBool(true)) row
+      else {
+        val matches = byPath.getOrElse((original \ "rtl_path").values.toString, Nil)
+        if (matches.size != 1) fail("bank role missing or duplicated in functional inventory")
+        val entry = matches.head
+        val width = if (Set("completed_steps", "consumed", "applied")((row \ "role").values.toString)) 64 else 1
+        if ((entry \ "depth") != JInt(1) || (entry \ "width") != JInt(width))
+          fail("bank role inventory storage shape mismatch")
+        JObject(row.asInstanceOf[JObject].obj ++ List(
+          "generated_state_id" -> (entry \ "state_id"), "bank" -> (entry \ "bank"),
+          "slot" -> (entry \ "slot"), "input_storage_hierarchy" -> (entry \ "storage_hierarchy")))
+      }
+    }
+    Seq(GoldenGateOutputFileAnnotation(canonical(JObject(List(
+      "binding_version" -> JInt(1), "scope" -> JString("native-banked-fame-clock-progress-role-map-only"),
+      "global_target_cut_proven" -> JBool(false), "capture_supported" -> JBool(false),
+      "deployable_capture_image" -> JBool(false),
+      "bank_binding_sha256" -> JString(sha256(banks.binding)),
+      "bank_input_reference_sha256" -> (binding \ "reference_sha256"),
+      "bank_instrumented_sha256" -> JString(sha256(banks.state.circuit.serialize)),
+      "emitted_verilog_sha256" -> JString(sha256(rtl)),
+      "emission_reference_sha256" -> JString(sha256(actual.circuit.serialize)),
+      "signals" -> JArray(bound.toList)))), ".native-functional-fame-clock-progress.json"))
+  }
+
   def emit(state: CircuitState, rtl: String, manifest: String): Seq[GoldenGateOutputFileAnnotation] = {
     val rows = resolve(state)
     if (rows.isEmpty) return Nil

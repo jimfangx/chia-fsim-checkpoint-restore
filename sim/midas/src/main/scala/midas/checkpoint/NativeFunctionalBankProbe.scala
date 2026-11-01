@@ -78,6 +78,8 @@ object NativeFunctionalBankProbe {
       .execute(constrained.copy(annotations = constrained.annotations :+
         firrtl.EmitCircuitAnnotation(emitter.getClass)))
     val rtl = emitted.getEmittedCircuit.value
+    val actual = emitter.preparedState.getOrElse(fail("native companion emitter did not expose its actual state"))
+    val progress = FAMEClockProgressBindings.emitNativeBanked(generated, actual, rtl)
     val files = Seq(
       ".native-functional-reference.fir" -> reference.circuit.serialize,
       ".native-functional-reference.anno.json" -> firrtl.annotations.JsonProtocol.serialize(owners.distinct.sortBy(_.serialize)),
@@ -90,7 +92,13 @@ object NativeFunctionalBankProbe {
       ".native-functional-inventory.json" -> inventory,
       ".native-functional-instrumented.fir" -> generated.state.circuit.serialize,
       ".native-functional-binding.json" -> generated.binding,
-      ".native-functional.sv" -> rtl) ++ constrained.annotations.collect {
+      ".native-functional.sv" -> rtl) ++ (if (progress.isEmpty) Nil else Seq(
+        ".native-functional-emitted.fir" -> actual.circuit.serialize,
+        ".native-functional-emitted-progress.anno.json" -> firrtl.annotations.JsonProtocol.serialize(
+          actual.annotations.collect {
+            case a: FAMEClockProgressModelAnnotation => a
+            case a: FAMEClockProgressSignalAnnotation => a
+          }))) ++ progress.map(a => a.fileSuffix -> a.body) ++ constrained.annotations.collect {
         case a: midas.passes.XDCOutputAnnotation => (".native-functional" + a.suffix.get) -> a.fileBody
       }
     val binding = canonical(JObject(List(

@@ -18,6 +18,34 @@ object NativeCheckpointConstraints {
 
   def emit(wired: CircuitState, wrapper: String, placement: XDCPathToCircuitAnnotation):
       Seq[GoldenGateOutputFileAnnotation] = {
+    GeneratedStateBankAnnotations.preflight(wired)
+    emitValidated(wired, wrapper, placement)
+  }
+
+  /** Clock-mask wiring deliberately changes the original gate I/CE graph.
+    * Validate FAME roles on the complete unmasked bank, then require the exact
+    * deterministic wiring transform, including every annotation, before
+    * checking XDC against the resulting concrete circuit. Ordinary preflight
+    * must continue rejecting banked/masked roles as production semantics.
+    */
+  def emitNative(reference: CircuitState, manifest: String, plan: String, dependencies: String,
+      banks: GeneratedStateBankAccess.Result, wired: PhysicalClockCutWiring.Result,
+      wrapper: String, placement: XDCPathToCircuitAnnotation): Seq[GoldenGateOutputFileAnnotation] = {
+    GeneratedStateBankAccess.validateAnnotationBinding(banks)
+    val expected = PhysicalClockCutWiring.generateNative(reference, manifest, plan, dependencies, banks)
+    require(wired.binding == expected.binding && wired.state.circuit.serialize == expected.state.circuit.serialize &&
+      wired.state.annotations == expected.state.annotations,
+      "native constraints: changed clock-mask circuit or annotations")
+    val remaining = wired.state.annotations.filterNot {
+      case _: FAMEClockProgressModelAnnotation | _: FAMEClockProgressSignalAnnotation => true
+      case _ => false
+    }
+    GeneratedStateBankAnnotations.preflight(wired.state.copy(annotations = remaining))
+    emitValidated(wired.state, wrapper, placement)
+  }
+
+  private def emitValidated(wired: CircuitState, wrapper: String, placement: XDCPathToCircuitAnnotation):
+      Seq[GoldenGateOutputFileAnnotation] = {
     require(wrapper == wired.circuit.main + "CheckpointStateAccess",
       "native constraints: changed state-access wrapper identity")
     def nested(path: Option[String]): Option[String] = {
@@ -28,7 +56,6 @@ object NativeCheckpointConstraints {
     val rebased = XDCPathToCircuitAnnotation(nested(placement.preLinkPath), nested(placement.postLinkPath))
     // Check every target against the bank-specialized, clock-wired circuit
     // before WriteXDCFile can silently expand an unreachable module to nothing.
-    GeneratedStateBankAnnotations.preflight(wired)
     val emitted = WriteXDCFile.execute(wired.copy(annotations = wired.annotations :+ rebased))
     val specs = wired.annotations.collect {
       case a: InternalXDCAnnotation => a
