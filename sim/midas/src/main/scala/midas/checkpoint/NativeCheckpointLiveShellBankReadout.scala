@@ -18,7 +18,7 @@ object NativeCheckpointLiveShellBankReadout {
   private val prefix = "checkpoint_live_readout_"
   case class Result(state: CircuitState, snapshot: NativeCheckpointLiveShellSnapshot.Result,
       entry: StateAccessEntry, binding: String, files: Seq[GoldenGateOutputFileAnnotation],
-      enableRestore: Boolean = false)
+      enableRestore: Boolean = false, enableCapture: Boolean = false)
   private def check(ok: Boolean, why: String): Unit = require(ok, "live shell bank readout: " + why)
   private def statements(s: Statement): Seq[Statement] = {
     val xs = scala.collection.mutable.ArrayBuffer.empty[Statement]
@@ -28,7 +28,8 @@ object NativeCheckpointLiveShellBankReadout {
   private def resource(name: String): String = {
     val s = scala.io.Source.fromResource(name); try s.mkString finally s.close()
   }
-  def generate(snapshot: NativeCheckpointLiveShellSnapshot.Result, enableRestore: Boolean = false): Result = {
+  def generate(snapshot: NativeCheckpointLiveShellSnapshot.Result, enableRestore: Boolean = false,
+      enableCapture: Boolean = false): Result = {
     NativeCheckpointLiveShellSnapshot.validate(snapshot)
     val doc = parse(snapshot.binding)
     val JString(selectedPath) = doc \ "selected_execution"
@@ -65,12 +66,18 @@ object NativeCheckpointLiveShellBankReadout {
       port("reset", Input, 1), port("permission", Input, 1), port("snapshot_state", Input, bits),
       port("restore_hold", Input, 1), port("restore_load", Input, 1), port("restore_state", Input, 69),
       port("restore_ready", Output, 1),
+      port("capture_hold", Input, 1), port("capture_address", Input, 32),
+      port("capture_valid", Output, 1), port("capture_data", Output, 64), port("capture_error", Output, 1),
       port("idle", Output, 1), port("control_state", Output, 69)) ++ bus.flatMap { case (n,(d,w)) =>
       Seq(port(roles(n), d, w), port("original_" + roles(n), if (d == Input) Output else Input, w))
     }, definition, Seq(IntParam("BITS", bits), IntParam("SNAPSHOT_BANK", bank),
-      IntParam("RESTORE_ENABLE", if (enableRestore) 1 else 0)))
+      IntParam("RESTORE_ENABLE", if (enableRestore) 1 else 0),
+      IntParam("CAPTURE_ENABLE", if (enableCapture) 1 else 0)))
     val restorePorts = Seq(port(prefix + "restore_hold", Input, 1), port(prefix + "restore_load", Input, 1),
       port(prefix + "restore_state", Input, 69), port(prefix + "restore_ready", Output, 1))
+    val capturePorts = Seq(port(prefix + "capture_hold", Input, 1), port(prefix + "capture_address", Input, 32),
+      port(prefix + "capture_valid", Output, 1), port(prefix + "capture_data", Output, 64),
+      port(prefix + "capture_error", Output, 1))
     val instance = prefix + "adapter"
     val idlePort = port(prefix + "idle", Input, 1)
     val attemptPort = port(prefix + "attempt", Input, 1)
@@ -106,6 +113,11 @@ object NativeCheckpointLiveShellBankReadout {
           else Connect(NoInfo, pin(localRole), if (enableRestore) WRef(q.name, q.tpe)
             else UIntLiteral(0, q.tpe.asInstanceOf[UIntType].width))
         }.filterNot(c => !enableRestore && c.loc.serialize == prefix + "restore_ready")
+        val captureConnections = capturePorts.collect {
+          case q if q.direction == Input => Connect(NoInfo, pin(q.name.stripPrefix(prefix)),
+            if (enableCapture) WRef(q.name, q.tpe) else UIntLiteral(0, q.tpe.asInstanceOf[UIntType].width))
+          case q if enableCapture => Connect(NoInfo, WRef(q.name, q.tpe), pin(q.name.stripPrefix(prefix)))
+        }
         wires ++ Seq(WDefInstance(instance, definition),
           Connect(NoInfo, pin("clock"), WRef(enclosingClock.stripPrefix(rootName + "."), ClockType)),
           Connect(NoInfo, pin("reset"), WRef(p + "ckpt_reset")),
@@ -114,10 +126,11 @@ object NativeCheckpointLiveShellBankReadout {
             Seq(bits - 1, BigInt(0)), UIntType(IntWidth(bits)))),
           Connect(NoInfo, WRef(idlePort.name), pin("idle")),
           Connect(NoInfo, WRef(attemptPort.name), WRef(p + "ckpt_req_valid")),
-          Connect(NoInfo, WRef(prefix + "control_state"), pin("control_state"))) ++ restoreConnections ++ connectBus ++ routes
+          Connect(NoInfo, WRef(prefix + "control_state"), pin("control_state"))) ++
+          restoreConnections ++ captureConnections ++ connectBus ++ routes
       }
       val ports = if (i == 0) m.ports ++ Seq(port(prefix + "control_state", Output, 69)) ++
-        (if (enableRestore) restorePorts else Nil)
+        (if (enableRestore) restorePorts else Nil) ++ (if (enableCapture) capturePorts else Nil)
         else m.ports ++ Seq(idlePort, attemptPort)
       val local = if (i == 0) Seq(DefWire(NoInfo, idlePort.name, idlePort.tpe),
         DefWire(NoInfo, attemptPort.name, attemptPort.tpe)) else Nil
@@ -147,14 +160,20 @@ object NativeCheckpointLiveShellBankReadout {
       "readout_state_owner" -> JString("unsupported_live_readout_state_capture_and_restore"),
       "local_readout_restore_enabled" -> JBool(enableRestore),
       "local_readout_restore_scope" -> JString("69_bit_routing_and_snapshot_response_only"),
+      "local_readout_capture_enabled" -> JBool(enableCapture),
+      "local_readout_capture_scope" -> JString("held_69_bit_routing_and_snapshot_response_only"),
+      "local_readout_capture_words" -> JInt(2),
+      "local_readout_capture_extra_storage_bits" -> JInt(0),
+      "local_readout_capture_transport" -> JString("stateless_sideband_64_bit_words_lsb0_zero_padded"),
+      "local_readout_capture_target_cycle_authority" -> JBool(false),
       "original_and_staging_restore_supported" -> JBool(false),
       "files" -> JObject(files.map(f => f.fileSuffix -> JString(sha256(f.body))).toList),
       "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
       "metasim_restore_supported" -> JBool(false), "production_freeze_owners_bound" -> JBool(false))))
-    Result(state, snapshot, entry, binding, files, enableRestore)
+    Result(state, snapshot, entry, binding, files, enableRestore, enableCapture)
   }
   def validate(result: Result): Unit = {
-    val expected = generate(result.snapshot, result.enableRestore)
+    val expected = generate(result.snapshot, result.enableRestore, result.enableCapture)
     check(result == expected, "changed source, staged payload, bank routing, descriptor or new owner")
   }
 }

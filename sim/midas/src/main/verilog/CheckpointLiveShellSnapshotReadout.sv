@@ -4,7 +4,8 @@
 module CheckpointLiveShellSnapshotReadout #(
     parameter integer BITS = 557,
     parameter [7:0] SNAPSHOT_BANK = 8'd1,
-    parameter integer RESTORE_ENABLE = 0
+    parameter integer RESTORE_ENABLE = 0,
+    parameter integer CAPTURE_ENABLE = 0
 ) (
     input wire clock, reset, permission,
     // Complete LOCAL routing/response owner. Original banks, payload, target
@@ -12,6 +13,16 @@ module CheckpointLiveShellSnapshotReadout #(
     input wire restore_hold, restore_load,
     input wire [68:0] restore_state,
     output wire restore_ready,
+    // Opt-in, stateless LOCAL capture port. Assert hold before sampling on a
+    // raw clock edge, revoke permission, and withdraw all public handshake and
+    // restore intent. Both words observe the SAME parked 69-bit owner. There
+    // is no new response register, recursive snapshot owner or implicit cut
+    // label; the caller must bind the global cut and every original endpoint.
+    input wire capture_hold,
+    input wire [31:0] capture_address,
+    output wire capture_valid,
+    output wire [63:0] capture_data,
+    output wire capture_error,
     input wire [BITS-1:0] snapshot_state,
     input wire request_valid,
     output wire request_ready,
@@ -39,8 +50,9 @@ module CheckpointLiveShellSnapshotReadout #(
     reg pending, snapshot_owner;
     wire select_snapshot = bank == SNAPSHOT_BANK;
     wire restoring = RESTORE_ENABLE != 0 && restore_hold;
+    wire capturing = CAPTURE_ENABLE != 0 && capture_hold;
     wire load_attempt = RESTORE_ENABLE != 0 && restore_load;
-    wire allowed = permission && !reset && !restoring && !load_attempt;
+    wire allowed = permission && !reset && !restoring && !load_attempt && !capturing;
     wire snapshot_request_ready, snapshot_response_valid, snapshot_response_ready;
     wire [63:0] snapshot_response_data;
     wire snapshot_response_error, snapshot_failed;
@@ -50,11 +62,16 @@ module CheckpointLiveShellSnapshotReadout #(
     // All inactive data/error/owner bits remain data, even when not visible.
     wire shape_valid = restore_state[67] == (restore_state[0] && restore_state[1]);
     wire safe_restore = !permission && !request_valid && !response_ready;
-    assign restore_ready = restoring && safe_restore && shape_valid && snapshot_restore_ready && !reset;
+    assign restore_ready = restoring && safe_restore && shape_valid && snapshot_restore_ready && !reset && !capturing;
+    wire safe_capture = !permission && !request_valid && !response_ready && !load_attempt && !restoring;
+    assign capture_valid = capturing && safe_capture && !reset;
+    assign capture_error = capturing && (!capture_valid || capture_address >= 2);
+    wire [127:0] capture_padded = {59'b0, control_state};
+    assign capture_data = capture_valid && !capture_error ? capture_padded[capture_address * 64 +: 64] : 64'b0;
     // Original reader phases are checked independently at the staging owner.
     // Its public request_ready is permission-gated, so using it here would
     // create a capture/permission loop before the first staged copy exists.
-    assign idle = !pending && !snapshot_control[65] && !snapshot_failed && !restoring && !load_attempt;
+    assign idle = !pending && !snapshot_control[65] && !snapshot_failed && !restoring && !load_attempt && !capturing;
     assign request_ready = allowed && !pending &&
         (select_snapshot ? snapshot_request_ready : original_request_ready);
     assign original_request_valid = allowed && !pending && !select_snapshot && request_valid;
@@ -71,11 +88,12 @@ module CheckpointLiveShellSnapshotReadout #(
     assign snapshot_response_ready = allowed && pending && snapshot_owner && response_ready;
     assign control_state = {snapshot_control, snapshot_owner, pending};
     CheckpointSnapshotStateBank #(.BITS(BITS), .BANK(SNAPSHOT_BANK), .SLOT(16'd0),
-        .RESTORE_ENABLE(RESTORE_ENABLE)) snapshot_bank(
+        .RESTORE_ENABLE(RESTORE_ENABLE), .CAPTURE_ENABLE(CAPTURE_ENABLE)) snapshot_bank(
         .clock(clock), .reset(reset), .read_enable(allowed), .snapshot_state(snapshot_state),
         .restore_hold(restoring),
         .restore_load(load_attempt && restoring && safe_restore && shape_valid && !reset),
         .restore_state(restore_state[68:2]), .restore_ready(snapshot_restore_ready),
+        .capture_hold(capturing),
         .request_valid(allowed && !pending && select_snapshot && request_valid),
         .request_ready(snapshot_request_ready), .bank(bank), .slot(slot), .address(address),
         .response_valid(snapshot_response_valid), .response_ready(snapshot_response_ready),
@@ -88,7 +106,7 @@ module CheckpointLiveShellSnapshotReadout #(
         end else if (load_attempt && restore_ready) begin
             pending <= restore_state[0];
             snapshot_owner <= restore_state[1];
-        end else begin
+        end else if (!capturing) begin
             if (request_valid && request_ready) begin
                 pending <= 1;
                 snapshot_owner <= select_snapshot;

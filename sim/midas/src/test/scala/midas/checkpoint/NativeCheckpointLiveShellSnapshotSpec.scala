@@ -109,6 +109,32 @@ class NativeCheckpointLiveShellSnapshotSpec extends AnyFlatSpec {
     intercept[IllegalArgumentException] {
       NativeCheckpointLiveShellBankReadout.validate(restorable.copy(enableRestore = false))
     }
+    for (restore <- Seq(false, true)) {
+      val captured = NativeCheckpointLiveShellBankReadout.generate(result, enableRestore = restore, enableCapture = true)
+      NativeCheckpointLiveShellBankReadout.validate(captured)
+      assert(captured.entry == readout.entry && originalLive(s.state) == originalLive(captured.state))
+      val doc = parse(captured.binding)
+      assert((doc \ "local_readout_capture_enabled") == JBool(true))
+      assert((doc \ "local_readout_capture_words") == JInt(2))
+      assert((doc \ "local_readout_capture_extra_storage_bits") == JInt(0))
+      assert((doc \ "local_readout_capture_target_cycle_authority") == JBool(false))
+      assert((doc \ "complete_fpga_capture") == JBool(false))
+      assert((doc \ "original_and_staging_restore_supported") == JBool(false))
+      val root = captured.state.circuit.modules.find(_.name == "LiveTop").get
+      assert(root.ports.filter(_.name.startsWith("checkpoint_live_readout_capture_")).size == 5)
+      assert(readout.state.circuit.modules.find(_.name == "LiveTop").get.ports.forall(p =>
+        !p.name.startsWith("checkpoint_live_readout_capture_")))
+      intercept[IllegalArgumentException] {
+        NativeCheckpointLiveShellBankReadout.validate(captured.copy(enableCapture = false))
+      }
+      sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { base =>
+        val out = java.nio.file.Paths.get(base, "live-shell-bank-readout-capture" + (if (restore) "-restore" else ""))
+        java.nio.file.Files.createDirectories(out)
+        Seq("wired.fir" -> captured.state.circuit.serialize, "wired.sv" -> emit(captured.state),
+          "binding.json" -> captured.binding).foreach { case (name,text) =>
+            java.nio.file.Files.write(out.resolve(name), text.getBytes(java.nio.charset.StandardCharsets.UTF_8)) }
+      }
+    }
     sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { base =>
       val out = java.nio.file.Paths.get(base, "live-shell-bank-readout-restore"); java.nio.file.Files.createDirectories(out)
       Seq("wired.fir" -> restorable.state.circuit.serialize, "wired.sv" -> emit(restorable.state),

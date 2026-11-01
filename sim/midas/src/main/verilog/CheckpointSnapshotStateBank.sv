@@ -8,7 +8,8 @@ module CheckpointSnapshotStateBank #(
     parameter integer BITS = 6727,
     parameter [7:0] BANK = 8'd254,
     parameter [15:0] SLOT = 16'd0,
-    parameter integer RESTORE_ENABLE = 0
+    parameter integer RESTORE_ENABLE = 0,
+    parameter integer CAPTURE_ENABLE = 0
 ) (
     input wire clock, reset, read_enable,
     // Local response-owner restore only. The caller parks all bank traffic
@@ -16,6 +17,10 @@ module CheckpointSnapshotStateBank #(
     input wire restore_hold, restore_load,
     input wire [66:0] restore_state,
     output wire restore_ready,
+    // Independent local parking for an external read-only observation port.
+    // No response, fault or retained byte changes while held, including an
+    // in-flight response. This does not freeze the supplied snapshot_state.
+    input wire capture_hold,
     input wire [BITS-1:0] snapshot_state,
     input wire request_valid,
     output wire request_ready,
@@ -37,12 +42,13 @@ module CheckpointSnapshotStateBank #(
     reg saved_error;
     wire [PAD_BITS-1:0] padded = {{(PAD_BITS-BITS){1'b0}}, snapshot_state};
     wire restoring = RESTORE_ENABLE != 0 && restore_hold;
+    wire capturing = CAPTURE_ENABLE != 0 && capture_hold;
     wire load_attempt = RESTORE_ENABLE != 0 && restore_load;
     wire unsafe_restore = (load_attempt && !restoring) ||
         (restoring && (read_enable || request_valid || response_ready));
-    wire fault = (pending && !read_enable && !restoring) || unsafe_restore;
-    wire permission = read_enable && !failed && !fault && !reset && !restoring && !load_attempt;
-    assign restore_ready = restoring && !unsafe_restore && !reset;
+    wire fault = (pending && !read_enable && !restoring && !capturing) || unsafe_restore;
+    wire permission = read_enable && !failed && !fault && !reset && !restoring && !load_attempt && !capturing;
+    assign restore_ready = restoring && !unsafe_restore && !reset && !capturing;
     wire invalid = bank != BANK || slot != SLOT || address >= WORDS;
     assign request_ready = permission && !pending;
     assign response_valid = permission && pending;
@@ -60,7 +66,7 @@ module CheckpointSnapshotStateBank #(
             saved_error <= restore_state[64];
             pending <= restore_state[65];
             failed <= restore_state[66];
-        end else begin
+        end else if (!capturing) begin
             if (fault) failed <= 1;
             if (request_valid && request_ready) begin
                 pending <= 1;
