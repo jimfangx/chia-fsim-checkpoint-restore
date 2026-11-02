@@ -43,6 +43,14 @@ object FAMEClockCutWiring {
   val prefix = "checkpoint_fame_cut_"
   val valid = prefix + "consistent"
   val cycle = prefix + "applied_cycle"
+  /** Combinational local witness only. Existing storage, native gates and their
+    * owners remain in place; no collector, mask, reset or transport is added.
+    */
+  case class Witness(state: CircuitState, binding: String)
+  private def sameState(a: CircuitState, b: CircuitState): Boolean =
+    a.circuit.serialize == b.circuit.serialize && a.form == b.form &&
+      a.annotations.toSeq == b.annotations.toSeq &&
+      a.renames.map(_.serialize.linesIterator.toSeq.sorted) == b.renames.map(_.serialize.linesIterator.toSeq.sorted)
   case class Native(banks: GeneratedStateBankAccess.Result, dependencies: String,
       manifest: String, plan: String, witness: CircuitState, staging: F2NativeCollectorSnapshot.Result)
   case class Result(state: CircuitState, binding: String, collector: F2ClockResetCutWiring.Result,
@@ -114,12 +122,25 @@ object FAMEClockCutWiring {
       primaryDomain: String, owners: Int): Result =
     generateImpl(input, manifest, plan, resetPort, primaryDomain, owners, nativeBanks = true)
 
-  private def generateImpl(input: CircuitState, manifest: String, plan: String, resetPort: String,
-      primaryDomain: String, owners: Int, nativeBanks: Boolean): Result = {
-    if (input.form != LowForm || owners < 1 || owners > 65535)
-      fail("resolved LowForm and 1..65535 external owners required")
+  /** Reuse the checked applied-edge label in an existing coordinator without
+    * instantiating a second clock-cut controller. The consumer must separately
+    * prove its common cut and all other owners before accepting this witness.
+    */
+  def generateWitness(input: CircuitState, manifest: String, plan: String,
+      primaryDomain: String): Witness = {
+    if (input.form != LowForm) fail("resolved LowForm required")
     if (manifest != SimulatorStateInventory.discover(input) || plan != PhysicalClockCutPlan.discover(input, manifest))
       fail("stale complete inventory or physical clock plan")
+    generateWitness(input, primaryDomain)
+  }
+
+  /** Resolve only the concrete FAME roles. An enclosing transport may contain
+    * separately owned opaque storage; it cannot be admitted by this witness.
+    * The production consumer must independently validate that storage and its
+    * exact transport ABI, resources, owner bindings and incomplete-image guard.
+    */
+  def generateWitness(input: CircuitState, primaryDomain: String): Witness = {
+    if (input.form != LowForm) fail("resolved LowForm required")
     FAMEClockProgressBindings.resolve(input)
     val models = input.annotations.collect { case a: FAMEClockProgressModelAnnotation => a }
     if (models.size != 1 || !models.head.domains.contains(primaryDomain))
@@ -173,6 +194,44 @@ object FAMEClockCutWiring {
       case m => m
     }
     val witness = state.copy(circuit = state.circuit.copy(modules = rewritten))
+    val binding = canonical(JObject(List(
+      "witness_version" -> JInt(1), "scope" -> JString("local_fame_combinational_witness_only"),
+      "reference_sha256" -> JString(sha256(input.circuit.serialize)),
+      "reopened_reference_sha256" -> JString(sha256(state.circuit.serialize)),
+      "wired_reference_sha256" -> JString(sha256(witness.circuit.serialize)),
+      "model_identity" -> JString(model.model), "primary_domain" -> JString(primaryDomain),
+      "label_role" -> JString("applied"), "label_path" -> (row(primaryDomain, "applied") \ "rtl_path"),
+      "valid_port" -> JString(valid), "cycle_port" -> JString(cycle),
+      "predicate" -> JString("not_reset_and_not_overflow_and_all_domains_consumed_eq_65bit_applied_plus_pending_and_consumed_le_completed_steps"),
+      "signals" -> JArray(rows.toList), "new_storage_bits" -> JInt(0),
+      "global_target_cut_proven" -> JBool(false), "production_freeze_owners_bound" -> JBool(false),
+      "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
+      "metasim_restore_supported" -> JBool(false))))
+    Witness(witness, binding)
+  }
+
+  def validateWitness(input: CircuitState, primaryDomain: String, result: Witness): Unit = {
+    val expected = generateWitness(input, primaryDomain)
+    if (expected.binding != result.binding || !sameState(expected.state, result.state))
+      fail("witness differs from independent regeneration")
+  }
+
+  def validateWitness(input: CircuitState, manifest: String, plan: String,
+      primaryDomain: String, result: Witness): Unit = {
+    val expected = generateWitness(input, manifest, plan, primaryDomain)
+    if (expected.binding != result.binding || !sameState(expected.state, result.state))
+      fail("witness differs from independent regeneration")
+  }
+
+  private def generateImpl(input: CircuitState, manifest: String, plan: String, resetPort: String,
+      primaryDomain: String, owners: Int, nativeBanks: Boolean): Result = {
+    if (input.form != LowForm || owners < 1 || owners > 65535)
+      fail("resolved LowForm and 1..65535 external owners required")
+    val local = generateWitness(input, manifest, plan, primaryDomain)
+    val witness = local.state
+    val witnessBinding = parse(local.binding)
+    val rows = (witnessBinding \ "signals").asInstanceOf[JArray].arr
+    val bit = UIntType(IntWidth(1))
     // Reconstruct the inventory/topology for the added combinational outputs.
     // Every original storage declaration and StateID remains unchanged.
     val inv = SimulatorStateInventory.discover(witness)
@@ -187,7 +246,7 @@ object FAMEClockCutWiring {
     val collector = native.map(_.staging.collector).getOrElse(
       F2ClockResetCutWiring.generate(witness, inv, clockPlan, resetPort, cycle, owners + 1))
     val composed = native.map(_.staging.state).getOrElse(collector.state)
-    val root = composed.circuit.modules.collectFirst { case m: Module if m.name == state.circuit.main => m }.get
+    val root = composed.circuit.modules.collectFirst { case m: Module if m.name == witness.circuit.main => m }.get
     val ownerPort = F2ClockResetCutWiring.prefix + "owner_present"
     def expr(e: Expression): Expression = e match {
       case r: WRef if r.name == ownerPort =>
@@ -230,12 +289,12 @@ object FAMEClockCutWiring {
         "local_fame_witness_native_banks_staged_f2_collector_sibling_only"
         else "local_fame_witness_connected_f2_collector_sibling_only"),
       "reference_sha256" -> JString(sha256(input.circuit.serialize)),
-      "reopened_reference_sha256" -> JString(sha256(state.circuit.serialize)),
+      "reopened_reference_sha256" -> (witnessBinding \ "reopened_reference_sha256"),
       "manifest_sha256" -> JString(sha256(manifest)), "plan_sha256" -> JString(sha256(plan)),
       "wired_reference_sha256" -> JString(sha256(result.circuit.serialize)),
       "collector_binding_sha256" -> JString(sha256(collector.binding)),
-      "model_identity" -> JString(model.model), "primary_domain" -> JString(primaryDomain),
-      "label_role" -> JString("applied"), "label_path" -> (row(primaryDomain, "applied") \ "rtl_path"),
+      "model_identity" -> (witnessBinding \ "model_identity"), "primary_domain" -> JString(primaryDomain),
+      "label_role" -> JString("applied"), "label_path" -> (witnessBinding \ "label_path"),
       "fame_owner_bit" -> JInt(owners), "external_owners" -> JInt(owners),
       "predicate" -> JString("not_reset_and_not_overflow_and_all_domains_consumed_eq_65bit_applied_plus_pending_and_consumed_le_completed_steps"),
       "signals" -> JArray(boundRows.toList), "new_storage_bits" -> JInt(0),
@@ -265,10 +324,6 @@ object FAMEClockCutWiring {
     // RenameMap is mutable compiler metadata with reference equality. Compare
     // its actual mappings, just as we compare emitted IR and live annotations;
     // independently regenerated native bank results are distinct objects.
-    def sameState(a: CircuitState, b: CircuitState): Boolean =
-      a.circuit.serialize == b.circuit.serialize && a.form == b.form &&
-        a.annotations.toSeq == b.annotations.toSeq &&
-        a.renames.map(_.serialize.linesIterator.toSeq.sorted) == b.renames.map(_.serialize.linesIterator.toSeq.sorted)
     def sameCollector(a: F2ClockResetCutWiring.Result, b: F2ClockResetCutWiring.Result): Boolean =
       a.binding == b.binding && sameState(a.state, b.state) &&
         a.reset.binding == b.reset.binding && a.reset.audit == b.reset.audit && sameState(a.reset.state, b.reset.state)
