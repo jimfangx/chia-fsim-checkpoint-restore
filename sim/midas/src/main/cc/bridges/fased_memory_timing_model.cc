@@ -137,6 +137,7 @@ FASEDMemoryTimingModel::FASEDMemoryTimingModel(
 
 void FASEDMemoryTimingModel::profile() {
   widget_checkpoint_state_t::call_t call(checkpoint_state);
+  checkpoint_publication.changed();
   if (lifecycle != 1)
     throw std::runtime_error("FASED profile outside initialized lifecycle");
   replay_stats();
@@ -150,6 +151,7 @@ void FASEDMemoryTimingModel::profile() {
 
 void FASEDMemoryTimingModel::init() {
   widget_checkpoint_state_t::call_t call(checkpoint_state);
+  checkpoint_publication.changed();
   if (lifecycle != 0)
     throw std::runtime_error("FASED repeated initialization");
   for (auto &[key, addr] : addr_map.w_registers) {
@@ -207,6 +209,7 @@ void FASEDMemoryTimingModel::init() {
 
 void FASEDMemoryTimingModel::finish() {
   widget_checkpoint_state_t::call_t call(checkpoint_state);
+  checkpoint_publication.changed();
   if (lifecycle != 1)
     throw std::runtime_error("FASED finish outside initialized lifecycle");
   replay_stats();
@@ -425,6 +428,11 @@ void FASEDMemoryTimingModel::load_checkpoint(const std::vector<uint8_t> &data) {
   // All validation/allocation precedes mutation. No MMIO, file access or
   // target advancement occurs here, including on a malformed payload.
   auto decoded = decode_checkpoint(data);
+  checkpoint_publication.changed();
+  apply_checkpoint(decoded);
+}
+
+void FASEDMemoryTimingModel::apply_checkpoint(decoded_checkpoint_t &decoded) noexcept {
   for (size_t i = 0; i < histograms.size(); ++i)
     std::copy(decoded.histograms[i].begin(), decoded.histograms[i].end(), histograms[i].latency);
   for (size_t i = 0; i < rangectrs.size(); ++i) {
@@ -434,4 +442,41 @@ void FASEDMemoryTimingModel::load_checkpoint(const std::vector<uint8_t> &data) {
   stats_history.swap(decoded.history);
   lifecycle = decoded.lifecycle;
   stats_replay_pending = true;
+}
+
+// Returned-call host state only. The hardware timing model, functional memory,
+// physical cut and output publication retain separate ownership. Preparation
+// allocates every replacement buffer; sealing checks the untouched destination.
+// The coordinator must exclude ordinary calls through all owners' readbacks.
+class FASEDMemoryTimingModel::restore_t final : public prepared_checkpoint_t {
+  FASEDMemoryTimingModel &owner;
+  checkpoint_publication_t::guard_t guard;
+  const std::vector<uint8_t> expected;
+  const bool expected_replay_pending;
+  decoded_checkpoint_t replacement;
+public:
+  restore_t(FASEDMemoryTimingModel &owner, const std::vector<uint8_t> &payload)
+      : owner(owner), guard(owner.checkpoint_publication),
+        expected(owner.save_checkpoint()),
+        expected_replay_pending(owner.stats_replay_pending),
+        replacement(owner.decode_checkpoint(payload)) {}
+  void seal() override {
+    // Check lifetime/thread/generation before dereferencing the destination.
+    guard.require_unsealed();
+    if (owner.save_checkpoint() != expected ||
+        owner.stats_replay_pending != expected_replay_pending)
+      throw std::runtime_error("FASED checkpoint destination changed");
+    guard.seal();
+  }
+  void publish() noexcept override {
+    // Misuse fails before any owner access; no parsing, allocation, MMIO or
+    // file replay is permitted in this no-fail aggregate publication phase.
+    guard.publish();
+    owner.apply_checkpoint(replacement);
+  }
+};
+
+std::unique_ptr<prepared_checkpoint_t>
+FASEDMemoryTimingModel::prepare_checkpoint_publication(const std::vector<uint8_t> &payload) {
+  return std::make_unique<restore_t>(*this, payload);
 }

@@ -6,6 +6,7 @@
 #include "core/address_map.h"
 #include "core/bridge_driver.h"
 #include "core/widget_checkpoint.h"
+#include "core/checkpoint_publication.h"
 
 #include <fstream>
 #include <set>
@@ -136,6 +137,8 @@ public:
   std::vector<uint8_t> save_checkpoint() const override;
   void validate_checkpoint(const std::vector<uint8_t> &) const override;
   void load_checkpoint(const std::vector<uint8_t> &) override;
+  std::unique_ptr<prepared_checkpoint_t> prepare_checkpoint_publication(
+      const std::vector<uint8_t> &) override;
 
   const AddressMap &get_addr_map() const { return addr_map; }
 
@@ -158,6 +161,7 @@ private:
   bool stats_replay_pending = false;
   uint64_t lifecycle = 0; // constructed=0, initialized=1, finished=2
   widget_checkpoint_state_t checkpoint_state;
+  checkpoint_publication_t checkpoint_publication;
   widget_checkpoint_config_t checkpoint_config() const;
   struct decoded_checkpoint_t {
     uint64_t lifecycle;
@@ -165,6 +169,8 @@ private:
     std::vector<std::vector<uint64_t>> histograms, ranges;
   };
   decoded_checkpoint_t decode_checkpoint(const std::vector<uint8_t> &) const;
+  void apply_checkpoint(decoded_checkpoint_t &) noexcept;
+  class restore_t;
   void require_checkpointable() const;
   void replay_stats();
   void append_stats(const std::string &);
