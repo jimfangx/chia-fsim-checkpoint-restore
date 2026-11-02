@@ -106,7 +106,7 @@ object NativeCheckpointInPlaceContext {
       check(snapshot == result.context, "compiler context changed")
       check((binding \ "compiler_context_sha256") == JString(sha256(result.context)), "unbound compiler context")
       check(owners.toVector == result.native.state.annotations.toVector, "storage projection changed")
-      GeneratedStateBankAnnotations.preflight(state.copy(annotations = owners))
+      GeneratedStateBankAnnotations.preflight(state.copy(annotations = owners), fameSource = Some(result.host))
     }
   }
 }

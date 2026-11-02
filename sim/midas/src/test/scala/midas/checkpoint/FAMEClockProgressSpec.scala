@@ -50,8 +50,13 @@ class FAMEClockProgressSpec extends AnyFlatSpec {
     clockOutA <= model.clockOutA
     clockOutB <= model.clockOutB
 """
-  private def seed(): CircuitState = {
-    val state = new Compiler(Forms.LowForm).execute(CircuitState(Parser.parse(source), ChirrtlForm))
+  private def seed(targetReset: Boolean = false): CircuitState = {
+    // The regional runtime fixture resets target storage through real input
+    // tokens. FAME hostReset inhibits the gated target clocks themselves.
+    val text = if (!targetReset) source else source
+      .replace("a <= add(a, data)", "a <= mux(eq(data, UInt<8>(0)), UInt<8>(0), add(a, data))")
+      .replace("b <= add(b, UInt<8>(1))", "b <= mux(eq(data, UInt<8>(0)), UInt<8>(0), add(b, UInt<8>(1)))")
+    val state = new Compiler(Forms.LowForm).execute(CircuitState(Parser.parse(text), ChirrtlForm))
     val top = ModuleTarget("Top", "Top"); val model = ModuleTarget("Top", "Model")
     val clockInfo = TargetClockChannel(Seq(RationalClock("fast", 1, 1), RationalClock("slow", 1, 3)), Seq(1, 3))
     state.copy(form = LowForm, annotations = Seq(
@@ -65,8 +70,8 @@ class FAMEClockProgressSpec extends AnyFlatSpec {
       FAMEChannelPortsAnnotation("value", Some(model.ref("clockOutA")), Seq(model.ref("value"))),
       FAMEChannelPortsAnnotation("slow", Some(model.ref("clockOutB")), Seq(model.ref("slow")))))
   }
-  private def transform(observe: Boolean): CircuitState = {
-    val s = seed()
+  private def transform(observe: Boolean, targetReset: Boolean = false): CircuitState = {
+    val s = seed(targetReset)
     val requested = if (!observe) s else s.copy(annotations = s.annotations ++ Seq(
       SimulatorCheckpointInventoryAnnotation("Top"), FAMEClockProgressAnnotation))
     val fame = new FAMETransform().execute(requested)
@@ -368,12 +373,132 @@ class FAMEClockProgressSpec extends AnyFlatSpec {
       }
     }
   }
-  private def bankReference(): CircuitState = {
-    val s = transform(true)
+  private def bankReference(targetReset: Boolean = false): CircuitState = {
+    val s = transform(true, targetReset)
     new Compiler(Forms.LowForm).execute(s.copy(form = HighForm, annotations = s.annotations.filter {
       case _: DontTouchAnnotation | _: FAMEClockProgressSignalAnnotation | _: FAMEClockProgressModelAnnotation => true
       case _ => false
     })).copy(form = LowForm)
+  }
+
+  it should "authenticate regional freeze rewrites against all original FAME owner equations" in {
+    import org.json4s._
+    import org.json4s.native.JsonMethods.parse
+    val host = bankReference(targetReset = true)
+    val execution = GeneratedExternalOwners.instances(host, host.circuit.main).collectFirst {
+      case (path, m: Module) if m.name == "Model" => path.split('.').last
+    }.get
+    val selected = ModuleTarget("Top", "Top").instOf(execution, "Model")
+    val regions = NativeCheckpointRegions.generate(host, Seq(selected))
+    NativeCheckpointRegions.validate(regions)
+    val rows = FAMEClockProgressBindings.resolveFrozen(host, regions.state)
+    assert(rows.size == 21)
+    assert(FAMEClockProgressBindings.resolveFrozen(host, host) == FAMEClockProgressBindings.resolve(host))
+    intercept[IllegalArgumentException](FAMEClockProgressBindings.resolve(regions.state))
+    val graft = NativeCheckpointRegionGraft.generate(regions)
+    assert(FAMEClockProgressBindings.resolveFrozen(host, graft.state) == rows)
+    val cut = NativeCheckpointRegionClockCut.generate(regions, Seq("external_reset", "host_memory"))
+    assert(FAMEClockProgressBindings.resolveFrozen(host, cut.state) == rows)
+    val role = regions.state.annotations.collectFirst {
+      case a: FAMEClockProgressSignalAnnotation if a.role == "completed_steps" => a
+    }.get
+    val owner = role.target.path.last._2.value
+    def changed(rewrite: Statement => Statement): CircuitState = regions.state.copy(circuit =
+      regions.state.circuit.copy(modules = regions.state.circuit.modules.map {
+        case m: Module if m.name == owner => m.copy(body = rewrite(m.body))
+        case m => m
+      }))
+    for (mutation <- 0 until 9) {
+      var count = 0
+      def rewrite(s: Statement): Statement = s match {
+        case c: Connect if c.loc.serialize == role.target.ref && mutation < 5 =>
+          count += 1
+          val freeze = c.expr.asInstanceOf[Mux]
+          c.copy(expr = mutation match {
+            case 0 => freeze.copy(cond = UIntLiteral(0, IntWidth(1)))
+            case 1 => freeze.copy(tval = UIntLiteral(0, IntWidth(64)))
+            case 2 => freeze.copy(fval = WRef(role.target.ref, UIntType(IntWidth(64))))
+            case 3 => freeze.copy(fval = freeze.fval.asInstanceOf[Mux].copy(cond = UIntLiteral(1, IntWidth(1))))
+            case 4 => freeze.copy(fval = freeze.fval.asInstanceOf[Mux].copy(fval = UIntLiteral(0, IntWidth(64))))
+          })
+        case r: DefRegister if r.name == role.target.ref && mutation == 5 =>
+          count += 1; r.copy(clock = WRef("badClock", ClockType))
+        case c: Connect if c.loc.serialize.endsWith(".CE") && mutation == 6 =>
+          count += 1; c.copy(expr = UIntLiteral(1, IntWidth(1)))
+        case i: WDefInstance if i.name == PhysicalClockCutWiring.rootGate && mutation == 7 =>
+          count += 1; EmptyStmt
+        case c: Connect if c.loc.serialize == PhysicalClockCutWiring.rootGate + ".I" && mutation == 8 =>
+          count += 1; c.copy(expr = WRef("badClock", ClockType))
+        case x => x.mapStmt(rewrite)
+      }
+      val bad = changed(rewrite)
+      assert(count > 0)
+      intercept[IllegalArgumentException](FAMEClockProgressBindings.resolveFrozen(host, bad))
+      val rebound = SemanticStateInventory.canonical(parse(regions.binding).transformField {
+        case ("instrumented_sha256", _) => "instrumented_sha256" ->
+          JString(SemanticStateInventory.sha256(bad.circuit.serialize))
+      })
+      intercept[IllegalArgumentException](NativeCheckpointRegions.validate(regions.copy(state = bad, binding = rebound)))
+    }
+    val reversedFreeze = regions.state.copy(circuit = regions.state.circuit.copy(modules =
+      regions.state.circuit.modules.map {
+        case m: Module if m.name == owner => m.copy(ports = m.ports.map {
+          case p if p.name == "ckpt_freeze" => p.copy(direction = Output)
+          case p => p
+        })
+        case m => m
+      }))
+    intercept[IllegalArgumentException](FAMEClockProgressBindings.resolveFrozen(host, reversedFreeze))
+    // Local role projection grants no ancestor route authority. The complete
+    // regional validator independently reconstructs that sideband as well.
+    def crossWire(s: Statement): Statement = s match {
+      case c: Connect if c.loc.serialize == execution + ".ckpt_freeze" => c.copy(expr = UIntLiteral(0, IntWidth(1)))
+      case x => x.mapStmt(crossWire)
+    }
+    val badRoute = regions.state.copy(circuit = regions.state.circuit.copy(modules =
+      regions.state.circuit.modules.map {
+        case m: Module if m.name == "Top" => m.copy(body = crossWire(m.body))
+        case m => m
+      }))
+    intercept[IllegalArgumentException](NativeCheckpointRegions.validate(regions.copy(state = badRoute)))
+    // The exact same role identities cannot authorize an altered unselected model.
+    val badHost = host.copy(circuit = host.circuit.copy(modules = host.circuit.modules.map {
+      case m: Module if m.name == "Model" =>
+        def rewrite(s: Statement): Statement = s match {
+          case c: Connect if c.loc.serialize == role.target.ref => c.copy(expr = UIntLiteral(0, IntWidth(64)))
+          case x => x.mapStmt(rewrite)
+        }
+        m.copy(body = rewrite(m.body))
+      case m => m
+    }))
+    intercept[IllegalArgumentException](FAMEClockProgressBindings.resolveFrozen(host, badHost))
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { base =>
+      val out = Paths.get(base).resolve("fame-region-freeze"); Files.createDirectories(out)
+      def save(name: String, body: String): Unit = Files.write(out.resolve(name), body.getBytes(UTF_8))
+      save("host.fir", host.circuit.serialize)
+      save("host-annotations.json", JsonProtocol.serialize(host.annotations))
+      save("instrumented.fir", regions.state.circuit.serialize)
+      save("instrumented-annotations.json", JsonProtocol.serialize(regions.state.annotations))
+      save("binding.json", regions.binding)
+      save("descriptors.json", regions.descriptors.manifest)
+      def emittedState(value: CircuitState): String = {
+        val e = new SemanticCleanEmitter
+        new Compiler(Seq(firrtl.options.Dependency.fromTransform(e)), Forms.LowForm, Set(e))
+          .execute(value.copy(annotations = value.annotations :+ EmitCircuitAnnotation(e.getClass)))
+          .getEmittedCircuit.value
+      }
+      save("host.sv", emittedState(host))
+      save("instrumented.sv", emittedState(regions.state))
+      save("targets.json", SemanticStateInventory.canonical(JArray(List(JString(selected.serialize)))))
+      save("roles.json", SemanticStateInventory.canonical(JArray(rows.toList)))
+      save("grafted.fir", graft.state.circuit.serialize)
+      save("common-cut.fir", cut.state.circuit.serialize)
+      val emitter = new SemanticCleanEmitter
+      val emitted = new Compiler(Seq(firrtl.options.Dependency.fromTransform(emitter)), Forms.LowForm, Set(emitter))
+        .execute(cut.state.copy(annotations = cut.state.annotations :+ EmitCircuitAnnotation(emitter.getClass)))
+      save("generated.sv", emitted.getEmittedCircuit.value)
+      cut.files.foreach(f => save("generated" + f.fileSuffix, f.body))
+    }
   }
 
   it should "specialize complete FAME identities into native functional banks and hash every translated role" in {

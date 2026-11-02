@@ -160,7 +160,7 @@ object NativeCheckpointRegionWidgetGraft {
     val typed = firrtl.passes.InferTypes.run(firrtl.passes.ResolveKinds.run(firrtl.passes.ToWorkingIR.run(circuit)))
     val flowed = firrtl.passes.ResolveFlows.run(typed)
     firrtl.passes.CheckTypes.run(flowed); firrtl.passes.CheckFlows.run(flowed)
-    val projected = NativeCheckpointWidgetAnnotations.project(after, after.copy(circuit = flowed))
+    val projected = NativeCheckpointWidgetAnnotations.project(after, after.copy(circuit = flowed), Some(source.host))
     val sourceContext = source.host.annotations.filter(SimulatorBankProbeContext.accepts)
     val graftContext = graft.state.annotations.filter(SimulatorBankProbeContext.accepts)
     check(graftContext.toVector == sourceContext.toVector, "generated compiler context changed")
@@ -173,7 +173,7 @@ object NativeCheckpointRegionWidgetGraft {
     val identity = GeneratedExternalOwners.instances(result, result.circuit.main).collect { case (path, m: Module) =>
       GeneratedStateBankAnnotations.Clone(m.name, path, m.name, m)
     }
-    val (validated, _) = GeneratedStateBankAnnotations.translate(storage, identity)
+    val (validated, _) = GeneratedStateBankAnnotations.translate(storage, identity, fameSource = Some(source.host))
     check(validated.toSet == storage.annotations.toSet, "combined storage annotation targets changed")
     val binding = canonical(JObject(List(
       "connection_version" -> JInt(1), "scope" -> JString("reserved_widget_to_existing_disjoint_regions_routes_only"),

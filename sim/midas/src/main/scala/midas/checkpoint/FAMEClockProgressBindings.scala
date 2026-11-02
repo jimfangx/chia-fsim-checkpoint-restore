@@ -97,7 +97,18 @@ object FAMEClockProgressBindings {
   private[checkpoint] def resolveBanked(input: CircuitState): Seq[JValue] =
     resolveImpl(input, banked = true)
 
-  private def resolveImpl(input: CircuitState, banked: Boolean): Seq[JValue] = {
+  /** Source-bound diagnostic projection. The original role contract remains strict;
+    * only the exact generated bank and physical mask equations may differ. */
+  private[checkpoint] def resolveFrozen(source: CircuitState, input: CircuitState): Seq[JValue] =
+    resolveImpl(input, banked = false, source = Some(source))
+
+  private def resolveImpl(input: CircuitState, banked: Boolean,
+      source: Option[CircuitState] = None): Seq[JValue] = {
+    val sourceRows = source.map { original =>
+      val rows = resolve(original)
+      validatePreserved(original, input)
+      rows
+    }
     if (models(input).isEmpty && signals(input).isEmpty) return Nil
     val state = PhysicalClockCutPlan.explicitConnections(input)
     val ms = models(state); val ss = signals(state)
@@ -184,7 +195,7 @@ object FAMEClockProgressBindings {
     }.toMap
     if (locations.values.map(_.absolute).toSeq.distinct.size != ss.size) fail("aliased signal roles")
 
-    ms.foreach { model =>
+    if (source.isEmpty) ms.foreach { model =>
       val owners = ss.filter(_.model == model.model)
       val ownerLocations = owners.map(a => locations(a).path)
       if (ownerLocations.distinct.size != 1) fail("model roles split across executions")
@@ -272,12 +283,14 @@ object FAMEClockProgressBindings {
           fail("native gate or pending role connectivity mismatch")
       }
     }
-    ss.sortBy(key).map { a =>
+    val rows = ss.sortBy(key).map { a =>
       val location = locations(a)
       JObject(List("model_identity" -> JString(a.model), "domain_identity" -> JString(a.domain),
         "role" -> JString(a.role), "target" -> JString(a.target.serialize), "rtl_path" -> JString(location.absolute),
         "type" -> JString(location.tpe.serialize), "storage" -> JBool(registers(a.role))))
     }
+    source.foreach(original => FAMEClockProgressProjection.validate(original, input, sourceRows.get, rows))
+    rows
   }
 
   /** Bind native-bank roles to this companion emitter's actual prepared IR.

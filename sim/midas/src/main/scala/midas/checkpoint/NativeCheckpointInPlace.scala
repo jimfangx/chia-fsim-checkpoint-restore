@@ -156,7 +156,7 @@ object NativeCheckpointInPlace {
     val finalClones = after.toSeq.collect { case (path, m: Module) =>
       GeneratedStateBankAnnotations.Clone(m.name, path, m.name, m)
     }
-    val (validated, _) = GeneratedStateBankAnnotations.translate(result, finalClones)
+    val (validated, _) = GeneratedStateBankAnnotations.translate(result, finalClones, fameSource = Some(host))
     check(validated.toSet == result.annotations.filterNot(_.isInstanceOf[firrtl.transforms.CombinationalPath]).toSet,
       "post-graft annotation targets changed during validation")
     def annotationJSON(as: firrtl.AnnotationSeq): String = JsonProtocol.serialize(as.distinct.sortBy(_.serialize))

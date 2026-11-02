@@ -143,12 +143,17 @@ private[checkpoint] object GeneratedStateBankAnnotations {
     }
   }
 
-  def preflight(state: CircuitState, bankedProgress: Boolean = false): Unit = {
+  def preflight(state: CircuitState, bankedProgress: Boolean = false,
+      fameSource: Option[CircuitState] = None): Unit = {
     GeneratedSynthesisConstantAdapter.validate(state, instrumented = true)
     // These are live, correlated construction-site roles, never inert compiler
     // context. Validate the complete model and exact native gate connectivity
     // before projecting any of its targets into instance-specialized banks.
-    if (bankedProgress) FAMEClockProgressBindings.resolveBanked(state) else FAMEClockProgressBindings.resolve(state)
+    fameSource match {
+      case Some(source) => FAMEClockProgressBindings.resolveFrozen(source, state)
+      case None => if (bankedProgress) FAMEClockProgressBindings.resolveBanked(state)
+        else FAMEClockProgressBindings.resolve(state)
+    }
     val unsupported = state.annotations.filterNot(supported)
     if (unsupported.nonEmpty) fail("input annotations require explicit clone/rename translation: " +
       unsupported.map(_.getClass.getName).distinct.mkString(", "))
@@ -243,9 +248,10 @@ private[checkpoint] object GeneratedStateBankAnnotations {
   }.distinct.sortBy(_.serialize))
   def translatedHash(state: CircuitState): String = SemanticStateInventory.sha256(annotationJSON(state.annotations))
 
-  def translate(state: CircuitState, clones: Seq[Clone], preserveConcreteStorage: Boolean = false):
+  def translate(state: CircuitState, clones: Seq[Clone], preserveConcreteStorage: Boolean = false,
+      fameSource: Option[CircuitState] = None):
       (Seq[Annotation], JValue) = {
-    preflight(state)
+    preflight(state, fameSource = fameSource)
     val modules = state.circuit.modules.map(m => m.name -> m).toMap
     def targets(target: ReferenceTarget, memory: Boolean): Seq[ReferenceTarget] = {
       if (target.circuit != state.circuit.main || target.component.nonEmpty)

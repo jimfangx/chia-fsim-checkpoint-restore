@@ -209,7 +209,7 @@ object NativeCheckpointRegions {
       GeneratedStateBankAnnotations.Clone(m.name, path, m.name, m)
     }
     val (validated, _) = GeneratedStateBankAnnotations.translate(state.copy(annotations = annotations), finalClones,
-      preserveConcreteStorage = concreteStorage)
+      preserveConcreteStorage = concreteStorage, fameSource = Some(host))
     check(validated.toSet == annotations.toSet, "post-graft annotation targets changed")
     val snapshot = SimulatorBankProbeContext.snapshot(context, host.circuit.serialize, state.circuit.serialize)
     val shellBindings = if (shells.isEmpty) Nil else List("local_shells" -> JArray(shells.zipWithIndex.map { case (r, i) =>

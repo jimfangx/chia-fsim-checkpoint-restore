@@ -104,7 +104,7 @@ private[checkpoint] object NativeCheckpointWidgetAnnotations {
     Result(result, binding)
   }
 
-  def project(before: CircuitState, after: CircuitState): Result = {
+  def project(before: CircuitState, after: CircuitState, fameSource: Option[CircuitState] = None): Result = {
     require(before.circuit.main == after.circuit.main && before.form == after.form,
       "checkpoint widget annotations: changed host root or form")
     val original = GeneratedExternalOwners.instances(before, before.circuit.main)
@@ -123,7 +123,7 @@ private[checkpoint] object NativeCheckpointWidgetAnnotations {
     val identity = emitted.toSeq.collect { case (path, m: Module) =>
       GeneratedStateBankAnnotations.Clone(m.name, path, m.name, m)
     }
-    val (validated, _) = GeneratedStateBankAnnotations.translate(result.copy(annotations = projected), identity)
+    val (validated, _) = GeneratedStateBankAnnotations.translate(result.copy(annotations = projected), identity, fameSource = fameSource)
     require(validated.toSet == projected.toSet,
       "checkpoint widget annotations: emitted targets changed during validation")
     val binding = canonical(JObject(List(
