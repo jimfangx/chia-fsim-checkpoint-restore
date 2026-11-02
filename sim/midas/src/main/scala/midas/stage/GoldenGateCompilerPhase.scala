@@ -28,16 +28,30 @@ object GoldenGateCompilerPhase {
     * history. Keep the ordinary compiler path and its image guard unchanged.
     */
   private[midas] def prepareCheckpointBoundary(input: CircuitState): CircuitState = {
+    val prepared = prepareCheckpointTransport(input)
+    midas.checkpoint.NativeCheckpointWidgetReservation.requireBound(prepared)
+    prepared
+  }
+
+  /** Shared compiler preparation before the independent image-admission guard.
+    * A selected local FAME witness cannot admit an incomplete capture image.
+    */
+  private[midas] def prepareCheckpointTransport(input: CircuitState): CircuitState = {
+    midas.checkpoint.FAMEClockCutTransportSelection.validateCardinality(input.annotations)
     val prepared = if (midas.checkpoint.NativeCheckpointRegionCompilerProbe.requested(input.annotations)) {
       val constants = midas.checkpoint.SimulatorFPGASynthesisConstants(input)
       val before = midas.checkpoint.NativeCheckpointRegionCompilerProbe.normalizeMetadata(constants)
       val after = midas.passes.ResolveSimulationInline.forCheckpointRegions(before)
       midas.checkpoint.NativeCheckpointRegionCompilerProbe(before, after)
+    } else if (midas.checkpoint.FAMEClockCutTransportSelection.requested(input.annotations)) {
+      val before = midas.checkpoint.SimulatorFPGASynthesisConstants(input)
+      midas.checkpoint.FAMEClockCutTransportSelection.validatePreserved(input.annotations, before.annotations)
+      val after = midas.passes.ResolveSimulationInline(before)
+      midas.checkpoint.FAMEClockCutTransportSelection(before, after)
     } else {
       val inlined = midas.passes.ResolveSimulationInline(input)
       midas.checkpoint.SimulatorFPGASynthesisConstants(inlined)
     }
-    midas.checkpoint.NativeCheckpointWidgetReservation.requireBound(prepared)
     prepared
   }
 
@@ -70,6 +84,7 @@ class GoldenGateCompilerPhase extends Phase {
     midas.checkpoint.SimulatorFPGASynthesisConstants.validateCardinality(annotations)
     midas.checkpoint.PhysicalClockCutPlan.validateCardinality(annotations)
     midas.checkpoint.NativeCheckpointRegionCompilerProbe.validateCardinality(annotations)
+    midas.checkpoint.FAMEClockCutTransportSelection.validateCardinality(annotations)
 
     implicit val p = annotations.collectFirst({ case ConfigParametersAnnotation(p) => p }).get
 
@@ -106,6 +121,7 @@ class GoldenGateCompilerPhase extends Phase {
         .execute(loweredTarget)
 
     GoldenGateEmitterPolicy.validatePreserved(consumedAnnotations, simulator.annotations)
+    midas.checkpoint.FAMEClockCutTransportSelection.validatePreserved(consumedAnnotations, simulator.annotations)
     midas.passes.GoldenGateDedupGroups.validatePreserved(state.annotations, simulator.annotations)
     compileSimulator(simulator)
   }
@@ -122,6 +138,7 @@ class GoldenGateCompilerPhase extends Phase {
     midas.checkpoint.SimulatorFPGASynthesisConstants.validateRequest(simulator)
     midas.checkpoint.PhysicalClockCutPlan.validateRequest(simulator)
     midas.checkpoint.NativeCheckpointRegionCompilerProbe.validateCardinality(simulator.annotations)
+    midas.checkpoint.FAMEClockCutTransportSelection.validateCardinality(simulator.annotations)
     midas.checkpoint.FAMEClockProgressBindings.resolve(simulator)
     // Note: the final lowering to Verilog is broken up into multiple firrtl.Compiler steps
     // to avoid breakages that can emerge from "legal" but unsound pass orderings
@@ -160,6 +177,7 @@ class GoldenGateCompilerPhase extends Phase {
         "Simulator bank probe cannot surround its own live capture transport")
     }
     val dedupRetiredSimulator = midas.passes.GoldenGateDedupGroups.retire(backendSimulator.copy(form = firrtl.LowForm))
+    midas.checkpoint.FAMEClockCutTransportSelection.validatePreserved(simulator.annotations, dedupRetiredSimulator.annotations)
     val fpgaConstants = GoldenGateCompilerPhase.prepareCheckpointBoundary(dedupRetiredSimulator)
     val nativeBankCompanion = midas.checkpoint.NativeFunctionalBankProbe(fpgaConstants)
     val postLoweredSimulator = midas.checkpoint.SimulatorBankProbe(nativeBankCompanion)

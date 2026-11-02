@@ -123,6 +123,38 @@ class FAMEClockCutTransportWiringSpec extends AnyFlatSpec {
     }
   }
 
+  it should "qualify transparent owner nodes declared in the original transport host body" in {
+    for (native <- Seq(false, true); nested <- Seq(false, true)) {
+      val (source, target) = fixture(native, nested)
+      val aliases = Map("ownerPresent" -> "presentAlias", "ownerFrozen" -> "frozenAlias", "ownerError" -> "errorAlias")
+      val state = source.copy(circuit = source.circuit.copy(modules = source.circuit.modules.map {
+        case m: Module if m.name == target.path.lastOption.map(_._2.value).getOrElse(source.circuit.main) =>
+          def rewrite(s: Statement): Statement = s match {
+            case c: Connect if c.loc.serialize.startsWith("transport.owner_") =>
+              val old = c.expr.asInstanceOf[WRef]
+              c.copy(expr = WRef(aliases(old.name), old.tpe))
+            case x => x.mapStmt(rewrite)
+          }
+          val nodes = aliases.toSeq.sortBy(_._1).map { case (port, alias) =>
+            DefNode(NoInfo, alias, WRef(port, UIntType(IntWidth(3))))
+          }
+          m.copy(body = Block(nodes ++ Seq(rewrite(m.body))))
+        case m => m
+      }))
+      val result = FAMEClockCutTransportWiring.connect(state, target, "clockA", owners, "fame")
+      FAMEClockCutTransportWiring.validate(state, target, "clockA", owners, "fame", result)
+      val host = result.state.circuit.modules.find(_.name == target.path.lastOption.map(_._2.value)
+        .getOrElse(source.circuit.main)).get.asInstanceOf[Module]
+      val body = all(host.body)
+      aliases.foreach { case (port, alias) =>
+        val node = body.indexWhere { case n: DefNode => n.name == alias; case _ => false }
+        val saved = body.indexWhere { case c: Connect => c.expr.serialize == alias &&
+          c.loc.serialize.startsWith(FAMEClockCutTransportWiring.prefix); case _ => false }
+        assert(node >= 0 && saved > node)
+      }
+    }
+  }
+
   it should "reject stale targets geometry source overrides clocks and missing or aliased independent owners" in {
     val (s, target) = fixture(true)
     def reject(x: CircuitState) = intercept[IllegalArgumentException](

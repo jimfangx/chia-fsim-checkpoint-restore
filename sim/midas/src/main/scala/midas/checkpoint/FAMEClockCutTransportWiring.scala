@@ -208,10 +208,15 @@ object FAMEClockCutTransportWiring {
           c.copy(expr = qualified(c.loc.serialize.stripPrefix(instance + ".")))
         case x => x.mapStmt(rewrite)
       }
-      val saved = if (!last) Nil else pins.flatMap(n => Seq(
-        DefWire(NoInfo, prefix + n, vector), Connect(NoInfo, WRef(prefix + n, vector), original(n))))
+      // The original owner expression may name a DefNode in the original body.
+      // Declare the saved wires before their qualified uses, but assign them
+      // only after the original aliases have been declared. Hoisting both
+      // together would create a forward reference in the real inlined widget.
+      val savedWires = if (!last) Nil else pins.map(n => DefWire(NoInfo, prefix + n, vector))
+      val savedConnections = if (!last) Nil else pins.map(n => Connect(NoInfo, WRef(prefix + n, vector), original(n)))
       val extraPorts = if (root) Nil else names.map { case (n, t) => Port(NoInfo, prefix + n, Input, t) }
-      m.name -> m.copy(ports = m.ports ++ extraPorts, body = Block(saved ++ Seq(rewrite(m.body)) ++ next))
+      m.name -> m.copy(ports = m.ports ++ extraPorts,
+        body = Block(savedWires ++ Seq(rewrite(m.body)) ++ savedConnections ++ next))
     }.toMap
     val circuit = state.circuit.copy(modules = state.circuit.modules.map(m => routed.getOrElse(m.name, m)))
     val typed = firrtl.passes.InferTypes.run(firrtl.passes.ResolveKinds.run(firrtl.passes.ToWorkingIR.run(circuit)))
