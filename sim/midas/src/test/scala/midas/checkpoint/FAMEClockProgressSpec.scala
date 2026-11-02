@@ -148,6 +148,130 @@ class FAMEClockProgressSpec extends AnyFlatSpec {
     }
   }
 
+  it should "compose native FAME observer and pending banks with the checked applied cut and staged collector" in {
+    import org.json4s._
+    import org.json4s.native.JsonMethods.parse
+    val prepared = emit(transform(true))._1
+    // The bank caller consumes the emitter request, as NativeFunctionalBankProbe
+    // does. Keep every storage/constraint/progress annotation and prepared wire.
+    val state = prepared.copy(form = LowForm, annotations = prepared.annotations.filterNot(_.isInstanceOf[EmitCircuitAnnotation]))
+    val original = state.circuit.serialize
+    val inv = SimulatorStateInventory.discover(state)
+    val plan = PhysicalClockCutPlan.discover(state, inv)
+    val result = FAMEClockCutWiring.generateNative(state, inv, plan, "hostReset", "clockA", 3)
+    FAMEClockCutWiring.validateNative(state, inv, plan, "hostReset", "clockA", 3, result)
+    val native = result.native.get
+    val binding = parse(result.binding)
+    val rows = (binding \ "signals").asInstanceOf[JArray].arr
+    val stored = rows.filter(r => (r \ "storage") == JBool(true))
+    assert(rows.size == 21 && stored.size == 8)
+    val inventory = (parse(inv) \ "state").asInstanceOf[JArray].arr
+    val banked = (parse(native.banks.binding) \ "state").asInstanceOf[JArray].arr
+    stored.foreach { r =>
+      val original = inventory.filter(e => (e \ "hierarchy") == (r \ "rtl_path"))
+      val bank = banked.filter(e => (e \ "state_id") == (r \ "generated_state_id"))
+      assert(original.size == 1 && bank.size == 1)
+      assert((original.head \ "state_id") == (r \ "generated_state_id"))
+      Seq("bank", "slot", "storage_hierarchy").foreach(k => assert((bank.head \ k) == (r \ k)))
+    }
+    assert(stored.count(r => (r \ "role") == JString("pending_flag")) == 2)
+    assert(native.banks.entries.map(_.stateID).toSet == banked.map(e => (e \ "state_id").values.toString).toSet)
+    val root = result.state.circuit.modules.collectFirst { case m: Module if m.name == "Top" => m }.get
+    val text = root.body.serialize
+    assert(root.ports.find(_.name == "checkpoint_f2_owner_present").get.tpe == UIntType(IntWidth(3)))
+    assert(text.contains("cat(checkpoint_fame_cut_consistent, checkpoint_f2_owner_present)"))
+    assert(text.contains("checkpoint_f2_adapter.target_cycle <= checkpoint_fame_cut_applied_cycle"))
+    assert(text.contains("checkpoint_f2_shadow_adapter.target_cycle <= checkpoint_fame_cut_applied_cycle"))
+    assert(text.contains("checkpoint_f2_shadow_permission <= and(checkpoint_f2_shadow_adapter.borrow_enable, checkpoint_f2_read_enable)"))
+    assert(text.contains("ckpt_clock <= hostClock"))
+    Seq("checkpoint_f2_bank_ckpt_req_valid", "ckpt_req_ready", "ckpt_resp_valid", "checkpoint_f2_bank_ckpt_resp_ready")
+      .foreach(n => assert(text.linesIterator.find(_.trim.startsWith(n + " <=")).get.contains("checkpoint_f2_shadow_permission")))
+    val gateModules = result.state.circuit.modules.collect { case e: ExtModule if e.defname == "BUFGCE" => e.name }.toSet
+    def gateCount(s: Statement): Int = (s match {
+      case i: WDefInstance if gateModules(i.module) => 1
+      case _ => 0
+    }) + { var count = 0; s.foreachStmt(x => count += gateCount(x)); count }
+    assert(result.state.circuit.modules.collect { case m: Module => gateCount(m.body) }.sum == 3)
+    Seq("global_target_cut_proven", "production_freeze_owners_bound", "complete_fpga_capture",
+      "deployable_capture_image", "native_latch_restore_supported", "metasim_restore_supported")
+      .foreach(k => assert((binding \ k) == JBool(false)))
+    assert((binding \ "bank_binding_sha256") == JString(SemanticStateInventory.sha256(native.banks.binding)))
+    assert((binding \ "staging_binding_sha256") == JString(SemanticStateInventory.sha256(native.staging.binding)))
+    assert(state.circuit.serialize == original)
+    sys.env.get("CHECKPOINT_TEST_ARTIFACT_DIR").foreach { base =>
+      val out = Paths.get(base).resolve("fame-native-cut"); Files.createDirectories(out)
+      val e = new SemanticCleanEmitter
+      val rtl = new Compiler(Seq(firrtl.options.Dependency.fromTransform(e)), Forms.LowForm, Set(e)).execute(
+        result.state.copy(annotations = Seq(EmitCircuitAnnotation(e.getClass)))).getEmittedCircuit.value
+      val files = Seq("reference.fir" -> state.circuit.serialize, "reference.sv" -> emit(transform(false))._2,
+        "wired.fir" -> result.state.circuit.serialize, "wired.sv" -> rtl,
+        "binding.json" -> result.binding, "collector-binding.json" -> result.collector.binding,
+        "staging-binding.json" -> native.staging.binding, "banks-binding.json" -> native.banks.binding,
+        "banks.json" -> SemanticStateInventory.canonical(JObject(List("entries" -> JArray(native.banks.entries.map { e =>
+          JObject(List("state_id" -> JString(e.stateID), "bank" -> JInt(e.bank), "slot" -> JInt(e.slot),
+            "width" -> JInt(e.width), "depth" -> JInt(e.depth)))
+        }.toList)))) ,
+        "manifest.json" -> inv, "plan.json" -> plan, "dependencies.json" -> native.dependencies,
+        "witness.fir" -> native.witness.circuit.serialize,
+        "witness-manifest.json" -> native.manifest, "witness-plan.json" -> native.plan)
+      files.foreach { case (n, body) => Files.write(out.resolve(n), body.getBytes(UTF_8)) }
+      Files.write(out.resolve("emission.json"), SemanticStateInventory.canonical(JObject(List(
+        "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
+        "inputs" -> JObject(files.map { case (n, body) => n -> JString(SemanticStateInventory.sha256(body)) }.toList)
+      ))).getBytes(UTF_8))
+    }
+  }
+
+  it should "reject altered native FAME staging banks and coherently rehashed witness wiring" in {
+    import org.json4s._
+    import org.json4s.native.JsonMethods.parse
+    val prepared = emit(transform(true))._1
+    val state = prepared.copy(form = LowForm, annotations = prepared.annotations.filterNot(_.isInstanceOf[EmitCircuitAnnotation]))
+    val inv = SimulatorStateInventory.discover(state); val plan = PhysicalClockCutPlan.discover(state, inv)
+    val result = FAMEClockCutWiring.generateNative(state, inv, plan, "hostReset", "clockA", 3)
+    val native = result.native.get
+    val changed = Seq(result.copy(native = None),
+      result.copy(collector = result.collector.copy(reset = result.collector.reset.copy(audit = "tampered"))),
+      result.copy(native = Some(native.copy(dependencies = native.dependencies + " "))),
+      result.copy(native = Some(native.copy(banks = native.banks.copy(entries = native.banks.entries.drop(1))))),
+      result.copy(native = Some(native.copy(staging = native.staging.copy(binding = native.staging.binding + " ")))),
+      result.copy(native = Some(native.copy(staging = native.staging.copy(collector = native.staging.collector.copy(
+        reset = native.staging.collector.reset.copy(audit = "tampered")))))))
+    changed.foreach(r => intercept[IllegalArgumentException] {
+      FAMEClockCutWiring.validateNative(state, inv, plan, "hostReset", "clockA", 3, r)
+    })
+    for (sink <- Seq("checkpoint_f2_adapter.target_cycle", "checkpoint_f2_shadow_adapter.target_cycle",
+        "checkpoint_f2_adapter.owner_present", "ckpt_resp_valid", "ckpt_clock")) {
+      var count = 0
+      def rewrite(s: Statement): Statement = s match {
+        case c: Connect if c.loc.serialize == sink =>
+          count += 1
+          c.copy(expr = if (sink == "ckpt_clock") DoPrim(firrtl.PrimOps.AsClock, Seq(UIntLiteral(0, IntWidth(1))), Nil, ClockType)
+            else UIntLiteral(0, IntWidth(if (sink.endsWith("target_cycle")) 64 else 1)))
+        case x => x.mapStmt(rewrite)
+      }
+      val circuit = result.state.circuit.copy(modules = result.state.circuit.modules.map {
+        case m: Module if m.name == "Top" => m.copy(body = rewrite(m.body))
+        case m => m
+      })
+      assert(count == 1)
+      val mutated = circuit
+      val binding = SemanticStateInventory.canonical(parse(result.binding).transformField {
+        case ("wired_reference_sha256", _) => "wired_reference_sha256" -> JString(SemanticStateInventory.sha256(mutated.serialize))
+      })
+      intercept[IllegalArgumentException] {
+        FAMEClockCutWiring.validateNative(state, inv, plan, "hostReset", "clockA", 3,
+          result.copy(state = result.state.copy(circuit = mutated), binding = binding))
+      }
+    }
+    intercept[IllegalArgumentException] {
+      FAMEClockCutWiring.validate(state, inv, plan, "hostReset", "clockA", 3, result)
+    }
+    assert(intercept[IllegalArgumentException] {
+      GeneratedStateBankAccess.generate(state, inv, separateAccessClock = true)
+    }.getMessage.contains("requires a synthesized capture owner"))
+  }
+
   it should "reject incomplete roles domains stale inputs and coherently rehashed missing witness wiring" in {
     import org.json4s._
     import org.json4s.native.JsonMethods.parse

@@ -10,6 +10,7 @@ import firrtl.stage.Forms
 import firrtl.stage.transforms.Compiler
 import midas.stage.GoldenGateOutputFileAnnotation
 import org.json4s._
+import org.json4s.native.JsonMethods.parse
 
 case class FAMEClockCutWiringAnnotation(primaryDomain: String, owners: Int)
     extends NoTargetAnnotation with Unserializable with HasShellOptions {
@@ -42,7 +43,10 @@ object FAMEClockCutWiring {
   val prefix = "checkpoint_fame_cut_"
   val valid = prefix + "consistent"
   val cycle = prefix + "applied_cycle"
-  case class Result(state: CircuitState, binding: String, collector: F2ClockResetCutWiring.Result)
+  case class Native(banks: GeneratedStateBankAccess.Result, dependencies: String,
+      manifest: String, plan: String, witness: CircuitState, staging: F2NativeCollectorSnapshot.Result)
+  case class Result(state: CircuitState, binding: String, collector: F2ClockResetCutWiring.Result,
+      native: Option[Native] = None)
   private def fail(why: String): Nothing =
     throw new IllegalArgumentException("FAME clock cut wiring unsupported: " + why)
   private def all(s: Statement): Seq[Statement] = {
@@ -97,7 +101,21 @@ object FAMEClockCutWiring {
   }
 
   def generate(input: CircuitState, manifest: String, plan: String, resetPort: String,
-      primaryDomain: String, owners: Int): Result = {
+      primaryDomain: String, owners: Int): Result =
+    generateImpl(input, manifest, plan, resetPort, primaryDomain, owners, nativeBanks = false)
+
+  /** Own native observer/pending readout with the same applied-edge witness.
+    * Stage the running collector and idle response endpoint BEFORE opening any
+    * functional bank. The separate raw clock keeps transport alive while the
+    * common cut holds original storage. Physical CE dependency checks remain
+    * mandatory; this does not own native latch restoration or production state.
+    */
+  def generateNative(input: CircuitState, manifest: String, plan: String, resetPort: String,
+      primaryDomain: String, owners: Int): Result =
+    generateImpl(input, manifest, plan, resetPort, primaryDomain, owners, nativeBanks = true)
+
+  private def generateImpl(input: CircuitState, manifest: String, plan: String, resetPort: String,
+      primaryDomain: String, owners: Int, nativeBanks: Boolean): Result = {
     if (input.form != LowForm || owners < 1 || owners > 65535)
       fail("resolved LowForm and 1..65535 external owners required")
     if (manifest != SimulatorStateInventory.discover(input) || plan != PhysicalClockCutPlan.discover(input, manifest))
@@ -159,8 +177,17 @@ object FAMEClockCutWiring {
     // Every original storage declaration and StateID remains unchanged.
     val inv = SimulatorStateInventory.discover(witness)
     val clockPlan = PhysicalClockCutPlan.discover(witness, inv)
-    val collector = F2ClockResetCutWiring.generate(witness, inv, clockPlan, resetPort, cycle, owners + 1)
-    val root = collector.state.circuit.modules.collectFirst { case m: Module if m.name == state.circuit.main => m }.get
+    val native = if (!nativeBanks) None else {
+      val dependencies = PhysicalClockCutDependencies.discover(witness, inv, clockPlan)
+      val banks = GeneratedStateBankAccess.generatePhysicalCompanion(witness, inv, clockPlan, dependencies)
+      val staging = F2NativeCollectorSnapshot.generate(witness, inv, clockPlan, resetPort, cycle,
+        owners + 1, dependencies, banks)
+      Some(Native(banks, dependencies, inv, clockPlan, witness, staging))
+    }
+    val collector = native.map(_.staging.collector).getOrElse(
+      F2ClockResetCutWiring.generate(witness, inv, clockPlan, resetPort, cycle, owners + 1))
+    val composed = native.map(_.staging.state).getOrElse(collector.state)
+    val root = composed.circuit.modules.collectFirst { case m: Module if m.name == state.circuit.main => m }.get
     val ownerPort = F2ClockResetCutWiring.prefix + "owner_present"
     def expr(e: Expression): Expression = e match {
       case r: WRef if r.name == ownerPort =>
@@ -173,7 +200,7 @@ object FAMEClockCutWiring {
       case p if p.name == ownerPort => p.copy(tpe = UIntType(IntWidth(owners)))
       case p => p
     }, body = statement(root.body))
-    val circuit = collector.state.circuit.copy(modules = collector.state.circuit.modules.map {
+    val circuit = composed.circuit.copy(modules = composed.circuit.modules.map {
       case m if m.name == root.name => connected
       case m => m
     })
@@ -181,9 +208,27 @@ object FAMEClockCutWiring {
     val typed = firrtl.passes.InferTypes.run(firrtl.passes.ResolveKinds.run(working))
     val flowed = firrtl.passes.ResolveFlows.run(typed)
     firrtl.passes.CheckTypes.run(flowed); firrtl.passes.CheckFlows.run(flowed)
-    val result = collector.state.copy(circuit = flowed)
+    val result = composed.copy(circuit = flowed)
+    val boundRows = native.map { n =>
+      val inventory = (parse(n.banks.binding) \ "state").asInstanceOf[JArray].arr
+      rows.map { row =>
+        if ((row \ "storage") != JBool(true)) row
+        else {
+          val entries = inventory.filter(e => (e \ "hierarchy") == (row \ "rtl_path"))
+          if (entries.size != 1) fail("observer/pending role missing or duplicated in native banks")
+          val entry = entries.head
+          JObject(row.asInstanceOf[JObject].obj ++ List(
+            "generated_state_id" -> (entry \ "state_id"), "bank" -> (entry \ "bank"),
+            "slot" -> (entry \ "slot"), "address" -> JInt(0),
+            "width" -> (entry \ "width"), "depth" -> (entry \ "depth"),
+            "storage_hierarchy" -> (entry \ "storage_hierarchy")))
+        }
+      }
+    }.getOrElse(rows)
     val binding = canonical(JObject(List(
-      "binding_version" -> JInt(1), "scope" -> JString("local_fame_witness_connected_f2_collector_sibling_only"),
+      "binding_version" -> JInt(1), "scope" -> JString(if (native.nonEmpty)
+        "local_fame_witness_native_banks_staged_f2_collector_sibling_only"
+        else "local_fame_witness_connected_f2_collector_sibling_only"),
       "reference_sha256" -> JString(sha256(input.circuit.serialize)),
       "reopened_reference_sha256" -> JString(sha256(state.circuit.serialize)),
       "manifest_sha256" -> JString(sha256(manifest)), "plan_sha256" -> JString(sha256(plan)),
@@ -193,20 +238,53 @@ object FAMEClockCutWiring {
       "label_role" -> JString("applied"), "label_path" -> (row(primaryDomain, "applied") \ "rtl_path"),
       "fame_owner_bit" -> JInt(owners), "external_owners" -> JInt(owners),
       "predicate" -> JString("not_reset_and_not_overflow_and_all_domains_consumed_eq_65bit_applied_plus_pending_and_consumed_le_completed_steps"),
-      "signals" -> JArray(rows.toList), "new_storage_bits" -> JInt(0),
+      "signals" -> JArray(boundRows.toList), "new_storage_bits" -> JInt(0),
       "global_target_cut_proven" -> JBool(false), "production_freeze_owners_bound" -> JBool(false),
-      "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false))))
-    Result(result, binding, collector)
+      "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false)) ++ native.toList.flatMap { n => List(
+        "bank_binding_sha256" -> JString(sha256(n.banks.binding)),
+        "dependencies_sha256" -> JString(sha256(n.dependencies)),
+        "witness_manifest_sha256" -> JString(sha256(n.manifest)),
+        "witness_plan_sha256" -> JString(sha256(n.plan)),
+        "staging_binding_sha256" -> JString(sha256(n.staging.binding)),
+        "functional_entries" -> JInt(n.banks.entries.size),
+        "native_latch_restore_supported" -> JBool(false), "metasim_restore_supported" -> JBool(false)) }))
+    Result(result, binding, collector, native)
   }
 
   def validate(input: CircuitState, manifest: String, plan: String, resetPort: String,
       primaryDomain: String, owners: Int, result: Result): Unit = {
-    val expected = generate(input, manifest, plan, resetPort, primaryDomain, owners)
-    if (result.binding != expected.binding || result.state.circuit.serialize != expected.state.circuit.serialize ||
-        result.state.form != expected.state.form || result.state.annotations.toSeq != expected.state.annotations.toSeq ||
-        result.collector.binding != expected.collector.binding ||
-        result.collector.state.circuit.serialize != expected.collector.state.circuit.serialize ||
-        result.collector.reset.binding != expected.collector.reset.binding)
+    validateResult(generate(input, manifest, plan, resetPort, primaryDomain, owners), result)
+  }
+
+  def validateNative(input: CircuitState, manifest: String, plan: String, resetPort: String,
+      primaryDomain: String, owners: Int, result: Result): Unit = {
+    validateResult(generateNative(input, manifest, plan, resetPort, primaryDomain, owners), result)
+  }
+
+  private def validateResult(expected: Result, result: Result): Unit = {
+    // RenameMap is mutable compiler metadata with reference equality. Compare
+    // its actual mappings, just as we compare emitted IR and live annotations;
+    // independently regenerated native bank results are distinct objects.
+    def sameState(a: CircuitState, b: CircuitState): Boolean =
+      a.circuit.serialize == b.circuit.serialize && a.form == b.form &&
+        a.annotations.toSeq == b.annotations.toSeq &&
+        a.renames.map(_.serialize.linesIterator.toSeq.sorted) == b.renames.map(_.serialize.linesIterator.toSeq.sorted)
+    def sameCollector(a: F2ClockResetCutWiring.Result, b: F2ClockResetCutWiring.Result): Boolean =
+      a.binding == b.binding && sameState(a.state, b.state) &&
+        a.reset.binding == b.reset.binding && a.reset.audit == b.reset.audit && sameState(a.reset.state, b.reset.state)
+    val sameNative = (result.native, expected.native) match {
+      case (None, None) => true
+      case (Some(a), Some(b)) =>
+        GeneratedStateBankAccess.validateAnnotationBinding(a.banks)
+        a.dependencies == b.dependencies && a.manifest == b.manifest && a.plan == b.plan &&
+          sameState(a.witness, b.witness) && a.banks.binding == b.banks.binding &&
+          a.banks.entries == b.banks.entries && sameState(a.banks.state, b.banks.state) &&
+          a.staging.binding == b.staging.binding && sameState(a.staging.state, b.staging.state) &&
+          sameCollector(a.staging.collector, b.staging.collector)
+      case _ => false
+    }
+    if (!sameNative || result.binding != expected.binding || !sameState(result.state, expected.state) ||
+        !sameCollector(result.collector, expected.collector))
       fail("witness/collector differs from independent regeneration")
   }
 
