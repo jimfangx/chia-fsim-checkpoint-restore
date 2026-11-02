@@ -14,12 +14,18 @@ import org.chipsalliance.cde.config.Config
   * Entry/gate counts are checked against the newly reconstructed executions,
   * never accepted as proof of coverage. No stock recipe enables this overlay.
   */
-class WithRocketRegionCompilerProbeReservation extends Config((site, here, up) => {
+private[firesim] class RocketRegionCompilerProbeReservation(observerDomains: Int) extends Config((site, here, up) => {
   case CheckpointCaptureTopKey =>
     require(sys.props.get("checkpoint.rocket.region.compiler.probe").contains("true"),
       "Rocket regional reservation is a test-only, nondeployable compiler diagnostic")
     val baseEntries = if (sys.props.get("checkpoint.rocket.shell.compiler.probe").contains("true")) 11093 else 10910
-    val entries = baseEntries + (if (sys.props.get("checkpoint.rocket.queue.compiler.probe").contains("true")) 20 else 0)
+    // The opt-in FAME observer adds completed_steps/overflow and two counters
+    // per model clock domain. Pending flags already belong to the base DUT.
+    // This is an elaboration reservation only: hookup still reconstructs and
+    // checks every descriptor and gate from the actual compiler source.
+    val observerEntries = if (observerDomains == 0) 0 else 2 + 2 * observerDomains
+    val entries = baseEntries + observerEntries +
+      (if (sys.props.get("checkpoint.rocket.queue.compiler.probe").contains("true")) 20 else 0)
     Some(new NativeCheckpointWidgetReservationBinding(entries, 3,
       Seq("unsupported.functional-memory", "unsupported.bridge-host", "unsupported.reset-external-writers")) {
       protected def connectOwners(top: FPGATopImp, capture: CheckpointCaptureSideband): Unit = {
@@ -32,3 +38,9 @@ class WithRocketRegionCompilerProbeReservation extends Config((site, here, up) =
       }
     })
 })
+
+class WithRocketRegionCompilerProbeReservation extends RocketRegionCompilerProbeReservation(0)
+
+/** Exact QuadRocket has two FAME model clock domains. A different model/domain
+  * count fails the unchanged source-reconstructed descriptor check. */
+class WithRocketFAMERegionCompilerProbeReservation extends RocketRegionCompilerProbeReservation(2)
