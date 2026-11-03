@@ -13,7 +13,7 @@ import scala.util.control.NonFatal
 case class NativeCheckpointRegionCompilerProbeAnnotation(paths: String) extends NoTargetAnnotation with Unserializable
 case class NativeCheckpointShellCompilerProbeAnnotation(paths: String) extends NoTargetAnnotation with Unserializable
 case class NativeCheckpointRegisterSnapshotProbeAnnotation(path: String, includeAsyncMemories: Boolean = false,
-    restoreStaging: Boolean = false)
+    restoreStaging: Boolean = false, restoreOriginal: Boolean = false)
     extends NoTargetAnnotation with Unserializable
 object NativeCheckpointRegisterSnapshotProbeAnnotation extends HasShellOptions {
   val options = Seq(new ShellOption[String](
@@ -28,6 +28,10 @@ object NativeCheckpointRegisterSnapshotProbeAnnotation extends HasShellOptions {
     longOption = "simulator-native-register-memory-staging-restore-probe",
     toAnnotationSeq = value => Seq(NativeCheckpointRegisterSnapshotProbeAnnotation(value, true, true)),
     helpText = "Opt in to whole staging-owner restore; original storage/global owners and production image admission remain unsupported.",
+  ), new ShellOption[String](
+    longOption = "simulator-native-register-memory-original-restore-probe",
+    toAnnotationSeq = value => Seq(NativeCheckpointRegisterSnapshotProbeAnnotation(value, true, true, true)),
+    helpText = "Opt in to held original register/async-memory restore and whole staging restore; no global-owner or image admission.",
   ))
 }
 /** Inert metadata-resolution history, never a storage or freeze-owner contract. */
@@ -211,7 +215,7 @@ object NativeCheckpointRegionCompilerProbe {
       save("inventory-permission.json", inventory.binding)
       snapshotRequest.foreach { request =>
         val snapshot = NativeCheckpointRegisterSnapshot.generate(inventory.source,
-          paths(request.path).head, "clock", request.includeAsyncMemories, request.restoreStaging)
+          paths(request.path).head, "clock", request.includeAsyncMemories, request.restoreStaging, request.restoreOriginal)
         state("register-snapshot", snapshot.state)
         save("register-snapshot-binding.json", snapshot.binding)
         snapshot.files.foreach(f => save("generated" + f.fileSuffix, f.body))

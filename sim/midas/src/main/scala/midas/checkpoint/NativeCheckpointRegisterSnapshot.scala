@@ -10,8 +10,8 @@ import org.json4s._
   * Original declarations/equations/clocks keep running, including the control
   * bus used for extraction. Added observation is combinational until the one
   * raw-clock staging edge. Cut/reset/host certificates are external obligations,
-  * and original storage never gains a restore mapping. Whole staging-owner
-  * restore is explicit opt-in and requires separately parked original owners.
+  * and production image admission stays disabled. Staging and bounded original
+  * subtree restore are separate explicit opt-ins; other owners remain external.
   */
 object NativeCheckpointRegisterSnapshot {
   import SemanticStateInventory.{canonical, sha256}
@@ -21,7 +21,7 @@ object NativeCheckpointRegisterSnapshot {
   val definition = "CheckpointNativeStateSnapshot"
   case class Result(source: CircuitState, state: CircuitState, path: Seq[String], rawClock: String,
       binding: String, files: Seq[GoldenGateOutputFileAnnotation], includeAsyncMemories: Boolean = false,
-      restoreStaging: Boolean = false)
+      restoreStaging: Boolean = false, restoreOriginal: Boolean = false)
   private def check(ok: Boolean, why: String): Unit =
     require(ok, "native register snapshot: " + why)
   private def all(s: Statement): Seq[Statement] = {
@@ -30,7 +30,7 @@ object NativeCheckpointRegisterSnapshot {
     visit(s); out.toSeq
   }
   def generate(source: CircuitState, path: Seq[String], rawClock: String,
-      includeAsyncMemories: Boolean = false, restoreStaging: Boolean = false): Result = {
+      includeAsyncMemories: Boolean = false, restoreStaging: Boolean = false, restoreOriginal: Boolean = false): Result = {
     check(source.form == LowForm && path.nonEmpty && path.head == source.circuit.main &&
       path.forall(_.matches("[A-Za-z_][A-Za-z0-9_$]*")), "rooted concrete path required")
     val modules = source.circuit.modules.map(m => m.name -> m).toMap
@@ -113,6 +113,12 @@ object NativeCheckpointRegisterSnapshot {
       check(!ancestors(m.name), "recursive subtree")
       if (widths.contains(m.name)) return widths(m.name)
       val ss = statements(m)
+      if (restoreOriginal) ss.foreach {
+        case p: Print => check(clock(m, p.clk) == clockInput(m), "effect raw clock mismatch")
+        case p: Stop => check(clock(m, p.clk) == clockInput(m), "effect raw clock mismatch")
+        case p: Verification => check(clock(m, p.clk) == clockInput(m), "effect raw clock mismatch")
+        case _ => ()
+      }
       val names = m.ports.map(_.name) ++ ss.collect { case d: IsDeclaration => d.name }
       check(names.distinct.size == names.size, "duplicate declaration")
       check(!ss.exists {
@@ -122,6 +128,10 @@ object NativeCheckpointRegisterSnapshot {
       }, "memory or unresolved storage requires its own adapter: " + m.name)
       val regs = registers(m)
       val registerBits = regs.map { r =>
+        if (restoreOriginal) check(r.reset match {
+          case UIntLiteral(value, _) => value == 0
+          case _ => false
+        }, "original restore requires reset lowered into the resolved next-state equation")
         check(clock(m, r.clock) == clockInput(m), "register does not share raw clock: " + m.name + "." + r.name)
         r.tpe match {
           case UIntType(IntWidth(w)) if w > 0 && w <= 1048576 => w
@@ -161,6 +171,10 @@ object NativeCheckpointRegisterSnapshot {
       }.sum
       check(own + childBits <= 1048576, "observation exceeds bounded vector width")
       val result = (own + childBits).toInt
+      if (restoreOriginal && result == 0) check(!ss.exists {
+        case _: Print | _: Stop | _: Verification => true
+        case _ => false
+      }, "stateless effect-only subtree requires separate parking")
       widths(m.name) = result; result
     }
     val bits = width(selected, Set.empty)
@@ -203,6 +217,11 @@ object NativeCheckpointRegisterSnapshot {
     }
     val layout = rows(selected, selectedPath)
     check(offset == bits, "incomplete register layout")
+    val originalDepth = widths.keys.toSeq.flatMap(n => memories(local(modules(n))).map(_.depth.toInt))
+      .foldLeft(1)(math.max)
+    val originalInputs = if (restoreOriginal) Seq("original_hold" -> 1, "original_load" -> 1,
+      "original_address" -> 32, "original_state" -> bits) else Nil
+    val originalOutputs = if (restoreOriginal) Seq("original_ready" -> 1) else Nil
     val restoreInputs = if (restoreStaging) Seq("restore_hold" -> 1, "restore_load" -> 1,
       "restore_state" -> (bits + 71)) else Nil
     val restoreOutputs = if (restoreStaging) Seq("restore_ready" -> 1) else Nil
@@ -238,6 +257,66 @@ object NativeCheckpointRegisterSnapshot {
           else path(index + 1) + "." + observation
         val obsBits = if (expressions.nonEmpty) widths(m.name) else bits
         val root = m.name == source.circuit.main
+        val hold = prefix + "original_hold"
+        val address = prefix + "original_address"
+        val restoreVector = prefix + "original_state"
+        val load = if (root) s"and(${prefix}original_load, ${prefix}original_ready)"
+          else prefix + "original_load"
+        val localOffsets = scala.collection.mutable.Map.empty[String, Int]
+        var localOffset = 0
+        registers(m).foreach { r => localOffsets(r.name) = localOffset; localOffset += firrtl.bitWidth(r.tpe).toInt }
+        memories(m).foreach { r => localOffsets(r.name) = localOffset; localOffset += memoryBits(r) }
+        val childOffsets = children(m).filter(i => widths.getOrElse(m.name, 0) > 0 && widths.getOrElse(i.module, 0) > 0).map { i =>
+          val start = localOffset; localOffset += widths(i.module); i.name -> start
+        }.toMap
+        def slice(start: Int, count: Int, signed: Boolean = false): String = {
+          val value = s"bits($restoreVector, ${start + count - 1}, $start)"
+          if (signed) s"asSInt($value)" else value
+        }
+        val changedDrivers = scala.collection.mutable.Map.empty[String, String]
+        if (restoreOriginal && widths.getOrElse(m.name, 0) > 0) {
+          registers(m).foreach { r =>
+            val old = statements(m).collect { case c: Connect if c.loc.serialize == r.name => c.expr.serialize }.head
+            changedDrivers(r.name) = s"mux($hold, mux($load, ${slice(localOffsets(r.name), firrtl.bitWidth(r.tpe).toInt,
+              r.tpe.isInstanceOf[SIntType])}, ${r.name}), $old)"
+          }
+          memories(m).foreach { ram =>
+            val writer = ram.name + "." + ram.writers.head
+            def original(pin: String): String = {
+              val drivers = statements(m).collect { case c: Connect if c.loc.serialize == writer + "." + pin => c.expr.serialize }
+              check(drivers.size == 1, "original restore requires every resolved writer pin: " + writer + "." + pin)
+              drivers.head
+            }
+            val w = firrtl.bitWidth(ram.dataType).toInt
+            val values = (0 until ram.depth.toInt).map(i => slice(localOffsets(ram.name) + i*w, w,
+              ram.dataType.isInstanceOf[SIntType]))
+            val data = values.dropRight(1).zipWithIndex.foldRight(values.last) { case ((value,i), tail) =>
+              s"mux(eq($address, UInt<32>($i)), $value, $tail)"
+            }
+            val count = ram.depth.toInt
+            changedDrivers(writer + ".en") = s"mux($hold, and($load, lt($address, UInt<32>($count))), ${original("en")})"
+            changedDrivers(writer + ".addr") = s"mux($hold, bits($address, ${math.max(1, (ram.depth-1).bitLength)-1}, 0), ${original("addr")})"
+            changedDrivers(writer + ".data") = s"mux($hold, $data, ${original("data")})"
+            changedDrivers(writer + ".mask") = s"mux($hold, UInt<1>(1), ${original("mask")})"
+            // The original guarded clock was validated against this exact
+            // enable. Disabled writes have no effect; restore uses the raw edge.
+            changedDrivers(writer + ".clk") = clockInput(m)
+          }
+        }
+        val restoreRoutes = if (!restoreOriginal) Nil else children(m).flatMap { i =>
+          if (!changedNames(i.module)) Nil else {
+            val active = if (widths.getOrElse(m.name, 0) > 0) childOffsets.contains(i.name)
+              else index >= 0 && index < chain.size - 1 && path(index+1) == i.name
+            val w = widths.getOrElse(i.module, bits)
+            val vector = if (childOffsets.contains(i.name)) slice(childOffsets(i.name), w) else restoreVector
+            Seq(s"${i.name}.$hold <= ${if (active) hold else "UInt<1>(0)"}",
+              s"${i.name}.${prefix}original_load <= ${if (active) load else "UInt<1>(0)"}",
+              s"${i.name}.$address <= ${if (active) address else "UInt<32>(0)"}",
+              s"${i.name}.$restoreVector <= ${if (active) vector else s"UInt<$w>(0)"}")
+          }
+        }
+        val originalReady = if (restoreOriginal && root) Seq(
+          s"${prefix}original_ready <= and($hold, lt($address, UInt<32>($originalDepth)))") else Nil
         val attach = if (!root) Nil else Seq(s"inst $instance of $definition",
           s"$instance.clock <= $rawClock", s"$instance.live_state <= $observation",
           s"$instance.reader_idle <= UInt<1>(1)",
@@ -248,9 +327,16 @@ object NativeCheckpointRegisterSnapshot {
           restoreOutputs.map { case (n,_) => s"$prefix$n <= $instance.$n" } ++
           inputs.map { case (n,_) => s"$instance.$n <= $prefix$n" } ++
           outputs.map { case (n,_) => s"$prefix$n <= $instance.$n" }
+        def liveEffect(enable: Expression): Expression = firrtl.ir.DoPrim(firrtl.PrimOps.And,
+          Seq(firrtl.ir.DoPrim(firrtl.PrimOps.Not, Seq(WRef(hold)), Nil, UnknownType), enable), Nil, UnknownType)
         def addReaders(s: Statement): Statement = s match {
+          case p: Print if restoreOriginal && widths.getOrElse(m.name, 0) > 0 => p.copy(en = liveEffect(p.en))
+          case p: Stop if restoreOriginal && widths.getOrElse(m.name, 0) > 0 => p.copy(en = liveEffect(p.en))
+          case p: Verification if restoreOriginal && widths.getOrElse(m.name, 0) > 0 => p.copy(en = liveEffect(p.en))
           case ram: DefMemory if includeAsyncMemories && widths.getOrElse(m.name, 0) > 0 =>
             ram.copy(readers = ram.readers ++ readers(ram))
+          case c: Connect if changedDrivers.contains(c.loc.serialize) =>
+            parsed(Seq(c.loc.serialize + " <= " + changedDrivers(c.loc.serialize)))
           case other => other.mapStmt(addReaders)
         }
         val memoryRoutes = (if (includeAsyncMemories && widths.getOrElse(m.name, 0) > 0) memories(m) else Nil)
@@ -259,9 +345,20 @@ object NativeCheckpointRegisterSnapshot {
             s"${ram.name}.$p.en <= UInt<1>(1)", s"${ram.name}.$p.clk <= ${clockInput(m)}")
         }}
         m.copy(ports = (m.ports :+ port(observation, Output, obsBits)) ++
-          (if (root) (inputs ++ restoreInputs).map { case (n,w) => port(prefix + n, Input, w) } ++
-            (outputs ++ restoreOutputs).map { case (n,w) => port(prefix + n, Output, w) } else Nil),
-          body = Block(Seq(addReaders(m.body), parsed(memoryRoutes ++ Seq(s"$observation <= $vector") ++ attach))))
+          (if (root) (inputs ++ restoreInputs).map { case (n,w) => port(prefix+n, Input, w) } ++
+            (outputs ++ restoreOutputs ++ originalOutputs).map { case (n,w) => port(prefix+n, Output, w) } else Nil) ++
+          (if (restoreOriginal) originalInputs.map { case (n,w) => port(prefix+n, Input,
+            if (n == "original_state") obsBits else w) } else Nil),
+          body = Block(Seq(addReaders(m.body), parsed(memoryRoutes ++ Seq(s"$observation <= $vector") ++ attach ++
+            restoreRoutes ++ originalReady))))
+      case m: Module if restoreOriginal =>
+        val ties = children(m).filter(i => changedNames(i.module)).flatMap { i =>
+          Seq("original_hold" -> 1, "original_load" -> 1, "original_address" -> 32,
+            "original_state" -> widths.getOrElse(i.module, bits)).map { case (n,w) =>
+            s"${i.name}.$prefix$n <= UInt<$w>(0)"
+          }
+        }
+        if (ties.isEmpty) m else m.copy(body = Block(Seq(m.body, parsed(ties))))
       case m => m
     } :+ ext
     val typed = firrtl.passes.InferTypes.run(firrtl.passes.ResolveKinds.run(
@@ -271,7 +368,7 @@ object NativeCheckpointRegisterSnapshot {
     val resource = scala.io.Source.fromResource("CheckpointNativeStateSnapshot.sv")
     val body = try resource.mkString finally resource.close()
     val files = Seq(GoldenGateOutputFileAnnotation(body, ".register-snapshot.sv"))
-    val binding = canonical(JObject(List("snapshot_version" -> JInt(if (restoreStaging) 3 else if (includeAsyncMemories) 2 else 1),
+    val binding = canonical(JObject(List("snapshot_version" -> JInt(if (restoreOriginal) 4 else if (restoreStaging) 3 else if (includeAsyncMemories) 2 else 1),
       "scope" -> JString(if (includeAsyncMemories) "concrete_raw_clock_register_async_memory_subtree_staging_only"
         else "concrete_raw_clock_register_subtree_staging_only"),
       "selected_execution" -> JString(selectedPath), "raw_clock" -> JString(rawClock),
@@ -284,14 +381,16 @@ object NativeCheckpointRegisterSnapshot {
         "all_original_registers_and_async_memory_words_before_one_positive_raw_clock_edge"
         else "all_original_registers_before_one_positive_raw_clock_edge"),
       "source_registers_keep_running" -> JBool(true), "cut_certificates_bound" -> JBool(false),
-      "host_owner_bound" -> JBool(false), "original_restore_supported" -> JBool(false),
+      "host_owner_bound" -> JBool(false), "original_restore_supported" -> JBool(restoreOriginal),
       "staging_restore_supported" -> JBool(restoreStaging), "complete_fpga_capture" -> JBool(false),
       "deployable_capture_image" -> JBool(false), "metasim_restore_supported" -> JBool(false)) ++
-      (if (restoreStaging) List("include_async_memories" -> JBool(includeAsyncMemories),
-        "staging_restore_contract" -> JString("whole_owner_on_raw_clock_original_and_target_owners_parked_separately")) else Nil)))
-    Result(source, source.copy(circuit = resolved), path, rawClock, binding, files, includeAsyncMemories, restoreStaging)
+      (if (restoreOriginal || restoreStaging) List("include_async_memories" -> JBool(includeAsyncMemories)) else Nil) ++
+      (if (restoreOriginal) List("original_restore_depth" -> JInt(originalDepth),
+        "original_restore_contract" -> JString("hold_raw_clock_load_all_addresses_complete_readback_before_release")) else Nil) ++
+      (if (restoreStaging) List("staging_restore_contract" -> JString("whole_owner_on_raw_clock_original_and_target_owners_parked_separately")) else Nil)))
+    Result(source, source.copy(circuit = resolved), path, rawClock, binding, files, includeAsyncMemories, restoreStaging, restoreOriginal)
   }
   def validate(result: Result): Unit = check(result == generate(result.source, result.path, result.rawClock,
-    result.includeAsyncMemories, result.restoreStaging),
+    result.includeAsyncMemories, result.restoreStaging, result.restoreOriginal),
     "changed source, equations, observation routes, layout or staging owner")
 }

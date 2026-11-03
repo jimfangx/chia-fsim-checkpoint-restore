@@ -130,6 +130,27 @@ class NativeCheckpointRegisterSnapshotSpec extends AnyFlatSpec {
     intercept[IllegalArgumentException](NativeCheckpointRegisterSnapshot.validate(r.copy(restoreStaging = false)))
     save(r, "register-snapshot-restore")
   }
+  it should "hold and load only the selected concrete originals with independent staging and no image admission" in {
+    val r = NativeCheckpointRegisterSnapshot.generate(source(), Seq("Top", "fabric"), "clock",
+      restoreOriginal = true)
+    NativeCheckpointRegisterSnapshot.validate(r)
+    val d = parse(r.binding)
+    assert((d \ "snapshot_version") == JInt(4) && (d \ "original_restore_supported") == JBool(true))
+    assert((d \ "staging_restore_supported") == JBool(false) && (d \ "original_restore_depth") == JInt(1))
+    Seq("metasim_restore_supported", "complete_fpga_capture", "deployable_capture_image", "cut_certificates_bound")
+      .foreach(n => assert((d \ n) == JBool(false)))
+    val root = r.state.circuit.modules.find(_.name == "Top").get.asInstanceOf[Module]
+    assert(root.body.serialize.contains("unrelated.checkpoint_register_snapshot_original_hold <= UInt<1>(\"h0\")"))
+    assert(root.body.serialize.contains("fabric.checkpoint_register_snapshot_original_state <= checkpoint_register_snapshot_original_state"))
+    val leaf = r.state.circuit.modules.find(_.name == "Leaf").get.asInstanceOf[Module]
+    assert(leaf.body.serialize.contains("value <= mux(checkpoint_register_snapshot_original_hold, mux("))
+    assert(leaf.body.serialize.contains("asSInt(bits(checkpoint_register_snapshot_original_state, 8, 0))"))
+    intercept[IllegalArgumentException](NativeCheckpointRegisterSnapshot.validate(r.copy(restoreOriginal = false)))
+    val async = text.replace("reset => (UInt<1>(0), value)", "reset => (asAsyncReset(reset), UInt<65>(0))")
+    intercept[IllegalArgumentException](NativeCheckpointRegisterSnapshot.generate(source(async), Seq("Top", "fabric"),
+      "clock", restoreOriginal = true))
+    save(r, "register-original-restore")
+  }
   it should "reject stale paths, clocks, collisions and coherently altered generated state" in {
     val h = source()
     Seq(Seq("Other"), Seq("Top", "missing")).foreach(p =>
@@ -173,6 +194,10 @@ class NativeCheckpointRegisterSnapshotSpec extends AnyFlatSpec {
     storage.write.data <= asSInt(bits(data, 10, 2))
     storage.write.mask <= bits(data, 2, 2)
     reg value :""")
+    val original = NativeCheckpointRegisterSnapshot.generate(source(memory), Seq("Top", "fabric"), "clock",
+      includeAsyncMemories = true, restoreStaging = true, restoreOriginal = true)
+    NativeCheckpointRegisterSnapshot.validate(original)
+    save(original, "register-memory-original-restore")
     val h = source(memory)
     val r = NativeCheckpointRegisterSnapshot.generate(h, Seq("Top", "fabric"), "clock", true)
     val doc = parse(r.binding)
@@ -219,6 +244,8 @@ class NativeCheckpointRegisterSnapshotSpec extends AnyFlatSpec {
       "register-memory-snapshot-rocket")
     save(NativeCheckpointRegisterSnapshot.generate(controlSource, Seq(controlName), "clock", true, true),
       "register-memory-snapshot-rocket-restore")
+    save(NativeCheckpointRegisterSnapshot.generate(controlSource, Seq(controlName), "clock", true, true, true),
+      "register-memory-original-restore-rocket")
     val path = control ++ Seq("xbar", "router", "aw_queue")
     val r = NativeCheckpointRegisterSnapshot.generate(host, path, "clock")
     val d = parse(r.binding)
