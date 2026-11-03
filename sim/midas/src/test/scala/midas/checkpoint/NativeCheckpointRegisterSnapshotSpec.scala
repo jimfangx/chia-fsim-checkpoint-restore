@@ -141,12 +141,68 @@ class NativeCheckpointRegisterSnapshotSpec extends AnyFlatSpec {
     }))
     intercept[IllegalArgumentException](NativeCheckpointRegisterSnapshot.generate(opaque, Seq("Top", "fabric"), "clock"))
   }
+  it should "stage bounded asynchronous memory words at the same edge as sibling registers" in {
+    val memory = text.replace("    reg value :", """    mem storage :
+      data-type => SInt<9>
+      depth => 4
+      read-latency => 0
+      write-latency => 1
+      reader => read
+      writer => write
+      read-under-write => undefined
+    storage.read.addr <= bits(data, 1, 0)
+    storage.read.en <= UInt<1>(1)
+    storage.read.clk <= clock
+    storage.write.addr <= bits(data, 1, 0)
+    storage.write.en <= enable
+    storage.write.clk <= clock
+    storage.write.data <= asSInt(bits(data, 10, 2))
+    storage.write.mask <= bits(data, 2, 2)
+    reg value :""")
+    val h = source(memory)
+    val r = NativeCheckpointRegisterSnapshot.generate(h, Seq("Top", "fabric"), "clock", true)
+    val doc = parse(r.binding)
+    assert((doc \ "bits") == JInt(220) && (doc \ "snapshot_version") == JInt(2))
+    assert((doc \ "state").asInstanceOf[JArray].arr.count(x => (x \ "kind") == JString("memory")) == 2)
+    NativeCheckpointRegisterSnapshot.validate(r)
+    save(r, "register-memory-snapshot")
+    Seq(memory.replace("read-latency => 0", "read-latency => 1"),
+      memory.replace("write-latency => 1", "write-latency => 2"),
+      memory.replace("depth => 4", "depth => 1025"),
+      memory.replace("writer => write", "writer => write\n      writer => write_again"),
+      memory.replace("reader => read", "readwriter => rw\n      reader => read"),
+      memory.replace("storage.write.clk <= clock", "storage.write.clk <= validif(reset, clock)"),
+      memory.replace("storage.write.clk <= clock", "storage.write.clk <= asClock(enable)"),
+      memory.replace("storage.read.clk <= clock", "storage.read.clk <= asClock(enable)"),
+      memory.replace("read-under-write => undefined", "read-under-write => new"),
+      memory.replace("reader => read", "reader => checkpoint_register_snapshot_bad"))
+      .foreach { bad => intercept[IllegalArgumentException] {
+        NativeCheckpointRegisterSnapshot.generate(source(bad), Seq("Top", "fabric"), "clock", true)
+      }}
+    NativeCheckpointRegisterSnapshot.validate(NativeCheckpointRegisterSnapshot.generate(
+      source(memory.replace("storage.write.clk <= clock", "storage.write.clk <= validif(enable, clock)")),
+      Seq("Top", "fabric"), "clock", true))
+  }
   it should "stage each actual Rocket AW/AR reorder queue and reject the whole memory-bearing control fabric" in {
     val prefix = sys.props("checkpoint.shell.rocket.source")
     val host = source(new String(Files.readAllBytes(Paths.get(prefix + ".fir")), UTF_8))
     val control = Seq("F1Shim", "top", "ctrlInterconnect")
     val refusal = intercept[IllegalArgumentException](NativeCheckpointRegisterSnapshot.generate(host, control, "clock"))
     assert(refusal.getMessage.contains("memory or unresolved storage requires its own adapter"))
+    val complete = NativeCheckpointRegisterSnapshot.generate(host, control, "clock", true)
+    val completeDoc = parse(complete.binding)
+    val completeRows = (completeDoc \ "state").asInstanceOf[JArray].arr
+    assert(completeRows.size == 408 && completeRows.count(x => (x \ "kind") == JString("memory")) == 13)
+    // Include every physical word, including all fifteen W-route FIFO entries.
+    assert((completeDoc \ "bits") == JInt(1749))
+    val controlName = GeneratedExternalOwners.instances(host, host.circuit.main).toMap.apply(control.mkString(".")).name
+    val controlNeeded = GeneratedExternalOwners.instances(host, host.circuit.main).filter {
+      case (p,_) => p == control.mkString(".") || p.startsWith(control.mkString(".") + ".")
+    }.map(_._2.name).toSet
+    val controlSource = host.copy(circuit = host.circuit.copy(main = controlName,
+      modules = host.circuit.modules.filter(m => controlNeeded(m.name))))
+    save(NativeCheckpointRegisterSnapshot.generate(controlSource, Seq(controlName), "clock", true),
+      "register-memory-snapshot-rocket")
     val path = control ++ Seq("xbar", "router", "aw_queue")
     val r = NativeCheckpointRegisterSnapshot.generate(host, path, "clock")
     val d = parse(r.binding)

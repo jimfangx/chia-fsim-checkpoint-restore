@@ -12,12 +12,17 @@ import scala.util.control.NonFatal
 
 case class NativeCheckpointRegionCompilerProbeAnnotation(paths: String) extends NoTargetAnnotation with Unserializable
 case class NativeCheckpointShellCompilerProbeAnnotation(paths: String) extends NoTargetAnnotation with Unserializable
-case class NativeCheckpointRegisterSnapshotProbeAnnotation(path: String) extends NoTargetAnnotation with Unserializable
+case class NativeCheckpointRegisterSnapshotProbeAnnotation(path: String, includeAsyncMemories: Boolean = false)
+    extends NoTargetAnnotation with Unserializable
 object NativeCheckpointRegisterSnapshotProbeAnnotation extends HasShellOptions {
   val options = Seq(new ShellOption[String](
     longOption = "simulator-native-register-snapshot-probe",
     toAnnotationSeq = value => Seq(NativeCheckpointRegisterSnapshotProbeAnnotation(value)),
     helpText = "Stage one live register subtree at the actual regional compiler diagnostic; no global owner or image admission.",
+  ), new ShellOption[String](
+    longOption = "simulator-native-register-memory-snapshot-probe",
+    toAnnotationSeq = value => Seq(NativeCheckpointRegisterSnapshotProbeAnnotation(value, true)),
+    helpText = "Stage registers and bounded asynchronous memories together; diagnostic only, no production image admission.",
   ))
 }
 /** Inert metadata-resolution history, never a storage or freeze-owner contract. */
@@ -201,7 +206,7 @@ object NativeCheckpointRegionCompilerProbe {
       save("inventory-permission.json", inventory.binding)
       snapshotRequest.foreach { request =>
         val snapshot = NativeCheckpointRegisterSnapshot.generate(inventory.source,
-          paths(request.path).head, "clock")
+          paths(request.path).head, "clock", request.includeAsyncMemories)
         state("register-snapshot", snapshot.state)
         save("register-snapshot-binding.json", snapshot.binding)
         snapshot.files.foreach(f => save("generated" + f.fileSuffix, f.body))
