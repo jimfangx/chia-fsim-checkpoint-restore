@@ -12,6 +12,14 @@ import scala.util.control.NonFatal
 
 case class NativeCheckpointRegionCompilerProbeAnnotation(paths: String) extends NoTargetAnnotation with Unserializable
 case class NativeCheckpointShellCompilerProbeAnnotation(paths: String) extends NoTargetAnnotation with Unserializable
+case class NativeCheckpointRegisterSnapshotProbeAnnotation(path: String) extends NoTargetAnnotation with Unserializable
+object NativeCheckpointRegisterSnapshotProbeAnnotation extends HasShellOptions {
+  val options = Seq(new ShellOption[String](
+    longOption = "simulator-native-register-snapshot-probe",
+    toAnnotationSeq = value => Seq(NativeCheckpointRegisterSnapshotProbeAnnotation(value)),
+    helpText = "Stage one live register subtree at the actual regional compiler diagnostic; no global owner or image admission.",
+  ))
+}
 /** Inert metadata-resolution history, never a storage or freeze-owner contract. */
 case class NativeCheckpointRegionCompilerMetadataAnnotation(body: String) extends NoTargetAnnotation
 object NativeCheckpointRegionCompilerProbeAnnotation extends HasShellOptions {
@@ -85,6 +93,10 @@ object NativeCheckpointRegionCompilerProbe {
   def validateCardinality(as: AnnotationSeq): Unit = {
     val requests = as.collect { case a: NativeCheckpointRegionCompilerProbeAnnotation => a }
     val shells = as.collect { case a: NativeCheckpointShellCompilerProbeAnnotation => a }
+    val snapshots = as.collect { case a: NativeCheckpointRegisterSnapshotProbeAnnotation => a }
+    check(snapshots.size <= 1 && (snapshots.isEmpty || requests.size == 1),
+      "register snapshot diagnostic requires one regional request")
+    snapshots.foreach(a => check(paths(a.path).size == 1, "one register snapshot execution required"))
     check(shells.size <= 1 && (shells.isEmpty || requests.size == 1), "local shell diagnostic requires one regional request")
     shells.foreach(a => shellPaths(a.paths))
     if (requests.isEmpty) return
@@ -137,6 +149,7 @@ object NativeCheckpointRegionCompilerProbe {
     }
     val request = before.annotations.collect { case a: NativeCheckpointRegionCompilerProbeAnnotation => a }.head
     val shellRequest = before.annotations.collect { case a: NativeCheckpointShellCompilerProbeAnnotation => a }
+    val snapshotRequest = before.annotations.collect { case a: NativeCheckpointRegisterSnapshotProbeAnnotation => a }
     val dirs = before.annotations.collect { case TargetDirAnnotation(value) => value }
     check(dirs.size == 1 && dirs.head.nonEmpty, "one explicit compiler target directory required")
     val output = Paths.get(dirs.head).resolve(directory)
@@ -179,11 +192,20 @@ object NativeCheckpointRegionCompilerProbe {
         "request changed across inline")
       check(after.annotations.collect { case a: NativeCheckpointShellCompilerProbeAnnotation => a } == shellRequest,
         "local shell request changed across inline")
+      check(after.annotations.collect { case a: NativeCheckpointRegisterSnapshotProbeAnnotation => a } == snapshotRequest,
+        "register snapshot request changed across inline")
       val selected = targets(after, request.paths)
       save("targets.json", canonical(JArray(selected.map(t => JString(t.serialize)).toList)))
       val inventory = ReservedCheckpointInventory.forReservedWidgetSource(before, after)
       state("regional-source", inventory.source)
       save("inventory-permission.json", inventory.binding)
+      snapshotRequest.foreach { request =>
+        val snapshot = NativeCheckpointRegisterSnapshot.generate(inventory.source,
+          paths(request.path).head, "clock")
+        state("register-snapshot", snapshot.state)
+        save("register-snapshot-binding.json", snapshot.binding)
+        snapshot.files.foreach(f => save("generated" + f.fileSuffix, f.body))
+      }
       val localTargets = shellRequest.flatMap(a => shellTargets(after, a.paths))
       val regions = NativeCheckpointRegions.generate(inventory.source, selected, Some(inventory), localTargets)
       state("regional-instrumented", regions.state)
