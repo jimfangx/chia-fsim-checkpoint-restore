@@ -116,6 +116,20 @@ class NativeCheckpointRegisterSnapshotSpec extends AnyFlatSpec {
     NativeCheckpointRegisterSnapshot.validate(r)
     save(r, "register-snapshot")
   }
+  it should "export an explicit whole staging-owner restore without altering original storage" in {
+    val r = NativeCheckpointRegisterSnapshot.generate(source(), Seq("Top", "fabric"), "clock",
+      restoreStaging = true)
+    NativeCheckpointRegisterSnapshot.validate(r)
+    val d = parse(r.binding)
+    assert((d \ "snapshot_version") == JInt(3) && (d \ "staging_restore_supported") == JBool(true))
+    assert((d \ "original_restore_supported") == JBool(false) &&
+      (d \ "metasim_restore_supported") == JBool(false) && (d \ "cut_certificates_bound") == JBool(false))
+    val root = r.state.circuit.modules.find(_.name == "Top").get.asInstanceOf[Module]
+    assert(root.ports.find(_.name == "checkpoint_register_snapshot_restore_state").get.tpe == UIntType(IntWidth(219)))
+    assert(root.ports.find(_.name == "checkpoint_register_snapshot_restore_ready").get.direction == Output)
+    intercept[IllegalArgumentException](NativeCheckpointRegisterSnapshot.validate(r.copy(restoreStaging = false)))
+    save(r, "register-snapshot-restore")
+  }
   it should "reject stale paths, clocks, collisions and coherently altered generated state" in {
     val h = source()
     Seq(Seq("Other"), Seq("Top", "missing")).foreach(p =>
@@ -203,6 +217,8 @@ class NativeCheckpointRegisterSnapshotSpec extends AnyFlatSpec {
       modules = host.circuit.modules.filter(m => controlNeeded(m.name))))
     save(NativeCheckpointRegisterSnapshot.generate(controlSource, Seq(controlName), "clock", true),
       "register-memory-snapshot-rocket")
+    save(NativeCheckpointRegisterSnapshot.generate(controlSource, Seq(controlName), "clock", true, true),
+      "register-memory-snapshot-rocket-restore")
     val path = control ++ Seq("xbar", "router", "aw_queue")
     val r = NativeCheckpointRegisterSnapshot.generate(host, path, "clock")
     val d = parse(r.binding)

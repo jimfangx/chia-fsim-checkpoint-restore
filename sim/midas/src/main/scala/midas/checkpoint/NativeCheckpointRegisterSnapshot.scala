@@ -6,11 +6,12 @@ import firrtl.ir._
 import midas.stage.GoldenGateOutputFileAnnotation
 import org.json4s._
 
-/** Coherent staging of a concrete, entirely register-based live subtree.
+/** Coherent staging of a concrete register/async-memory live subtree.
   * Original declarations/equations/clocks keep running, including the control
   * bus used for extraction. Added observation is combinational until the one
   * raw-clock staging edge. Cut/reset/host certificates are external obligations,
-  * and neither the staging owner nor original registers gain a restore mapping.
+  * and original storage never gains a restore mapping. Whole staging-owner
+  * restore is explicit opt-in and requires separately parked original owners.
   */
 object NativeCheckpointRegisterSnapshot {
   import SemanticStateInventory.{canonical, sha256}
@@ -19,7 +20,8 @@ object NativeCheckpointRegisterSnapshot {
   val instance = prefix + "adapter"
   val definition = "CheckpointNativeStateSnapshot"
   case class Result(source: CircuitState, state: CircuitState, path: Seq[String], rawClock: String,
-      binding: String, files: Seq[GoldenGateOutputFileAnnotation], includeAsyncMemories: Boolean = false)
+      binding: String, files: Seq[GoldenGateOutputFileAnnotation], includeAsyncMemories: Boolean = false,
+      restoreStaging: Boolean = false)
   private def check(ok: Boolean, why: String): Unit =
     require(ok, "native register snapshot: " + why)
   private def all(s: Statement): Seq[Statement] = {
@@ -28,7 +30,7 @@ object NativeCheckpointRegisterSnapshot {
     visit(s); out.toSeq
   }
   def generate(source: CircuitState, path: Seq[String], rawClock: String,
-      includeAsyncMemories: Boolean = false): Result = {
+      includeAsyncMemories: Boolean = false, restoreStaging: Boolean = false): Result = {
     check(source.form == LowForm && path.nonEmpty && path.head == source.circuit.main &&
       path.forall(_.matches("[A-Za-z_][A-Za-z0-9_$]*")), "rooted concrete path required")
     val modules = source.circuit.modules.map(m => m.name -> m).toMap
@@ -201,6 +203,9 @@ object NativeCheckpointRegisterSnapshot {
     }
     val layout = rows(selected, selectedPath)
     check(offset == bits, "incomplete register layout")
+    val restoreInputs = if (restoreStaging) Seq("restore_hold" -> 1, "restore_load" -> 1,
+      "restore_state" -> (bits + 71)) else Nil
+    val restoreOutputs = if (restoreStaging) Seq("restore_ready" -> 1) else Nil
     val inputs = Seq("reset" -> 1, "request" -> 1, "release_snapshot" -> 1,
       "owners_present" -> 1, "functional_frozen" -> 1, "target_cycle" -> 64, "word_address" -> 32)
     val outputs = Seq("request_ready" -> 1, "valid" -> 1, "failed" -> 1, "word_data" -> 64,
@@ -211,7 +216,7 @@ object NativeCheckpointRegisterSnapshot {
         "reader_idle" -> 1, "borrow_attempt" -> 1, "live_state" -> bits)).map { case (n,w) => port(n, Input, w) } ++
       (outputs ++ Seq("restore_ready" -> 1, "borrow_enable" -> 1, "snapshot_state" -> bits))
         .map { case (n,w) => port(n, Output, w) }, definition,
-      Seq(IntParam("BITS", bits), IntParam("RESTORE_ENABLE", 0)))
+      Seq(IntParam("BITS", bits), IntParam("RESTORE_ENABLE", if (restoreStaging) 1 else 0)))
     def parsed(lines: Seq[String]): Statement = Parser.parse("circuit W :\n  module W :\n" +
       lines.map("    " + _ + "\n").mkString).modules.head.asInstanceOf[Module].body
     val changed = source.circuit.modules.map {
@@ -235,9 +240,12 @@ object NativeCheckpointRegisterSnapshot {
         val root = m.name == source.circuit.main
         val attach = if (!root) Nil else Seq(s"inst $instance of $definition",
           s"$instance.clock <= $rawClock", s"$instance.live_state <= $observation",
-          s"$instance.restore_hold <= UInt<1>(0)", s"$instance.restore_load <= UInt<1>(0)",
-          s"$instance.restore_state <= UInt<${bits + 71}>(0)", s"$instance.reader_idle <= UInt<1>(1)",
+          s"$instance.reader_idle <= UInt<1>(1)",
           s"$instance.borrow_attempt <= UInt<1>(0)") ++
+          (if (restoreStaging) restoreInputs.map { case (n,_) => s"$instance.$n <= $prefix$n" }
+           else Seq(s"$instance.restore_hold <= UInt<1>(0)", s"$instance.restore_load <= UInt<1>(0)",
+             s"$instance.restore_state <= UInt<${bits + 71}>(0)")) ++
+          restoreOutputs.map { case (n,_) => s"$prefix$n <= $instance.$n" } ++
           inputs.map { case (n,_) => s"$instance.$n <= $prefix$n" } ++
           outputs.map { case (n,_) => s"$prefix$n <= $instance.$n" }
         def addReaders(s: Statement): Statement = s match {
@@ -251,8 +259,8 @@ object NativeCheckpointRegisterSnapshot {
             s"${ram.name}.$p.en <= UInt<1>(1)", s"${ram.name}.$p.clk <= ${clockInput(m)}")
         }}
         m.copy(ports = (m.ports :+ port(observation, Output, obsBits)) ++
-          (if (root) inputs.map { case (n,w) => port(prefix + n, Input, w) } ++
-            outputs.map { case (n,w) => port(prefix + n, Output, w) } else Nil),
+          (if (root) (inputs ++ restoreInputs).map { case (n,w) => port(prefix + n, Input, w) } ++
+            (outputs ++ restoreOutputs).map { case (n,w) => port(prefix + n, Output, w) } else Nil),
           body = Block(Seq(addReaders(m.body), parsed(memoryRoutes ++ Seq(s"$observation <= $vector") ++ attach))))
       case m => m
     } :+ ext
@@ -263,7 +271,7 @@ object NativeCheckpointRegisterSnapshot {
     val resource = scala.io.Source.fromResource("CheckpointNativeStateSnapshot.sv")
     val body = try resource.mkString finally resource.close()
     val files = Seq(GoldenGateOutputFileAnnotation(body, ".register-snapshot.sv"))
-    val binding = canonical(JObject(List("snapshot_version" -> JInt(if (includeAsyncMemories) 2 else 1),
+    val binding = canonical(JObject(List("snapshot_version" -> JInt(if (restoreStaging) 3 else if (includeAsyncMemories) 2 else 1),
       "scope" -> JString(if (includeAsyncMemories) "concrete_raw_clock_register_async_memory_subtree_staging_only"
         else "concrete_raw_clock_register_subtree_staging_only"),
       "selected_execution" -> JString(selectedPath), "raw_clock" -> JString(rawClock),
@@ -277,11 +285,13 @@ object NativeCheckpointRegisterSnapshot {
         else "all_original_registers_before_one_positive_raw_clock_edge"),
       "source_registers_keep_running" -> JBool(true), "cut_certificates_bound" -> JBool(false),
       "host_owner_bound" -> JBool(false), "original_restore_supported" -> JBool(false),
-      "staging_restore_supported" -> JBool(false), "complete_fpga_capture" -> JBool(false),
-      "deployable_capture_image" -> JBool(false), "metasim_restore_supported" -> JBool(false))))
-    Result(source, source.copy(circuit = resolved), path, rawClock, binding, files, includeAsyncMemories)
+      "staging_restore_supported" -> JBool(restoreStaging), "complete_fpga_capture" -> JBool(false),
+      "deployable_capture_image" -> JBool(false), "metasim_restore_supported" -> JBool(false)) ++
+      (if (restoreStaging) List("include_async_memories" -> JBool(includeAsyncMemories),
+        "staging_restore_contract" -> JString("whole_owner_on_raw_clock_original_and_target_owners_parked_separately")) else Nil)))
+    Result(source, source.copy(circuit = resolved), path, rawClock, binding, files, includeAsyncMemories, restoreStaging)
   }
   def validate(result: Result): Unit = check(result == generate(result.source, result.path, result.rawClock,
-    result.includeAsyncMemories),
+    result.includeAsyncMemories, result.restoreStaging),
     "changed source, equations, observation routes, layout or staging owner")
 }
