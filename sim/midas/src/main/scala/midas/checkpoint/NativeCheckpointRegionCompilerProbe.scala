@@ -12,6 +12,14 @@ import scala.util.control.NonFatal
 
 case class NativeCheckpointRegionCompilerProbeAnnotation(paths: String) extends NoTargetAnnotation with Unserializable
 case class NativeCheckpointShellCompilerProbeAnnotation(paths: String) extends NoTargetAnnotation with Unserializable
+case class NativeCheckpointRegionCutSnapshotProbeAnnotation(owners: String) extends NoTargetAnnotation with Unserializable
+object NativeCheckpointRegionCutSnapshotProbeAnnotation extends HasShellOptions {
+  val options = Seq(new ShellOption[String](
+    longOption = "simulator-native-region-cut-snapshot-probe",
+    toAnnotationSeq = value => Seq(NativeCheckpointRegionCutSnapshotProbeAnnotation(value)),
+    helpText = "Attach atomic regional cut-control staging; comma-separated ordered external owners, diagnostic only, no MMIO hookup or image admission.",
+  ))
+}
 case class NativeCheckpointRegisterSnapshotProbeAnnotation(path: String, includeAsyncMemories: Boolean = false,
     restoreStaging: Boolean = false, restoreOriginal: Boolean = false)
     extends NoTargetAnnotation with Unserializable
@@ -104,10 +112,22 @@ object NativeCheckpointRegionCompilerProbe {
       i != j && result(i).startsWith(result(j)))), "duplicate or overlapping executions")
     result
   }
+  private def cutOwners(value: String): Seq[String] = {
+    val owners = value.split(",", -1).toVector
+    check(owners.nonEmpty && owners.size <= 65535 && owners.distinct.size == owners.size &&
+      owners.forall(_.matches("[A-Za-z0-9_.:/-]+")), "explicit unique ordered cut-snapshot external owners required")
+    owners
+  }
   def validateCardinality(as: AnnotationSeq): Unit = {
     val requests = as.collect { case a: NativeCheckpointRegionCompilerProbeAnnotation => a }
     val shells = as.collect { case a: NativeCheckpointShellCompilerProbeAnnotation => a }
     val snapshots = as.collect { case a: NativeCheckpointRegisterSnapshotProbeAnnotation => a }
+    val cuts = as.collect { case a: NativeCheckpointRegionCutSnapshotProbeAnnotation => a }
+    check(cuts.size <= 1 && (cuts.isEmpty || requests.size == 1),
+      "cut snapshot diagnostic requires one regional request")
+    check(cuts.isEmpty || (shells.isEmpty && snapshots.isEmpty),
+      "cut snapshot diagnostic cannot borrow local-shell or register-snapshot owners")
+    cuts.foreach(a => cutOwners(a.owners))
     check(snapshots.size <= 1 && (snapshots.isEmpty || requests.size == 1),
       "register snapshot diagnostic requires one regional request")
     snapshots.foreach(a => check(paths(a.path).size == 1, "one register snapshot execution required"))
@@ -159,11 +179,14 @@ object NativeCheckpointRegionCompilerProbe {
     validateCardinality(before.annotations)
     if (!requested(before.annotations)) {
       check(!requested(after.annotations), "request appeared after inline")
+      check(!after.annotations.exists(_.isInstanceOf[NativeCheckpointRegionCutSnapshotProbeAnnotation]),
+        "cut snapshot request appeared after inline")
       return after
     }
     val request = before.annotations.collect { case a: NativeCheckpointRegionCompilerProbeAnnotation => a }.head
     val shellRequest = before.annotations.collect { case a: NativeCheckpointShellCompilerProbeAnnotation => a }
     val snapshotRequest = before.annotations.collect { case a: NativeCheckpointRegisterSnapshotProbeAnnotation => a }
+    val cutRequest = before.annotations.collect { case a: NativeCheckpointRegionCutSnapshotProbeAnnotation => a }
     val dirs = before.annotations.collect { case TargetDirAnnotation(value) => value }
     check(dirs.size == 1 && dirs.head.nonEmpty, "one explicit compiler target directory required")
     val output = Paths.get(dirs.head).resolve(directory)
@@ -186,6 +209,7 @@ object NativeCheckpointRegionCompilerProbe {
         "probe_version" -> JInt(1), "scope" -> JString("actual_compiler_regional_hookup_diagnostic_only"),
         "status" -> JString(stage), "requested_paths" -> JString(request.paths),
         "requested_local_shells" -> JArray(shellRequest.map(a => JString(a.paths)).toList),
+        "requested_cut_snapshot_owners" -> JArray(cutRequest.flatMap(a => cutOwners(a.owners)).map(JString(_)).toList),
         "pre_inline_sha256" -> JString(sha256(before.circuit.serialize)),
         "post_inline_sha256" -> JString(sha256(after.circuit.serialize)),
         "artifacts" -> JObject(hashes.toList.map { case (name, hash) => name -> JString(hash) }),
@@ -208,6 +232,8 @@ object NativeCheckpointRegionCompilerProbe {
         "local shell request changed across inline")
       check(after.annotations.collect { case a: NativeCheckpointRegisterSnapshotProbeAnnotation => a } == snapshotRequest,
         "register snapshot request changed across inline")
+      check(after.annotations.collect { case a: NativeCheckpointRegionCutSnapshotProbeAnnotation => a } == cutRequest,
+        "cut snapshot request changed across inline")
       val selected = targets(after, request.paths)
       save("targets.json", canonical(JArray(selected.map(t => JString(t.serialize)).toList)))
       val inventory = ReservedCheckpointInventory.forReservedWidgetSource(before, after)
@@ -251,6 +277,20 @@ object NativeCheckpointRegionCompilerProbe {
         save(prefix + "-banks-binding.json", shell.banks.binding)
       }
       status("regional_network_reconstructed_incomplete")
+      if (cutRequest.nonEmpty) {
+        val snapshot = NativeCheckpointRegionCutSnapshot.generate(regions, cutOwners(cutRequest.head.owners))
+        state("cut-snapshot-parent", snapshot.cut.state)
+        save("cut-snapshot-parent-binding.json", snapshot.cut.binding)
+        save("cut-snapshot-graft-binding.json", snapshot.cut.graft.binding)
+        state("cut-snapshot", snapshot.state)
+        save("cut-snapshot-binding.json", snapshot.binding)
+        snapshot.files.foreach(f => save("generated" + f.fileSuffix, f.body))
+        // bindRegions regenerates an unstaged graft. Do not silently discard
+        // this attachment or claim its new control ports have an MMIO owner.
+        // The unchanged reservation/physical-owner guards must reject emission.
+        status("cut_snapshot_attached_incomplete_image_guard_required")
+        return snapshot.state.copy(annotations = snapshot.state.annotations ++ snapshot.files)
+      }
       save("transport-freeze-conflicts.json", canonical(NativeCheckpointRegionWidgetGraft.liveTransportConflicts(before, after, regions)))
       val bound = NativeCheckpointWidgetIdentity.bindRegions(before, after, regions)
       state("grafted", bound.connection.graft.state)

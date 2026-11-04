@@ -201,4 +201,81 @@ class NativeCheckpointRegionCompilerProbeSpec extends AnyFlatSpec {
     assert(NativeCheckpointRegions.firstStructuralDifference(original, changedType).contains(".tpe"))
     assert(NativeCheckpointRegions.firstStructuralDifference(original, changedFlow).contains(".flow"))
   }
+
+  it should "parse explicit ordered cut-snapshot owners and reject missing duplicate or conflicting requests" in {
+    val cut = NativeCheckpointRegionCutSnapshotProbeAnnotation("fixture.reset,fixture.memory")
+    val shell = new firrtl.options.Shell("checkpoint-cut-test") with midas.stage.GoldenGateCli
+    val parsed = shell.parse(Array("--simulator-native-region-compiler-probe", selection,
+      "--simulator-native-region-cut-snapshot-probe", cut.owners))
+    assert(parsed.contains(request) && parsed.contains(cut))
+    NativeCheckpointRegionCompilerProbe.validateCardinality(parsed)
+    val invalid = Seq("", "fixture.reset,", ",fixture.reset", "fixture.reset,fixture.reset", "fixture reset", "a;b", "a, b")
+    invalid.foreach(owners => intercept[IllegalArgumentException] {
+      NativeCheckpointRegionCompilerProbe.validateCardinality(Seq(request, cut.copy(owners = owners)))
+    })
+    Seq(Seq(cut), Seq(request, cut, cut), Seq(request, cut, NativeCheckpointShellCompilerProbeAnnotation("ReservationShell")),
+      Seq(request, cut, NativeCheckpointRegisterSnapshotProbeAnnotation("ReservationShell.top.peer"))).foreach(as =>
+      intercept[IllegalArgumentException](NativeCheckpointRegionCompilerProbe.validateCardinality(as)))
+  }
+
+  it should "select the actual staged circuit at the compiler boundary and retain every production image guard" in {
+    val dir = Files.createTempDirectory(base, "cut-selected-")
+    val owners = Seq("fixture.memory", "fixture.reset")
+    val cut = NativeCheckpointRegionCutSnapshotProbeAnnotation(owners.mkString(","))
+    val original = before(dir)
+    val source = NativeCheckpointRegionCompilerProbe.normalizeMetadata(original.copy(annotations = original.annotations :+ cut))
+    val post = ResolveSimulationInline.forCheckpointRegions(source)
+    val staged = NativeCheckpointRegionCompilerProbe(source, post)
+    val output = dir.resolve(NativeCheckpointRegionCompilerProbe.directory)
+    assert(text(output.resolve("cut-snapshot.fir")) == staged.circuit.serialize)
+    assert(staged.circuit.serialize.contains("inst checkpoint_region_cut_snapshot of CheckpointRegionCutSnapshot"))
+    assert(!Files.exists(output.resolve("identity-bound.fir")))
+    assert((status(dir) \ "status") == JString("cut_snapshot_attached_incomplete_image_guard_required"))
+    assert((status(dir) \ "requested_cut_snapshot_owners") == JArray(owners.map(JString(_)).toList))
+    val snapshot = parse(text(output.resolve("cut-snapshot-binding.json")))
+    val parent = text(output.resolve("cut-snapshot-parent-binding.json"))
+    assert((snapshot \ "attached_sha256") == JString(SemanticStateInventory.sha256(staged.circuit.serialize)))
+    assert((snapshot \ "cut_binding_sha256") == JString(SemanticStateInventory.sha256(parent)))
+    assert((parse(parent) \ "owners") == JArray(owners.map(JString(_)).toList))
+    Seq("complete_fpga_capture", "deployable_capture_image", "metasim_restore_supported",
+      "readout_router_state_atomically_owned", "staging_owner_restore_supported").foreach(k =>
+      assert((snapshot \ k) == JBool(false)))
+    val files = staged.annotations.collect { case f: midas.stage.GoldenGateOutputFileAnnotation => f }
+    Seq(".native-region-cut-controller.sv", ".native-region-cut-snapshot.sv", ".native-region-cut-staging.sv").foreach { suffix =>
+      val file = files.filter(_.fileSuffix == suffix)
+      assert(file.size == 1 && file.head.body == text(output.resolve("generated" + suffix)))
+    }
+    Seq(staged, staged.copy(annotations = Nil)).foreach { value =>
+      intercept[IllegalArgumentException](NativeCheckpointWidgetReservation.requireBound(value))
+      intercept[IllegalArgumentException](PhysicalClockGateContract.requireCaptureOwner(value))
+    }
+    audit(dir)
+  }
+
+  it should "retain staged diagnostic artifacts before the actual compiler rejects emission" in {
+    val dir = Files.createTempDirectory(base, "cut-guarded-")
+    val original = before(dir)
+    val source = original.copy(annotations = original.annotations :+
+      NativeCheckpointRegionCutSnapshotProbeAnnotation("fixture.reset,fixture.memory"))
+    intercept[IllegalArgumentException](GoldenGateCompilerPhase.prepareCheckpointBoundary(source))
+    assert((status(dir) \ "status") == JString("cut_snapshot_attached_incomplete_image_guard_required"))
+    assert(Files.exists(dir.resolve(NativeCheckpointRegionCompilerProbe.directory).resolve("cut-snapshot-binding.json")))
+    audit(dir)
+  }
+
+  it should "reject a changed cut request across inline while preserving the failed phase evidence" in {
+    val dir = Files.createTempDirectory(base, "cut-changed-")
+    val cut = NativeCheckpointRegionCutSnapshotProbeAnnotation("fixture.reset,fixture.memory")
+    val original = before(dir)
+    val source = original.copy(annotations = original.annotations :+ cut)
+    val post = ResolveSimulationInline(source)
+    val changed = post.copy(annotations = post.annotations.map {
+      case _: NativeCheckpointRegionCutSnapshotProbeAnnotation => cut.copy(owners = "fixture.memory,fixture.reset")
+      case a => a
+    })
+    val error = intercept[IllegalArgumentException](NativeCheckpointRegionCompilerProbe(source, changed))
+    assert(error.getMessage.contains("cut snapshot request changed across inline"))
+    assert((status(dir) \ "status") == JString("rejected"))
+    audit(dir)
+  }
 }
