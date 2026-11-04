@@ -24,7 +24,9 @@ object NativeCheckpointRegionGraft {
     s"  ${if (p.direction == Input) "input" else "output"} wire $signed${if (width == 1) "" else s"[${width-1}:0] "}${p.name}"
   }
   def generate(source: NativeCheckpointRegions.Result, stageNativeState: Boolean = false,
-      observeRouterState: Boolean = false): Result = {
+      observeRouterState: Boolean = false, restoreRouterState: Boolean = false): Result = {
+    require(!restoreRouterState || (observeRouterState && !stageNativeState && source.shells.isEmpty),
+      "native region graft: router restore requires complete observation and native-only unstaged endpoints")
     NativeCheckpointRegions.validate(source)
     require(!stageNativeState || source.regions.isEmpty,
       "native region graft: staging currently supports shell-only endpoints; physical CE/common-cut owners remain unsupported")
@@ -83,7 +85,12 @@ object NativeCheckpointRegionGraft {
     val routerBits = sharedRouterBits + 2 * source.regions.size
     val routerPorts = if (!observeRouterState) Nil else
       Seq(Port(NoInfo, "capture_router_state", Output, UIntType(IntWidth(routerBits))))
-    val ports = NativeCheckpointInPlaceGraft.capturePorts(source.descriptors.physicalClockGates) ++ nativePorts ++ snapshotPorts ++ routerPorts
+    def restorePort(n: String, d: Direction, bits: BigInt = 1): Port =
+      Port(NoInfo, "capture_router_restore_" + n, d, UIntType(IntWidth(bits)))
+    val restorePorts = if (!restoreRouterState) Nil else Seq(
+      restorePort("hold", Input), restorePort("load", Input), restorePort("state", Input, routerBits),
+      restorePort("ready", Output), restorePort("error", Output))
+    val ports = NativeCheckpointInPlaceGraft.capturePorts(source.descriptors.physicalClockGates) ++ nativePorts ++ snapshotPorts ++ routerPorts ++ restorePorts
     val declarations = scala.collection.mutable.ArrayBuffer.empty[String]
     def visit(s: Statement): Unit = { s match { case d: IsDeclaration => declarations += d.name; case _ => () }; s.foreachStmt(visit) }
     visit(root.body)
@@ -113,7 +120,7 @@ object NativeCheckpointRegionGraft {
       require(!state.circuit.modules.exists(m => m.name == localName || m.name == ceModule),
         "native region graft: endpoint definition collision")
       files += GoldenGateOutputFileAnnotation(NativeCheckpointStateAccess.render(original, localName, clock,
-        allocation.ceCount, r.native.identity.entries.filterNot(_.bank == 255), ceModule, prefix, Some(localPorts), observeRouterState),
+        allocation.ceCount, r.native.identity.entries.filterNot(_.bank == 255), ceModule, prefix, Some(localPorts), observeRouterState, restoreRouterState),
         s".native-region-graft-$i.sv")
       files += GoldenGateOutputFileAnnotation(ce(1).body, s".native-region-graft-$i-ce.sv")
       val ceSlice = s"[${allocation.ceBase} +: ${allocation.ceCount}]"
@@ -124,10 +131,15 @@ object NativeCheckpointRegionGraft {
         ".capture_descriptor_entry(32'd0)") ++ Seq("valid", "bank", "slot", "width", "depth").map(n => s".capture_descriptor_$n()")
       val routerObservation = if (!observeRouterState) Nil else Seq(
         s".capture_router_state(capture_router_state[${sharedRouterBits + 2*i} +: 2])")
+      val routerRestore = if (!restoreRouterState) Nil else Seq(
+        ".capture_router_restore_hold(router_restore_active)",
+        ".capture_router_restore_load(router_restore_accept)",
+        s".capture_router_restore_state(capture_router_restore_state[${sharedRouterBits + 2*i} +: 2])",
+        s".capture_router_restore_error(physical_restore_error[$i])")
       val transaction = Seq("request_valid", "request_ready", "response_valid", "response_ready", "response_error")
         .map(n => s".capture_$n(region_${n}[$i])") ++ Seq("bank", "slot", "address").map(n => s".capture_$n(region_$n)") ++
         Seq(s".capture_response_data(region_response_data[${i*64} +: 64])")
-      s"  $localName region$i(\n    ${(pass ++ control ++ transaction ++ routerObservation).mkString(",\n    ")});"
+      s"  $localName region$i(\n    ${(pass ++ control ++ transaction ++ routerObservation ++ routerRestore).mkString(",\n    ")});"
     }
     val shellEndpoints = source.shells.zipWithIndex.map { case (shell, index) =>
       val i = source.regions.size + index
@@ -194,6 +206,22 @@ object NativeCheckpointRegionGraft {
       case "request_valid" | "response_ready" => "capture_" + n + " && staged_permission"
       case _ => "raw_" + n
     }
+    // Validate the ENTIRE incoming vector before loading any physical owner.
+    // Keep all routers held even for an unheld/unsafe load, so no handshake can
+    // acknowledge that rejecting edge. Endpoint payloads are separate owners.
+    val restoreRTL = if (!restoreRouterState) "" else s"""
+  wire router_restore_active = capture_router_restore_hold || capture_router_restore_load;
+  wire router_restore_owner_valid = {1'b0,capture_router_restore_state[2 +: $ownerBits]} < ${ownerBits+1}'d$n;
+  assign capture_router_restore_ready = capture_router_restore_hold && capture_clock_mask &&
+    capture_read_enable && router_restore_owner_valid && !capture_reset;
+  wire router_restore_accept = capture_router_restore_load && capture_router_restore_ready;
+  wire shared_restore_error;
+  wire [${source.regions.size-1}:0] physical_restore_error;
+  assign capture_router_restore_error =
+    (router_restore_active && (!capture_clock_mask || !capture_read_enable)) ||
+    (capture_router_restore_load && !capture_router_restore_ready) ||
+    shared_restore_error || (|physical_restore_error);
+"""
     val declarationsRTL = (adapterPorts ++ ports).map { p =>
       val text = port(p)
       if (p.name.startsWith("capture_descriptor_") && p.direction == Output) text.replace("output wire", "output reg") else text
@@ -216,8 +244,11 @@ $cases
   wire [15:0] region_slot;
   wire [31:0] region_address;
 $stagingRTL
-  CheckpointRegionStateRouter #(${source.routing.parameters}) router(
+$restoreRTL
+  CheckpointRegionStateRouter #(${source.routing.parameters}${if (restoreRouterState) ",.RESTORE_SUPPORTED(1)" else ""}) router(
     ${if (observeRouterState) s".capture_state(capture_router_state[0 +: $sharedRouterBits])," else ""}
+    ${if (restoreRouterState) s""".restore_hold(router_restore_active), .restore_load(router_restore_accept),
+    .restore_state(capture_router_restore_state[0 +: $sharedRouterBits]), .restore_error(shared_restore_error),""" else ""}
     .clock($clock), .reset(capture_reset),
     .request_valid(${routerSignal("request_valid")}), .request_ready(${routerSignal("request_ready")}),
     .bank(capture_bank), .slot(capture_slot), .address(capture_address),
@@ -263,7 +294,16 @@ endmodule
           "definition" -> JString("CheckpointPhysicalStateRouter"), "offset" -> JInt(sharedRouterBits + 2*i),
           "bits" -> JInt(2), "fields_lsb0" -> JArray(List(JString("pending"), JString("selected_ce"))))))).toList),
       "sampling_contract" -> JString("same_raw_preedge_as_cut_control_before_first_bank_handshake"),
-      "atomic_snapshot_supported" -> JBool(false), "restore_supported" -> JBool(false))))
+      "atomic_snapshot_supported" -> JBool(false), "restore_supported" -> JBool(restoreRouterState))))
+    val restoreBinding = if (!restoreRouterState) Nil else List("router_state_restore" -> JObject(List(
+      "version" -> JInt(1), "scope" -> JString("complete_shared_and_physical_router_registers_only"),
+      "port_prefix" -> JString("capture_router_restore_"), "bits" -> JInt(routerBits),
+      "observation_port" -> JString("capture_router_state"),
+      "load_contract" -> JString("one_raw_positive_edge_all_routers_after_hold_mask_read_permission_and_complete_owner_validation"),
+      "rejection_contract" -> JString("no_partial_router_load_or_router_handshake_on_unsafe_load"),
+      "readback_contract" -> JString("retain_hold_deassert_load_compare_entire_observation_before_release"),
+      "endpoint_state_restored" -> JBool(false), "global_cut_restored" -> JBool(false),
+      "extra_storage_bits" -> JInt(0))))
     val binding = canonical(JObject(List(
       "graft_version" -> JInt(1), "scope" -> JString("existing_native_regions_shared_readout_only"),
       "root" -> JString(root.name), "adapter_module" -> JString(name), "adapter_instance" -> JString(instance),
@@ -273,7 +313,7 @@ endmodule
       "files" -> JObject(files.map(f => f.fileSuffix -> JString(sha256(f.body))).toList),
       "common_mask_and_sample_interface" -> JBool(true), "production_freeze_owners_bound" -> JBool(false),
       "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
-      "metasim_restore_supported" -> JBool(false)) ++ nativeBinding ++ snapshotBinding ++ routerBinding))
+      "metasim_restore_supported" -> JBool(false)) ++ nativeBinding ++ snapshotBinding ++ routerBinding ++ restoreBinding))
     Result(state.copy(circuit = flowed), files.toSeq :+
       GoldenGateOutputFileAnnotation(binding, ".native-region-graft.json"), binding)
   }

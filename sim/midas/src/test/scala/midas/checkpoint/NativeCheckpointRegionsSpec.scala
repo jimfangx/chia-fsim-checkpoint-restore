@@ -42,7 +42,7 @@ object NativeCheckpointRegionsFixture {
   }
   val targets = Seq(NativeCheckpointInPlaceFixture.target,
     ModuleTarget("NativeHost", "NativeHost").instOf("stage", "Stage").instOf("peer", "OtherStorage"))
-  def save(result: NativeCheckpointRegions.Result, name: String): Unit = {
+  def save(result: NativeCheckpointRegions.Result, name: String, restoreRouters: Boolean = false): Unit = {
     val out = Paths.get(sys.env("CHECKPOINT_TEST_ARTIFACT_DIR")).resolve(name)
     Files.createDirectories(out)
     def save(n: String, s: String): Unit = Files.write(out.resolve(n), s.getBytes(UTF_8))
@@ -56,7 +56,8 @@ object NativeCheckpointRegionsFixture {
       save(s"region-$i.fir", r.state.circuit.serialize)
       save(s"region-$i-binding.json", r.native.binding)
     }
-    val graft = NativeCheckpointRegionGraft.generate(result)
+    val graft = NativeCheckpointRegionGraft.generate(result, observeRouterState = restoreRouters,
+      restoreRouterState = restoreRouters)
     save("grafted.fir", graft.state.circuit.serialize)
     save("grafted-annotations.json", firrtl.annotations.JsonProtocol.serialize(graft.state.annotations))
     graft.files.foreach(f => save("FireSim-generated" + f.fileSuffix, f.body))
@@ -112,6 +113,33 @@ class NativeCheckpointRegionsSpec extends AnyFlatSpec {
     intercept[IllegalArgumentException](NativeCheckpointRegions.validate(r.copy(state = r.state.copy(
       annotations = r.state.annotations.filterNot(_.isInstanceOf[midas.InternalXDCAnnotation])))))
     intercept[IllegalArgumentException](NativeCheckpointRegions.validate(r.copy(routing = r.routing.copy(regions = r.routing.regions.reverse))))
+  }
+  it should "attach one validated atomic held-restore vector to every original router" in {
+    Seq(1, 2).foreach { count =>
+      val r = NativeCheckpointRegions.generate(source, targets.take(count))
+      val g = NativeCheckpointRegionGraft.generate(r, observeRouterState = true, restoreRouterState = true)
+      val b = parse(g.binding)
+      val width = 3 + 2 * count
+      assert((b \ "router_state_observation" \ "bits") == JInt(width))
+      assert((b \ "router_state_observation" \ "restore_supported") == JBool(true))
+      assert((b \ "router_state_restore" \ "extra_storage_bits") == JInt(0))
+      assert((b \ "router_state_restore" \ "endpoint_state_restored") == JBool(false))
+      assert((b \ "complete_fpga_capture") == JBool(false))
+      val root = g.state.circuit.modules.collectFirst { case m: Module if m.name == g.state.circuit.main => m }.get
+      assert(root.ports.contains(Port(NoInfo, "capture_router_restore_state", Input, UIntType(IntWidth(width)))))
+      val rtl = g.files.find(_.fileSuffix == ".native-region-graft.sv").get.body
+      assert(rtl.contains("wire router_restore_accept = capture_router_restore_load && capture_router_restore_ready;"))
+      assert(g.files.count(_.body.contains(".RESTORE_SUPPORTED(1)")) == count + 1)
+      save(r, s"native-regions-router-restore-$count", restoreRouters = true)
+    }
+    val r = NativeCheckpointRegions.generate(source, targets)
+    intercept[IllegalArgumentException](NativeCheckpointRegionGraft.generate(r, restoreRouterState = true))
+    val mixed = NativeCheckpointRegions.generate(source, targets,
+      shellTargets = Seq(ModuleTarget("NativeHost", "NativeHost")))
+    intercept[IllegalArgumentException](NativeCheckpointRegionGraft.generate(mixed,
+      observeRouterState = true, restoreRouterState = true))
+    intercept[IllegalArgumentException](NativeCheckpointRegionGraft.generate(r,
+      stageNativeState = true, observeRouterState = true, restoreRouterState = true))
   }
   it should "reject duplicate, nested, empty and stale selections before composing banks" in {
     val h = source
