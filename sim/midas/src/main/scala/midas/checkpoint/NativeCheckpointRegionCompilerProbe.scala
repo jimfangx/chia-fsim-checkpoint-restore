@@ -285,11 +285,15 @@ object NativeCheckpointRegionCompilerProbe {
         state("cut-snapshot", snapshot.state)
         save("cut-snapshot-binding.json", snapshot.binding)
         snapshot.files.foreach(f => save("generated" + f.fileSuffix, f.body))
-        // bindRegions regenerates an unstaged graft. Do not silently discard
-        // this attachment or claim its new control ports have an MMIO owner.
-        // The unchanged reservation/physical-owner guards must reject emission.
-        status("cut_snapshot_attached_incomplete_image_guard_required")
-        return snapshot.state.copy(annotations = snapshot.state.annotations ++ snapshot.files)
+        val bound = NativeCheckpointWidgetIdentity.bindRegionSnapshot(before, after, regions,
+          cutOwners(cutRequest.head.owners), snapshot)
+        state("connected", bound.connection.state)
+        save("connection.json", bound.connection.binding)
+        save("annotation-projection.json", bound.connection.annotationProjection)
+        state("identity-bound", bound.state)
+        save("identity-binding.json", bound.binding)
+        status("cut_snapshot_identity_bound_incomplete_image_guard_required")
+        return bound.state
       }
       save("transport-freeze-conflicts.json", canonical(NativeCheckpointRegionWidgetGraft.liveTransportConflicts(before, after, regions)))
       val bound = NativeCheckpointWidgetIdentity.bindRegions(before, after, regions)

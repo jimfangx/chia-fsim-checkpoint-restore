@@ -14,7 +14,7 @@ import org.json4s.native.JsonMethods.parse
 object NativeCheckpointRegionWidgetGraft {
   import SemanticStateInventory.{canonical, sha256}
   case class Result(state: CircuitState, graft: NativeCheckpointRegionGraft.Result, binding: String,
-      annotationProjection: String)
+      annotationProjection: String, snapshot: Option[NativeCheckpointRegionCutSnapshot.Result] = None)
   private val prefix = "checkpoint_region_widget_"
   private def check(ok: Boolean, why: String): Unit =
     require(ok, "checkpoint region widget graft: " + why)
@@ -59,7 +59,21 @@ object NativeCheckpointRegionWidgetGraft {
     JArray(rows)
   }
 
-  def connect(before: CircuitState, after: CircuitState, source: NativeCheckpointRegions.Result): Result = {
+  def connect(before: CircuitState, after: CircuitState, source: NativeCheckpointRegions.Result): Result =
+    connectSelected(before, after, source, None)
+
+  /** Authenticate the selected attachment before routing it. The regional
+    * controller keeps mask/sample authority; its extra controls remain explicit
+    * diagnostic ports until MMIO, target time and all owners have contracts.
+    */
+  def connectSnapshot(before: CircuitState, after: CircuitState, source: NativeCheckpointRegions.Result,
+      owners: Seq[String], snapshot: NativeCheckpointRegionCutSnapshot.Result): Result = {
+    NativeCheckpointRegionCutSnapshot.validate(source, owners, snapshot)
+    connectSelected(before, after, source, Some(snapshot))
+  }
+
+  private def connectSelected(before: CircuitState, after: CircuitState, source: NativeCheckpointRegions.Result,
+      snapshot: Option[NativeCheckpointRegionCutSnapshot.Result]): Result = {
     val peerText = NativeCheckpointWidgetPeerRouting.inspect(before, after)
     check(source.host.form == LowForm && source.host.circuit == after.circuit,
       "original region host differs from actual lowered host")
@@ -77,7 +91,9 @@ object NativeCheckpointRegionWidgetGraft {
     // original descriptor table covers the instrumented synchronous pipeline.
     check(!source.shells.exists(s => (parse(s.banks.binding) \ "native_state_observation") != JNothing),
       "native synchronous reader state requires an atomic widget staging owner before connection")
-    val graft = NativeCheckpointRegionGraft.generate(source)
+    val graft = snapshot.map(_.cut.graft).getOrElse(NativeCheckpointRegionGraft.generate(source))
+    val selected = snapshot.map(_.state).getOrElse(graft.state)
+    val resources = snapshot.map(_.files).getOrElse(graft.files)
     val execution = after.annotations.collect { case a: NativeCheckpointWidgetExecutionAnnotation => a }.head
     check(execution.entries == source.descriptors.entries.size && execution.gates == source.descriptors.physicalClockGates,
       "reserved entry/gate count differs from reconstructed descriptors")
@@ -94,13 +110,19 @@ object NativeCheckpointRegionWidgetGraft {
         "reserved route identifier collision")
       module
     }
+    // These three outputs belong to the selected physical controller. Never
+    // drive them from the transport's independent physical-cut placeholders.
+    val cutOwned = Set("capture_clock_mask", "capture_read_enable", "capture_captured_ce")
     val ports = NativeCheckpointInPlaceGraft.capturePorts(execution.gates)
+      .filterNot(p => snapshot.nonEmpty && cutOwned(p.name))
+    val selectedRoot = selected.circuit.modules.find(_.name == selected.circuit.main).get.asInstanceOf[Module]
+    check(ports.forall(p => selectedRoot.ports.contains(p)), "selected readout interface differs from transport roles")
     val pins = after.annotations.collect { case a: NativeCheckpointWidgetPinAnnotation => a.role -> a.target.ref }.toMap
-    val emittedExecutions = GeneratedExternalOwners.instances(graft.state, graft.state.circuit.main)
+    val emittedExecutions = GeneratedExternalOwners.instances(selected, selected.circuit.main)
       .groupBy(_._2.name).view.mapValues(_.map(_._1).toSet).toMap
     val changedExecutions = live.groupBy(_._2.name).collect { case (name, executions)
       if emittedExecutions.getOrElse(name, Set.empty[String]) != executions.map(_._1).toSet => name }.toSet
-    val changedNames = graft.state.circuit.modules.filter(m => originalModules.get(m.name).exists(_ != m)).map(_.name).toSet ++
+    val changedNames = selected.circuit.modules.filter(m => originalModules.get(m.name).exists(_ != m)).map(_.name).toSet ++
       chain.map(_.name) ++ changedExecutions
     // Typed storage contracts are projected below. Other targeted metadata on
     // modified definitions or changed execution sets needs its own contract.
@@ -119,7 +141,7 @@ object NativeCheckpointRegionWidgetGraft {
         ("(?:\\||:)" + java.util.regex.Pattern.quote(n) + "(?=[/>]|$)").r.findFirstIn(t.serialize).nonEmpty)),
         "unknown host annotation targets changed definition: " + a.getClass.getName))
     val rows = scala.collection.mutable.ArrayBuffer.empty[JValue]
-    val graftModules = graft.state.circuit.modules.map(m => m.name -> m).toMap
+    val graftModules = selected.circuit.modules.map(m => m.name -> m).toMap
     val routed = chain.zipWithIndex.map { case (original, index) =>
       val module = graftModules(original.name).asInstanceOf[Module]
       val root = index == 0
@@ -151,30 +173,44 @@ object NativeCheckpointRegionWidgetGraft {
       }
       rows += JObject(List("path" -> JString(paths(index)), "module" -> JString(module.name),
         "peer_host" -> JBool(peer)))
-      val nextPorts = if (root) original.ports else module.ports ++ ports.map(p =>
+      val nextPorts = if (root) module.ports.filterNot(p => ports.exists(_.name == p.name)) else module.ports ++ ports.map(p =>
         p.copy(name = prefix + p.name.stripPrefix("capture_"), direction = if (p.direction == Input) Output else Input))
       val wires = if (root) ports.map(p => DefWire(NoInfo, p.name, p.tpe)) else Nil
       module.name -> module.copy(ports = nextPorts, body = Block(wires ++ Seq(body) ++ extra))
     }.toMap
-    val circuit = graft.state.circuit.copy(modules = graft.state.circuit.modules.map(m => routed.getOrElse(m.name, m)))
+    val circuit = selected.circuit.copy(modules = selected.circuit.modules.map(m => routed.getOrElse(m.name, m)))
     val typed = firrtl.passes.InferTypes.run(firrtl.passes.ResolveKinds.run(firrtl.passes.ToWorkingIR.run(circuit)))
     val flowed = firrtl.passes.ResolveFlows.run(typed)
     firrtl.passes.CheckTypes.run(flowed); firrtl.passes.CheckFlows.run(flowed)
     val projected = NativeCheckpointWidgetAnnotations.project(after, after.copy(circuit = flowed), Some(source.host))
     val sourceContext = source.host.annotations.filter(SimulatorBankProbeContext.accepts)
-    val graftContext = graft.state.annotations.filter(SimulatorBankProbeContext.accepts)
+    val graftContext = selected.annotations.filter(SimulatorBankProbeContext.accepts)
     check(graftContext.toVector == sourceContext.toVector, "generated compiler context changed")
-    val generated = graft.state.annotations.filterNot(a => a == firrtl.transforms.NoCircuitDedupAnnotation ||
+    val generated = selected.annotations.filterNot(a => a == firrtl.transforms.NoCircuitDedupAnnotation ||
       SimulatorBankProbeContext.accepts(a))
     check(generated.forall(GeneratedStateBankAnnotations.supported), "unsupported generated storage annotation")
-    val result = projected.state.copy(annotations = projected.state.annotations ++
-      generated.filterNot(projected.state.annotations.contains))
+    val combined = projected.state.annotations ++ generated.filterNot(projected.state.annotations.contains)
+    if (snapshot.nonEmpty) {
+      val reserved = resources.map(_.fileSuffix)
+      check(reserved.distinct.size == reserved.size && !combined.exists {
+        case f: midas.stage.GoldenGateOutputFileAnnotation => reserved.contains(f.fileSuffix)
+        case _ => false
+      }, "selected resource suffix conflicts with enclosing compiler context")
+    }
+    val result = projected.state.copy(annotations = combined ++ (if (snapshot.nonEmpty) resources else Nil))
     val storage = result.copy(annotations = result.annotations.filter(GeneratedStateBankAnnotations.supported))
     val identity = GeneratedExternalOwners.instances(result, result.circuit.main).collect { case (path, m: Module) =>
       GeneratedStateBankAnnotations.Clone(m.name, path, m.name, m)
     }
     val (validated, _) = GeneratedStateBankAnnotations.translate(storage, identity, fameSource = Some(source.host))
     check(validated.toSet == storage.annotations.toSet, "combined storage annotation targets changed")
+    val selectedBinding = snapshot.toList.flatMap(s => List(
+      "selected_sha256" -> JString(sha256(selected.circuit.serialize)),
+      "selected_cut_snapshot" -> JBool(true),
+      "selected_snapshot_binding_sha256" -> JString(sha256(s.binding)),
+      "selected_resource_hashes" -> JObject(resources.map(f => f.fileSuffix -> JString(sha256(f.body))).toList),
+      "cut_snapshot_mmio_controls_bound" -> JBool(false),
+      "readout_router_state_atomically_owned" -> JBool(false), "staging_owner_restore_supported" -> JBool(false)))
     val binding = canonical(JObject(List(
       "connection_version" -> JInt(1), "scope" -> JString("reserved_widget_to_existing_disjoint_regions_routes_only"),
       "source_sha256" -> JString(sha256(after.circuit.serialize)),
@@ -193,7 +229,7 @@ object NativeCheckpointRegionWidgetGraft {
       "in_place_checkpoint_widget_connected" -> JBool(true), "descriptor_identity_bound" -> JBool(false),
       "external_transport_state_owner" -> JString("unsupported_no_atomic_capture_restore_adapter"),
       "production_freeze_owners_bound" -> JBool(false), "complete_fpga_capture" -> JBool(false),
-      "deployable_capture_image" -> JBool(false), "metasim_restore_supported" -> JBool(false))))
-    Result(result, graft, binding, projected.binding)
+      "deployable_capture_image" -> JBool(false), "metasim_restore_supported" -> JBool(false)) ++ selectedBinding))
+    Result(result, graft, binding, projected.binding, snapshot)
   }
 }

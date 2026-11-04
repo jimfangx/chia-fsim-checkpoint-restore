@@ -43,6 +43,15 @@ object NativeCheckpointWidgetIdentity {
     RegionsResult(state, connection, binding)
   }
 
+  def bindRegionSnapshot(before: CircuitState, after: CircuitState,
+      source: NativeCheckpointRegions.Result, owners: Seq[String],
+      snapshot: NativeCheckpointRegionCutSnapshot.Result): RegionsResult = {
+    val connection = NativeCheckpointRegionWidgetGraft.connectSnapshot(before, after, source, owners, snapshot)
+    val (state, binding) = bindConnected(before, after, connection.state, connection.binding, source.descriptors,
+      "staged_disjoint_regions_transport_and_host_identity_only")
+    RegionsResult(state, connection, binding)
+  }
+
   private def bindConnected(before: CircuitState, after: CircuitState, connected: CircuitState,
       connectionBinding: String, descriptors: CheckpointCaptureDescriptors, scope: String): (CircuitState, String) = {
     val execution = after.annotations.collect { case a: NativeCheckpointWidgetExecutionAnnotation => a }.head

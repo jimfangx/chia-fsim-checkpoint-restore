@@ -386,6 +386,83 @@ class NativeCheckpointRegionWidgetGraftSpec extends AnyFlatSpec {
       _.isInstanceOf[firrtl.EmitCircuitAnnotation]) :+ firrtl.EmitCircuitAnnotation(classOf[firrtl.SystemVerilogEmitter]))).getEmittedCircuit.value)
     println(s"NATIVE_REGION_WIDGET_IDENTITY out=$out/identity entries=14 guards_retained=true")
   }
+  it should "authenticate and route the selected staging attachment without replacing its clock authority" in {
+    val owners = Seq("fixture.reset", "fixture.memory")
+    val snapshot = NativeCheckpointRegionCutSnapshot.generate(source, owners)
+    val bound = NativeCheckpointWidgetIdentity.bindRegionSnapshot(before, after, source, owners, snapshot)
+    assert(bound.connection.snapshot.contains(snapshot))
+    val doc = parse(bound.connection.binding)
+    assert((doc \ "selected_sha256") == JString(SemanticStateInventory.sha256(snapshot.state.circuit.serialize)))
+    assert((doc \ "selected_snapshot_binding_sha256") == JString(SemanticStateInventory.sha256(snapshot.binding)))
+    assert((doc \ "pins").asInstanceOf[JArray].arr.size == 17)
+    val oldRoot = snapshot.state.circuit.modules.find(_.name == snapshot.state.circuit.main).get.asInstanceOf[FirrtlModule]
+    val root = bound.state.circuit.modules.find(_.name == bound.state.circuit.main).get.asInstanceOf[FirrtlModule]
+    val retained = oldRoot.ports.filter(p => p.name.startsWith("capture_cut_") || p.name.startsWith("capture_snapshot_") ||
+      Set("capture_clock_mask", "capture_read_enable", "capture_captured_ce")(p.name))
+    assert(retained.nonEmpty && retained.forall(root.ports.contains))
+    val originalModules = snapshot.state.circuit.modules.map(m => m.name -> m).toMap
+    bound.state.circuit.modules.filterNot(m => Set(root.name, "FPGATop")(m.name) ||
+      m.isInstanceOf[ExtModule] && m.asInstanceOf[ExtModule].defname == "CheckpointPhysicalCaptureTransport")
+      .foreach(m => assert(originalModules(m.name) == m))
+    assert(root.body.serialize.contains("inst checkpoint_region_cut_snapshot of CheckpointRegionCutSnapshot"))
+    assert(!root.body.serialize.contains("capture_clock_mask <= top.checkpoint_region_widget_clock_mask"))
+    snapshot.files.foreach(f => assert(bound.state.annotations.count(_ == f) == 1))
+    Seq("cut_snapshot_mmio_controls_bound", "readout_router_state_atomically_owned", "staging_owner_restore_supported",
+      "production_freeze_owners_bound", "complete_fpga_capture", "deployable_capture_image").foreach(k =>
+      assert((doc \ k) == JBool(false)))
+    Seq(bound.state, bound.state.copy(annotations = Nil)).foreach { state =>
+      intercept[IllegalArgumentException](NativeCheckpointWidgetReservation.requireBound(state))
+      intercept[IllegalArgumentException](PhysicalClockGateContract.requireCaptureOwner(state))
+    }
+    Seq("before" -> before, "after" -> after, "selected" -> snapshot.state,
+      "connected" -> bound.connection.state, "identity-bound" -> bound.state).foreach { case (name, state) =>
+      save("staged/" + name + ".fir", state.circuit.serialize)
+      save("staged/" + name + ".anno.json", JsonProtocol.serialize(state.annotations))
+    }
+    save("staged/snapshot-binding.json", snapshot.binding)
+    save("staged/cut-binding.json", snapshot.cut.binding)
+    save("staged/graft-binding.json", snapshot.cut.graft.binding)
+    save("staged/regions-binding.json", source.binding)
+    save("staged/descriptors.json", source.descriptors.manifest)
+    save("staged/descriptor-binding.json", source.descriptors.binding)
+    save("staged/annotation-projection.json", bound.connection.annotationProjection)
+    snapshot.files.foreach(f => save("staged/generated" + f.fileSuffix, f.body))
+    val header = bound.state.annotations.collectFirst {
+      case f: GoldenGateOutputFileAnnotation if f.fileSuffix == ".const.h" => f.body
+    }.get
+    save("staged/header.h", header)
+    save("staged/selected.fir", snapshot.state.circuit.serialize)
+    save("staged/connected.fir", bound.connection.state.circuit.serialize)
+    save("staged/identity-bound.fir", bound.state.circuit.serialize)
+    save("staged/connection.json", bound.connection.binding)
+    save("staged/identity.json", bound.binding)
+  }
+
+  it should "reject coherently rehashed staged circuits resources parent bindings and owner order" in {
+    val owners = Seq("fixture.reset", "fixture.memory")
+    val snapshot = NativeCheckpointRegionCutSnapshot.generate(source, owners)
+    val changed = snapshot.state.copy(circuit = snapshot.state.circuit.copy(info = FileInfo(StringLit("changed"))))
+    val binding = SemanticStateInventory.canonical(parse(snapshot.binding).transformField {
+      case ("attached_sha256", _) => "attached_sha256" -> JString(SemanticStateInventory.sha256(changed.circuit.serialize))
+    })
+    val mutations = Seq(snapshot.copy(state = changed, binding = binding),
+      snapshot.copy(state = snapshot.state.copy(annotations = Nil)),
+      snapshot.copy(files = snapshot.files.dropRight(1)),
+      snapshot.copy(files = snapshot.files.updated(0, snapshot.files.head.copy(body = snapshot.files.head.body + "\n"))),
+      snapshot.copy(cut = snapshot.cut.copy(binding = snapshot.cut.binding + "\n")),
+      snapshot.copy(cut = snapshot.cut.copy(graft = snapshot.cut.graft.copy(binding = snapshot.cut.graft.binding + "\n"))),
+      snapshot.copy(binding = snapshot.binding + "\n"))
+    mutations.foreach(s => intercept[IllegalArgumentException] {
+      NativeCheckpointWidgetIdentity.bindRegionSnapshot(before, after, source, owners, s)
+    })
+    intercept[IllegalArgumentException] {
+      NativeCheckpointWidgetIdentity.bindRegionSnapshot(before, after, source, owners.reverse, snapshot)
+    }
+    intercept[IllegalArgumentException] {
+      NativeCheckpointWidgetIdentity.bindRegionSnapshot(before, after, source.copy(targets = source.targets.reverse), owners, snapshot)
+    }
+  }
+
   it should "reconstruct regional descriptor identities instead of trusting rehashed sidecars" in {
     intercept[IllegalArgumentException](NativeCheckpointWidgetIdentity.bindRegions(before, after,
       source.copy(descriptors = NativeCheckpointInPlaceAccess.descriptors(source.regions.head))))
