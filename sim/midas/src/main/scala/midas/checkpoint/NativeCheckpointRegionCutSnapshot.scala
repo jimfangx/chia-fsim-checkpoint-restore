@@ -18,7 +18,8 @@ object NativeCheckpointRegionCutSnapshot {
   val instance = "checkpoint_region_cut_snapshot"
   val definition = "CheckpointRegionCutSnapshot"
   case class Result(state: CircuitState, cut: NativeCheckpointRegionClockCut.Result,
-      files: Seq[GoldenGateOutputFileAnnotation], binding: String, includeRouterState: Boolean = false)
+      files: Seq[GoldenGateOutputFileAnnotation], binding: String, includeRouterState: Boolean = false,
+      restoreStaging: Boolean = false)
   private def check(ok: Boolean, why: String): Unit =
     require(ok, "native region cut snapshot: " + why)
   private def all(s: Statement): Seq[Statement] = {
@@ -28,7 +29,7 @@ object NativeCheckpointRegionCutSnapshot {
   }
 
   def generate(source: NativeCheckpointRegions.Result, owners: Seq[String],
-      includeRouterState: Boolean = false): Result = {
+      includeRouterState: Boolean = false, restoreStaging: Boolean = false): Result = {
     // Regenerate rather than accepting a caller-supplied, potentially modified
     // cut. This authenticates original regions, owners and raw-clock routing.
     val cut = NativeCheckpointRegionClockCut.generate(source, owners, observeRouterState = includeRouterState)
@@ -54,13 +55,14 @@ object NativeCheckpointRegionCutSnapshot {
       }, "reserved staging identifier collision")
     def uint(n: Int): Type = UIntType(IntWidth(n))
     def p(n: String, d: Direction, w: Int = 1): Port = Port(NoInfo, n, d, uint(w))
-    val inputs = Seq(p("reset", Input), p("host_freeze_request", Input),
+    val restoreInputs = Seq(p("restore_hold", Input), p("restore_load", Input), p("restore_state", Input, bits + 71))
+    val inputs = Seq(p("reset", Input)) ++ restoreInputs ++ Seq(p("host_freeze_request", Input),
       p("snapshot_request", Input), p("snapshot_release", Input), p("physical_read_enable", Input),
       p("physical_failed", Input), p("source_pending", Input), p("target_cycle", Input, 64),
       p("live_control_state", Input, bits), p("request_valid", Input), p("source_request_ready", Input),
       p("source_response_valid", Input), p("source_response_data", Input, 64),
       p("source_response_error", Input), p("response_ready", Input), p("word_address", Input, 32))
-    val outputs = Seq(p("cut_freeze_request", Output), p("request_ready", Output),
+    val outputs = Seq(p("restore_ready", Output), p("cut_freeze_request", Output), p("request_ready", Output),
       p("source_request_valid", Output), p("source_response_ready", Output),
       p("response_valid", Output), p("response_data", Output, 64), p("response_error", Output),
       p("snapshot_ready", Output), p("snapshot_valid", Output), p("snapshot_failed", Output),
@@ -68,7 +70,7 @@ object NativeCheckpointRegionCutSnapshot {
       p("snapshot_error", Output, 6), p("captured_control_state", Output, bits),
       p("staging_control_state", Output, bits + 71))
     val adapter = ExtModule(NoInfo, definition, Seq(Port(NoInfo, "clock", Input, ClockType)) ++
-      inputs ++ outputs, definition, Seq(IntParam("CONTROL_BITS", bits)))
+      inputs ++ outputs, definition, Seq(IntParam("CONTROL_BITS", bits), IntParam("RESTORE_ENABLE", if (restoreStaging) 1 else 0)))
     // Interpose on ALL six readout directions and the physical freeze request.
     // The existing pending register continues tracking the inner accepted
     // request, never the unqualified external request.
@@ -84,7 +86,8 @@ object NativeCheckpointRegionCutSnapshot {
       case x => x.mapExpr(expr)
     }
     def stmt(s: Statement): Statement = s.mapStmt(stmt).mapExpr(expr)
-    val in = Map("reset" -> "capture_reset", "host_freeze_request" -> "capture_cut_freeze_request",
+    val in = restoreInputs.map(p => p.name -> (prefix + p.name)).toMap ++
+      Map("reset" -> "capture_reset", "host_freeze_request" -> "capture_cut_freeze_request",
       "snapshot_request" -> (prefix + "request"), "snapshot_release" -> (prefix + "release"),
       "physical_read_enable" -> "capture_read_enable", "physical_failed" -> "capture_cut_failed",
       "source_pending" -> "capture_cut_pending", "target_cycle" -> "capture_cut_target_cycle",
@@ -92,7 +95,8 @@ object NativeCheckpointRegionCutSnapshot {
       handshake.filter(n => Set("request_valid", "response_ready").contains(n)).map(n => n -> ("capture_" + n)) ++
       handshake.filter(n => Set("request_ready", "response_valid", "response_data", "response_error").contains(n))
         .map(n => ("source_" + n) -> renamed("capture_" + n))
-    val out = Map("cut_freeze_request" -> renamed("capture_cut_freeze_request"),
+    val out = Map("restore_ready" -> (prefix + "restore_ready"),
+      "cut_freeze_request" -> renamed("capture_cut_freeze_request"),
       "snapshot_ready" -> (prefix + "ready"), "snapshot_valid" -> (prefix + "valid"),
       "snapshot_failed" -> (prefix + "failed"), "snapshot_error" -> (prefix + "error")) ++
       Seq("word_data", "cut_cycle", "word_error", "captured_control_state", "staging_control_state")
@@ -103,7 +107,9 @@ object NativeCheckpointRegionCutSnapshot {
         .map(n => ("source_" + n) -> renamed("capture_" + n))
     check(in.keySet == inputs.map(_.name).toSet && out.keySet == outputs.map(_.name).toSet,
       "incomplete staging port ownership")
-    val extra = Seq(p(prefix + "request", Input), p(prefix + "release", Input), p(prefix + "word_address", Input, 32),
+    val restorePorts = if (!restoreStaging) Nil else restoreInputs.map(p => p.copy(name = prefix + p.name)) :+
+      p(prefix + "restore_ready", Output)
+    val extra = restorePorts ++ Seq(p(prefix + "request", Input), p(prefix + "release", Input), p(prefix + "word_address", Input, 32),
       p(prefix + "ready", Output), p(prefix + "valid", Output), p(prefix + "failed", Output),
       p(prefix + "word_data", Output, 64), p(prefix + "cut_cycle", Output, 64),
       p(prefix + "word_error", Output), p(prefix + "error", Output, 6),
@@ -112,10 +118,12 @@ object NativeCheckpointRegionCutSnapshot {
       inputs.map(p => Connect(NoInfo, pin(p.name), if (p.name == "live_control_state" && includeRouterState)
         DoPrim(firrtl.PrimOps.Cat, Seq(ref("capture_router_state", uint(routerBits)),
           ref("capture_cut_control_state", uint(controlBits))), Nil, uint(bits))
+        else if (!restoreStaging && restoreInputs.exists(_.name == p.name)) UIntLiteral(0, p.tpe.asInstanceOf[UIntType].width)
         else ref(in(p.name), p.tpe))) ++
       outputs.map(p => Connect(NoInfo, ref(out(p.name), p.tpe), pin(p.name)))
     val rewritten = root.copy(ports = root.ports ++ extra, body = Block(
-      originalPorts.map(p => DefWire(NoInfo, renamed(p.name), p.tpe)) ++ Seq(
+      originalPorts.map(p => DefWire(NoInfo, renamed(p.name), p.tpe)) ++
+        (if (restoreStaging) Nil else Seq(DefWire(NoInfo, prefix + "restore_ready", uint(1)))) ++ Seq(
         WDefInstance(NoInfo, instance, definition, firrtl.Utils.module_type(adapter)), stmt(root.body)) ++ connections))
     val circuit = cut.state.circuit.copy(modules = cut.state.circuit.modules.map(m =>
       if (m.name == root.name) rewritten else m) :+ adapter)
@@ -133,7 +141,11 @@ object NativeCheckpointRegionCutSnapshot {
       "router_state_offset" -> JInt(controlBits), "router_state_observation" -> routerObservation,
       "router_observation_atomically_staged" -> JBool(true),
       "payload_layout_lsb0" -> JArray(List(JString("cut_control"), JString("router_state"))))
-    val binding = canonical(JObject(List("snapshot_version" -> JInt(if (includeRouterState) 2 else 1),
+    val restoreBinding = if (!restoreStaging) Nil else List(
+      "staging_restore_extra_storage_bits" -> JInt(0),
+      "staging_restore_contract" -> JString("whole_owner_raw_posedge_under_hold_with_physical_read_permission_and_idle_readers"),
+      "original_controller_router_endpoint_restore_supported" -> JBool(false))
+    val binding = canonical(JObject(List("snapshot_version" -> JInt(if (restoreStaging) 3 else if (includeRouterState) 2 else 1),
       "scope" -> JString("selected_native_regions_atomic_cut_control_observation_only"),
       "cut_binding_sha256" -> JString(sha256(cut.binding)),
       "attached_sha256" -> JString(sha256(flowed.serialize)),
@@ -142,14 +154,14 @@ object NativeCheckpointRegionCutSnapshot {
       "resource_hashes" -> JObject(resources.map(f => f.fileSuffix -> JString(sha256(f.body))).toList),
       "control_state_bits" -> JInt(bits), "staging_owner_bits" -> JInt(bits + 71),
       "controller_observation_atomically_staged" -> JBool(true),
-      "readout_router_state_atomically_owned" -> JBool(false), "staging_owner_restore_supported" -> JBool(false),
+      "readout_router_state_atomically_owned" -> JBool(false), "staging_owner_restore_supported" -> JBool(restoreStaging),
       "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
-      "metasim_restore_supported" -> JBool(false)) ++ routerBinding))
-    Result(cut.state.copy(circuit = flowed), cut, cut.files ++ resources, binding, includeRouterState)
+      "metasim_restore_supported" -> JBool(false)) ++ routerBinding ++ restoreBinding))
+    Result(cut.state.copy(circuit = flowed), cut, cut.files ++ resources, binding, includeRouterState, restoreStaging)
   }
 
   def validate(source: NativeCheckpointRegions.Result, owners: Seq[String], result: Result): Unit = {
-    val expected = generate(source, owners, result.includeRouterState)
+    val expected = generate(source, owners, result.includeRouterState, result.restoreStaging)
     check(result == expected, "attached atomic snapshot differs from independent regeneration")
   }
 }

@@ -122,6 +122,37 @@ class NativeCheckpointRegionCutSnapshotSpec extends AnyFlatSpec {
     saveSnapshot(snapshot, "native-regions-cut-snapshot")
   }
 
+  it should "tie restore off by default and expose only the complete staging owner when selected" in {
+    for (routers <- Seq(false, true)) {
+      val result = NativeCheckpointRegionCutSnapshot.generate(regions, owners,
+        includeRouterState = routers, restoreStaging = true)
+      val bits = if (routers) 82 else 75
+      NativeCheckpointRegionCutSnapshot.validate(regions, owners, result)
+      val root = result.state.circuit.modules.find(_.name == "NativeHost").get.asInstanceOf[Module]
+      val c = all(root.body).collect { case x: Connect => x.loc.serialize -> x.expr.serialize }.toMap
+      for (n <- Seq("hold", "load", "state")) {
+        assert(c("checkpoint_region_cut_snapshot.restore_" + n) == "capture_snapshot_restore_" + n)
+      }
+      assert(c("capture_snapshot_restore_ready") == "checkpoint_region_cut_snapshot.restore_ready")
+      assert(root.ports.contains(Port(NoInfo, "capture_snapshot_restore_state", Input, UIntType(IntWidth(bits + 71)))))
+      val b = parse(result.binding)
+      assert((b \ "snapshot_version") == JInt(3))
+      assert((b \ "staging_owner_restore_supported") == JBool(true))
+      assert((b \ "staging_restore_extra_storage_bits") == JInt(0))
+      Seq("original_controller_router_endpoint_restore_supported", "complete_fpga_capture",
+        "deployable_capture_image", "metasim_restore_supported").foreach(k => assert((b \ k) == JBool(false)))
+      intercept[IllegalArgumentException](NativeCheckpointRegionCutSnapshot.validate(regions, owners,
+        result.copy(restoreStaging = false)))
+      saveSnapshot(result, if (routers) "native-regions-cut-router-staging-restore" else "native-regions-cut-staging-restore")
+    }
+    val root = snapshot.state.circuit.modules.find(_.name == "NativeHost").get.asInstanceOf[Module]
+    val c = all(root.body).collect { case x: Connect => x.loc.serialize -> x.expr.serialize }.toMap
+    assert(c("checkpoint_region_cut_snapshot.restore_hold") == "UInt<1>(\"h0\")")
+    assert(c("checkpoint_region_cut_snapshot.restore_load") == "UInt<1>(\"h0\")")
+    assert(c("checkpoint_region_cut_snapshot.restore_state") == "UInt<146>(\"h0\")")
+    assert(!root.ports.exists(_.name.startsWith("capture_snapshot_restore_")))
+  }
+
   it should "stage every shared and physical router bit at the same preedge without changing defaults" in {
     val result = NativeCheckpointRegionCutSnapshot.generate(regions, owners, includeRouterState = true)
     NativeCheckpointRegionCutSnapshot.validate(regions, owners, result)

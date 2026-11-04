@@ -6,11 +6,16 @@
 //
 // This bounded adapter owns neither bank/router payload nor external writers,
 // host state, target-time authority or complete simulator/semantic coverage.
-// The additional staging owner is exposed separately, with restore disabled.
+// The additional staging owner is exposed separately. Opt-in restore loads
+// only that owner, never the live controller, routers or endpoint state.
 module CheckpointRegionCutSnapshot #(
-    parameter integer CONTROL_BITS = 75
+    parameter integer CONTROL_BITS = 75,
+    parameter integer RESTORE_ENABLE = 0
 ) (
     input wire clock, reset,
+    input wire restore_hold, restore_load,
+    input wire [CONTROL_BITS+70:0] restore_state,
+    output wire restore_ready,
     input wire host_freeze_request, snapshot_request, snapshot_release,
     input wire physical_read_enable, physical_failed, source_pending,
     input wire [63:0] target_cycle,
@@ -39,13 +44,14 @@ module CheckpointRegionCutSnapshot #(
     output wire [CONTROL_BITS+70:0] staging_control_state
 );
     wire staged_valid, borrow_enable, staged_word_error;
+    wire restoring = RESTORE_ENABLE != 0 && (restore_hold || restore_load);
     wire [63:0] staged_word_data;
     wire permission = borrow_enable && physical_read_enable && !physical_failed;
 
     // Occupancy/error are registered state, not the live fault cone: avoid
     // feeding a controller's own read-enable/failure comparison back into its
     // freeze request. Host withdrawal cannot release an occupied epoch.
-    assign cut_freeze_request = host_freeze_request || snapshot_request ||
+    assign cut_freeze_request = host_freeze_request || snapshot_request || restoring ||
         staging_control_state[CONTROL_BITS] || (|snapshot_error);
     assign source_request_valid = request_valid && host_freeze_request && permission;
     assign request_ready = source_request_ready && host_freeze_request && permission;
@@ -64,10 +70,10 @@ module CheckpointRegionCutSnapshot #(
     // that a healthy cut constrains to zero. The independent native audit
     // checks every bit and its raw clock rather than inferring an encoding.
     (* keep_hierarchy = "yes", dont_touch = "true" *)
-    CheckpointNativeStateSnapshot #(.BITS(CONTROL_BITS), .RESTORE_ENABLE(0)) staging (
+    CheckpointNativeStateSnapshot #(.BITS(CONTROL_BITS), .RESTORE_ENABLE(RESTORE_ENABLE)) staging (
         .clock(clock), .reset(reset),
-        .restore_hold(1'b0), .restore_load(1'b0),
-        .restore_state({(CONTROL_BITS+71){1'b0}}), .restore_ready(),
+        .restore_hold(restore_hold), .restore_load(restore_load),
+        .restore_state(restore_state), .restore_ready(restore_ready),
         .request(snapshot_request), .release_snapshot(snapshot_release),
         .owners_present(!physical_failed),
         .functional_frozen(physical_read_enable),
