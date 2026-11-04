@@ -7,7 +7,11 @@ module CheckpointRegionStateRouter #(
   parameter [REGIONS*8-1:0] BANK_BASE = 16'h0100,
   parameter [REGIONS*8-1:0] BANK_COUNT = 16'h0101,
   parameter [REGIONS*16-1:0] CE_BASE = 32'h00010000,
-  parameter [REGIONS*16-1:0] CE_COUNT = 32'h00010001
+  parameter [REGIONS*16-1:0] CE_COUNT = 32'h00010001,
+  // Explicit diagnostic opt-in. Existing generated callers retain their
+  // original behavior with unconnected restore inputs. This interface owns
+  // only this router, never its endpoints or the global atomic cut.
+  parameter integer RESTORE_SUPPORTED = 0
 )(
   input wire clock, reset,
   input wire request_valid,
@@ -27,11 +31,25 @@ module CheckpointRegionStateRouter #(
   input wire [REGIONS-1:0] region_response_valid,
   output reg [REGIONS-1:0] region_response_ready,
   input wire [REGIONS*64-1:0] region_response_data,
-  input wire [REGIONS-1:0] region_response_error
+  input wire [REGIONS-1:0] region_response_error,
+  // Complete state, including inactive payload: {owner, invalid, pending}.
+  output wire [((REGIONS > 1) ? $clog2(REGIONS) : 1)+1:0] capture_state,
+  input wire restore_hold,
+  input wire restore_load,
+  input wire [((REGIONS > 1) ? $clog2(REGIONS) : 1)+1:0] restore_state,
+  output wire restore_error
 );
   localparam integer OWNER_WIDTH = REGIONS > 1 ? $clog2(REGIONS) : 1;
   reg pending, invalid;
   reg [OWNER_WIDTH-1:0] owner;
+  wire holding = RESTORE_SUPPORTED != 0 && restore_hold;
+  wire loading = RESTORE_SUPPORTED != 0 && restore_load;
+  // Invalid input must not alter state or acknowledge an edge. The caller
+  // retains hold through complete independent readback of every owner.
+  assign restore_error = loading && (!holding ||
+    int'({1'b0, restore_state[OWNER_WIDTH+1:2]}) >= REGIONS);
+  wire running = !reset && !holding && !restore_error;
+  assign capture_state = {owner, invalid, pending};
   reg route_valid;
   reg [OWNER_WIDTH-1:0] route;
   // Bank 255 belongs exclusively to physical CE slots. Functional banks use
@@ -59,22 +77,24 @@ module CheckpointRegionStateRouter #(
     end
   end
   assign region_address = address;
-  assign request_ready = !reset && !pending && (!route_valid || region_request_ready[route]);
-  assign response_valid = !reset && pending && (invalid || region_response_valid[owner]);
+  assign request_ready = running && !pending && (!route_valid || region_request_ready[route]);
+  assign response_valid = running && pending && (invalid || region_response_valid[owner]);
   assign response_data = invalid || !pending ? 64'b0 : region_response_data[owner*64 +: 64];
   assign response_error = pending && (invalid || region_response_error[owner]);
   always @* begin
     region_request_valid = 0;
     region_response_ready = 0;
-    if (!reset && !pending && route_valid) region_request_valid[route] = request_valid;
-    if (!reset && pending && !invalid) region_response_ready[owner] = response_ready;
+    if (running && !pending && route_valid) region_request_valid[route] = request_valid;
+    if (running && pending && !invalid) region_response_ready[owner] = response_ready;
   end
   always @(posedge clock) begin
     if (reset) begin
       pending <= 0;
       invalid <= 0;
       owner <= 0;
-    end else begin
+    end else if (loading && holding && !restore_error) begin
+      {owner, invalid, pending} <= restore_state;
+    end else if (running) begin
       if (request_valid && request_ready) begin
         pending <= 1;
         invalid <= !route_valid;
@@ -86,6 +106,8 @@ module CheckpointRegionStateRouter #(
   // These are elaboration errors, never a runtime fallback to a different owner.
   initial begin
     if (REGIONS < 1 || REGIONS > 255) $fatal(1,"checkpoint region count");
+    if (RESTORE_SUPPORTED != 0 && RESTORE_SUPPORTED != 1)
+      $fatal(1,"checkpoint region restore opt-in");
     for (integer a=0; a<REGIONS; a=a+1) begin
       if (BANK_COUNT[a*8 +: 8] == 0 ||
           int'(BANK_BASE[a*8 +: 8]) + int'(BANK_COUNT[a*8 +: 8]) > 255 ||
