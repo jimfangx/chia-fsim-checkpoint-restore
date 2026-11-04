@@ -208,6 +208,12 @@ class NativeCheckpointRegionCompilerProbeSpec extends AnyFlatSpec {
     val parsed = shell.parse(Array("--simulator-native-region-compiler-probe", selection,
       "--simulator-native-region-cut-snapshot-probe", cut.owners))
     assert(parsed.contains(request) && parsed.contains(cut))
+    val routers = shell.parse(Array("--simulator-native-region-compiler-probe", selection,
+      "--simulator-native-region-cut-router-snapshot-probe", cut.owners))
+    assert(routers.contains(cut.copy(includeRouterState = true)))
+    NativeCheckpointRegionCompilerProbe.validateCardinality(routers)
+    intercept[IllegalArgumentException](NativeCheckpointRegionCompilerProbe.validateCardinality(
+      Seq(request, cut, cut.copy(includeRouterState = true))))
     NativeCheckpointRegionCompilerProbe.validateCardinality(parsed)
     val invalid = Seq("", "fixture.reset,", ",fixture.reset", "fixture.reset,fixture.reset", "fixture reset", "a;b", "a, b")
     invalid.foreach(owners => intercept[IllegalArgumentException] {
@@ -233,6 +239,51 @@ class NativeCheckpointRegionCompilerProbeSpec extends AnyFlatSpec {
     assert((status(dir) \ "status") == JString("cut_snapshot_identity_bound_incomplete_image_guard_required"))
     assert((status(dir) \ "requested_cut_snapshot_owners") == JArray(owners.map(JString(_)).toList))
     val snapshot = parse(text(output.resolve("cut-snapshot-binding.json")))
+    val parent = text(output.resolve("cut-snapshot-parent-binding.json"))
+    val connection = parse(text(output.resolve("connection.json")))
+    assert((connection \ "selected_cut_snapshot") == JBool(true))
+    assert((connection \ "selected_snapshot_binding_sha256") ==
+      JString(SemanticStateInventory.sha256(text(output.resolve("cut-snapshot-binding.json")))))
+    assert((connection \ "selected_sha256") == snapshot.\("attached_sha256"))
+    assert((parse(text(output.resolve("identity-binding.json"))) \ "descriptor_identity_bound") == JBool(true))
+    assert(text(output.resolve("identity-bound.anno.json")).contains("Incomplete_checkpoint_hardware_coverage"))
+    assert((snapshot \ "attached_sha256") == JString(SemanticStateInventory.sha256(text(output.resolve("cut-snapshot.fir")))))
+    assert((snapshot \ "cut_binding_sha256") == JString(SemanticStateInventory.sha256(parent)))
+    assert((parse(parent) \ "owners") == JArray(owners.map(JString(_)).toList))
+    Seq("complete_fpga_capture", "deployable_capture_image", "metasim_restore_supported",
+      "readout_router_state_atomically_owned", "staging_owner_restore_supported").foreach(k =>
+      assert((snapshot \ k) == JBool(false)))
+    val files = staged.annotations.collect { case f: midas.stage.GoldenGateOutputFileAnnotation => f }
+    Seq(".native-region-cut-controller.sv", ".native-region-cut-snapshot.sv", ".native-region-cut-staging.sv").foreach { suffix =>
+      val file = files.filter(_.fileSuffix == suffix)
+      assert(file.size == 1 && file.head.body == text(output.resolve("generated" + suffix)))
+    }
+    Seq(staged, staged.copy(annotations = Nil)).foreach { value =>
+      intercept[IllegalArgumentException](NativeCheckpointWidgetReservation.requireBound(value))
+      intercept[IllegalArgumentException](PhysicalClockGateContract.requireCaptureOwner(value))
+    }
+    audit(dir)
+  }
+
+  it should "bind complete router observation through the real compiler widget factory and keep all image guards" in {
+    val dir = Files.createTempDirectory(base, "cut-routers-selected-")
+    val owners = Seq("fixture.memory", "fixture.reset")
+    val cut = NativeCheckpointRegionCutSnapshotProbeAnnotation(owners.mkString(","), includeRouterState = true)
+    val original = before(dir)
+    val source = NativeCheckpointRegionCompilerProbe.normalizeMetadata(original.copy(annotations = original.annotations :+ cut))
+    val post = ResolveSimulationInline.forCheckpointRegions(source)
+    val staged = NativeCheckpointRegionCompilerProbe(source, post)
+    val output = dir.resolve(NativeCheckpointRegionCompilerProbe.directory)
+    assert(text(output.resolve("identity-bound.fir")) == staged.circuit.serialize)
+    assert(staged.circuit.serialize.contains("inst checkpoint_region_cut_snapshot of CheckpointRegionCutSnapshot"))
+    assert(Files.exists(output.resolve("identity-bound.fir")))
+    assert((status(dir) \ "status") == JString("cut_snapshot_identity_bound_incomplete_image_guard_required"))
+    assert((status(dir) \ "requested_cut_snapshot_owners") == JArray(owners.map(JString(_)).toList))
+    val snapshot = parse(text(output.resolve("cut-snapshot-binding.json")))
+    assert((snapshot \ "snapshot_version") == JInt(2))
+    assert((snapshot \ "router_observation_atomically_staged") == JBool(true))
+    assert(text(output.resolve("cut-snapshot.fir")).contains("cat(capture_router_state, capture_cut_control_state)"))
+    assert(staged.circuit.serialize.contains("capture_router_state"))
     val parent = text(output.resolve("cut-snapshot-parent-binding.json"))
     val connection = parse(text(output.resolve("connection.json")))
     assert((connection \ "selected_cut_snapshot") == JBool(true))

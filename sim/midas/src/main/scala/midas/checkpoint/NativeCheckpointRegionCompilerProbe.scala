@@ -12,12 +12,16 @@ import scala.util.control.NonFatal
 
 case class NativeCheckpointRegionCompilerProbeAnnotation(paths: String) extends NoTargetAnnotation with Unserializable
 case class NativeCheckpointShellCompilerProbeAnnotation(paths: String) extends NoTargetAnnotation with Unserializable
-case class NativeCheckpointRegionCutSnapshotProbeAnnotation(owners: String) extends NoTargetAnnotation with Unserializable
+case class NativeCheckpointRegionCutSnapshotProbeAnnotation(owners: String, includeRouterState: Boolean = false) extends NoTargetAnnotation with Unserializable
 object NativeCheckpointRegionCutSnapshotProbeAnnotation extends HasShellOptions {
   val options = Seq(new ShellOption[String](
     longOption = "simulator-native-region-cut-snapshot-probe",
     toAnnotationSeq = value => Seq(NativeCheckpointRegionCutSnapshotProbeAnnotation(value)),
     helpText = "Attach atomic regional cut-control staging; comma-separated ordered external owners, diagnostic only, no MMIO hookup or image admission.",
+  ), new ShellOption[String](
+    longOption = "simulator-native-region-cut-router-snapshot-probe",
+    toAnnotationSeq = value => Seq(NativeCheckpointRegionCutSnapshotProbeAnnotation(value, true)),
+    helpText = "Stage complete shared/physical router vectors with regional cut control at the same raw edge; no restore or image admission.",
   ))
 }
 case class NativeCheckpointRegisterSnapshotProbeAnnotation(path: String, includeAsyncMemories: Boolean = false,
@@ -278,7 +282,8 @@ object NativeCheckpointRegionCompilerProbe {
       }
       status("regional_network_reconstructed_incomplete")
       if (cutRequest.nonEmpty) {
-        val snapshot = NativeCheckpointRegionCutSnapshot.generate(regions, cutOwners(cutRequest.head.owners))
+        val snapshot = NativeCheckpointRegionCutSnapshot.generate(regions, cutOwners(cutRequest.head.owners),
+          includeRouterState = cutRequest.head.includeRouterState)
         state("cut-snapshot-parent", snapshot.cut.state)
         save("cut-snapshot-parent-binding.json", snapshot.cut.binding)
         save("cut-snapshot-graft-binding.json", snapshot.cut.graft.binding)

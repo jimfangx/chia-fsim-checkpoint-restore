@@ -18,7 +18,7 @@ object NativeCheckpointRegionCutSnapshot {
   val instance = "checkpoint_region_cut_snapshot"
   val definition = "CheckpointRegionCutSnapshot"
   case class Result(state: CircuitState, cut: NativeCheckpointRegionClockCut.Result,
-      files: Seq[GoldenGateOutputFileAnnotation], binding: String)
+      files: Seq[GoldenGateOutputFileAnnotation], binding: String, includeRouterState: Boolean = false)
   private def check(ok: Boolean, why: String): Unit =
     require(ok, "native region cut snapshot: " + why)
   private def all(s: Statement): Seq[Statement] = {
@@ -27,15 +27,25 @@ object NativeCheckpointRegionCutSnapshot {
     visit(s); out.toSeq
   }
 
-  def generate(source: NativeCheckpointRegions.Result, owners: Seq[String]): Result = {
+  def generate(source: NativeCheckpointRegions.Result, owners: Seq[String],
+      includeRouterState: Boolean = false): Result = {
     // Regenerate rather than accepting a caller-supplied, potentially modified
     // cut. This authenticates original regions, owners and raw-clock routing.
-    val cut = NativeCheckpointRegionClockCut.generate(source, owners)
+    val cut = NativeCheckpointRegionClockCut.generate(source, owners, observeRouterState = includeRouterState)
     val root = cut.state.circuit.modules.collectFirst {
       case m: Module if m.name == cut.state.circuit.main => m
     }.get
     val JString(clock) = parse(cut.binding) \ "raw_clock"
-    val bits = source.descriptors.physicalClockGates + 71
+    val controlBits = source.descriptors.physicalClockGates + 71
+    val routerObservation = parse(cut.graft.binding) \ "router_state_observation"
+    val routerBits = if (!includeRouterState) 0 else {
+      val JInt(width) = routerObservation \ "bits"
+      check(width > 0 && width.isValidInt, "invalid complete router observation width")
+      check(root.ports.contains(Port(NoInfo, "capture_router_state", Output, UIntType(IntWidth(width)))),
+        "missing complete router observation")
+      width.toInt
+    }
+    val bits = controlBits + routerBits
     check(!(root.ports.map(_.name) ++ all(root.body).collect { case d: IsDeclaration => d.name })
       .exists(n => n.startsWith(prefix) || n == instance) &&
       !cut.state.circuit.modules.exists {
@@ -99,7 +109,10 @@ object NativeCheckpointRegionCutSnapshot {
       p(prefix + "word_error", Output), p(prefix + "error", Output, 6),
       p(prefix + "captured_control_state", Output, bits), p(prefix + "staging_control_state", Output, bits + 71))
     val connections = Seq(Connect(NoInfo, pin("clock"), ref(clock, ClockType))) ++
-      inputs.map(p => Connect(NoInfo, pin(p.name), ref(in(p.name), p.tpe))) ++
+      inputs.map(p => Connect(NoInfo, pin(p.name), if (p.name == "live_control_state" && includeRouterState)
+        DoPrim(firrtl.PrimOps.Cat, Seq(ref("capture_router_state", uint(routerBits)),
+          ref("capture_cut_control_state", uint(controlBits))), Nil, uint(bits))
+        else ref(in(p.name), p.tpe))) ++
       outputs.map(p => Connect(NoInfo, ref(out(p.name), p.tpe), pin(p.name)))
     val rewritten = root.copy(ports = root.ports ++ extra, body = Block(
       originalPorts.map(p => DefWire(NoInfo, renamed(p.name), p.tpe)) ++ Seq(
@@ -115,7 +128,12 @@ object NativeCheckpointRegionCutSnapshot {
       val body = try resource.mkString finally resource.close()
       GoldenGateOutputFileAnnotation(body, suffix)
     }
-    val binding = canonical(JObject(List("snapshot_version" -> JInt(1),
+    val routerBinding = if (!includeRouterState) Nil else List(
+      "controller_state_bits" -> JInt(controlBits), "router_state_bits" -> JInt(routerBits),
+      "router_state_offset" -> JInt(controlBits), "router_state_observation" -> routerObservation,
+      "router_observation_atomically_staged" -> JBool(true),
+      "payload_layout_lsb0" -> JArray(List(JString("cut_control"), JString("router_state"))))
+    val binding = canonical(JObject(List("snapshot_version" -> JInt(if (includeRouterState) 2 else 1),
       "scope" -> JString("selected_native_regions_atomic_cut_control_observation_only"),
       "cut_binding_sha256" -> JString(sha256(cut.binding)),
       "attached_sha256" -> JString(sha256(flowed.serialize)),
@@ -126,12 +144,12 @@ object NativeCheckpointRegionCutSnapshot {
       "controller_observation_atomically_staged" -> JBool(true),
       "readout_router_state_atomically_owned" -> JBool(false), "staging_owner_restore_supported" -> JBool(false),
       "complete_fpga_capture" -> JBool(false), "deployable_capture_image" -> JBool(false),
-      "metasim_restore_supported" -> JBool(false))))
-    Result(cut.state.copy(circuit = flowed), cut, cut.files ++ resources, binding)
+      "metasim_restore_supported" -> JBool(false)) ++ routerBinding))
+    Result(cut.state.copy(circuit = flowed), cut, cut.files ++ resources, binding, includeRouterState)
   }
 
   def validate(source: NativeCheckpointRegions.Result, owners: Seq[String], result: Result): Unit = {
-    val expected = generate(source, owners)
+    val expected = generate(source, owners, result.includeRouterState)
     check(result == expected, "attached atomic snapshot differs from independent regeneration")
   }
 }

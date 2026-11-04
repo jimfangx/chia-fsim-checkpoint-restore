@@ -19,7 +19,7 @@ object NativeCheckpointRegionClockCut {
   val instance = "checkpoint_region_clock_cut"
   val definition = "CheckpointPhysicalClockCut"
   case class Result(state: CircuitState, graft: NativeCheckpointRegionGraft.Result,
-      files: Seq[GoldenGateOutputFileAnnotation], binding: String)
+      files: Seq[GoldenGateOutputFileAnnotation], binding: String, observeRouterState: Boolean = false)
   private def check(ok: Boolean, why: String): Unit =
     require(ok, "native region common cut: " + why)
   private def all(s: Statement): Seq[Statement] = {
@@ -28,9 +28,10 @@ object NativeCheckpointRegionClockCut {
     visit(s); out.toSeq
   }
 
-  def generate(source: NativeCheckpointRegions.Result, owners: Seq[String]): Result = {
+  def generate(source: NativeCheckpointRegions.Result, owners: Seq[String],
+      observeRouterState: Boolean = false): Result = {
     // Reconstruct all source, descriptors, CE bit order and graft endpoints.
-    val graft = NativeCheckpointRegionGraft.generate(source)
+    val graft = NativeCheckpointRegionGraft.generate(source, observeRouterState = observeRouterState)
     check(source.regions.nonEmpty && source.shells.isEmpty,
       "native regions without shell/borrowed-reader owners required")
     check(owners.nonEmpty && owners.size <= 65535 && owners.distinct.size == owners.size &&
@@ -150,11 +151,11 @@ object NativeCheckpointRegionClockCut {
       "reset_writer_owners_bound" -> JBool(false), "production_freeze_owners_bound" -> JBool(false),
       "controller_state_atomically_owned" -> JBool(false), "complete_fpga_capture" -> JBool(false),
       "deployable_capture_image" -> JBool(false), "metasim_restore_supported" -> JBool(false))))
-    Result(graft.state.copy(circuit = flowed), graft, graft.files :+ file, binding)
+    Result(graft.state.copy(circuit = flowed), graft, graft.files :+ file, binding, observeRouterState)
   }
 
   def validate(source: NativeCheckpointRegions.Result, owners: Seq[String], result: Result): Unit = {
-    val expected = generate(source, owners)
+    val expected = generate(source, owners, result.observeRouterState)
     check(result.state == expected.state && result.graft == expected.graft &&
       result.files == expected.files && result.binding == expected.binding,
       "attached common-cut circuit differs from independent regeneration")

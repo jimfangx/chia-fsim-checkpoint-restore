@@ -88,9 +88,9 @@ class NativeCheckpointRegionCutSnapshotSpec extends AnyFlatSpec {
       .contains("identifier collision"))
   }
 
-  it should "emit the source-bound staged circuit beside its independently auditable original cut" in {
-    save(regions, "native-regions-cut-snapshot")
-    val out = Paths.get(sys.env("CHECKPOINT_TEST_ARTIFACT_DIR")).resolve("native-regions-cut-snapshot")
+  private def saveSnapshot(snapshot: NativeCheckpointRegionCutSnapshot.Result, name: String): Unit = {
+    save(regions, name)
+    val out = Paths.get(sys.env("CHECKPOINT_TEST_ARTIFACT_DIR")).resolve(name)
     def write(n: String, text: String): Unit = Files.write(out.resolve(n), text.getBytes(UTF_8))
     def emit(state: firrtl.CircuitState): String = {
       val placement = midas.targetutils.xdc.XDCPathToCircuitAnnotation(None, Some("shell/CL"))
@@ -101,6 +101,10 @@ class NativeCheckpointRegionCutSnapshotSpec extends AnyFlatSpec {
         .getEmittedCircuit.value
     }
     val cut = snapshot.cut
+    write("grafted.fir", cut.graft.state.circuit.serialize)
+    write("grafted-annotations.json", firrtl.annotations.JsonProtocol.serialize(cut.graft.state.annotations))
+    write("grafted.sv", emit(cut.graft.state))
+    cut.graft.files.foreach(f => write("FireSim-generated" + f.fileSuffix, f.body))
     write("attached.fir", cut.state.circuit.serialize)
     write("attached-annotations.json", firrtl.annotations.JsonProtocol.serialize(cut.state.annotations))
     write("cut-binding.json", cut.binding)
@@ -112,5 +116,43 @@ class NativeCheckpointRegionCutSnapshotSpec extends AnyFlatSpec {
     write("staged.sv", emit(snapshot.state))
     snapshot.files.filterNot(f => cut.graft.files.contains(f)).foreach(f => write("FireSim-generated" + f.fileSuffix, f.body))
     assert(Files.readString(out.resolve("staged.sv")).contains("CheckpointRegionCutSnapshot #("))
+  }
+
+  it should "emit the source-bound staged circuit beside its independently auditable original cut" in {
+    saveSnapshot(snapshot, "native-regions-cut-snapshot")
+  }
+
+  it should "stage every shared and physical router bit at the same preedge without changing defaults" in {
+    val result = NativeCheckpointRegionCutSnapshot.generate(regions, owners, includeRouterState = true)
+    NativeCheckpointRegionCutSnapshot.validate(regions, owners, result)
+    NativeCheckpointRegionClockCut.validate(regions, owners, result.cut)
+    val b = parse(result.binding)
+    assert((b \ "snapshot_version") == JInt(2))
+    assert((b \ "controller_state_bits") == JInt(75))
+    assert((b \ "router_state_bits") == JInt(7))
+    assert((b \ "control_state_bits") == JInt(82))
+    assert((b \ "staging_owner_bits") == JInt(153))
+    assert((b \ "router_observation_atomically_staged") == JBool(true))
+    val rows = (b \ "router_state_observation" \ "owners").asInstanceOf[JArray].arr
+    assert(rows.map(_ \ "offset") == List(JInt(0), JInt(3), JInt(5)))
+    assert(rows.map(_ \ "bits") == List(JInt(3), JInt(2), JInt(2)))
+    assert(rows.map(_ \ "instance") == List(JString("checkpoint_region_readout_adapter.router"),
+      JString("checkpoint_region_readout_adapter.region0.router"), JString("checkpoint_region_readout_adapter.region1.router")))
+    val root = result.state.circuit.modules.find(_.name == "NativeHost").get.asInstanceOf[Module]
+    val c = all(root.body).collect { case x: Connect => x.loc.serialize -> x.expr.serialize }.toMap
+    assert(c("checkpoint_region_cut_snapshot.live_control_state") == "cat(capture_router_state, capture_cut_control_state)")
+    assert(result.cut.graft.files.find(_.fileSuffix == ".native-region-graft.sv").get.body.contains(
+      ".capture_state(capture_router_state[0 +: 3])"))
+    (0 until 2).foreach { i =>
+      val body = result.cut.graft.files.find(_.fileSuffix == s".native-region-graft-$i.sv").get.body
+      assert(body.contains(".capture_state(capture_router_state)"))
+      assert(body.contains(".restore_hold(1'b0),.restore_load(1'b0),.restore_state(2'b0)"))
+    }
+    assert((parse(snapshot.cut.graft.binding) \ "router_state_observation") == JNothing)
+    intercept[IllegalArgumentException](NativeCheckpointRegionCutSnapshot.validate(regions, owners,
+      result.copy(includeRouterState = false)))
+    Seq("readout_router_state_atomically_owned", "staging_owner_restore_supported", "complete_fpga_capture",
+      "deployable_capture_image", "metasim_restore_supported").foreach(k => assert((b \ k) == JBool(false)))
+    saveSnapshot(result, "native-regions-cut-router-snapshot")
   }
 }

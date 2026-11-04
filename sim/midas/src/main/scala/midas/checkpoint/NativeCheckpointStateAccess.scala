@@ -64,7 +64,7 @@ object NativeCheckpointStateAccess {
     */
   private[checkpoint] def render(root: Module, name: String, clock: String, gates: Int,
       entries: Seq[StateAccessEntry], ceModule: String, sideband: String,
-      adapterPorts: Option[Seq[Port]] = None): String = {
+      adapterPorts: Option[Seq[Port]] = None, observeRouterState: Boolean = false): String = {
     def port(p: Port): String = {
       val (signed, width) = p.tpe match {
         case UIntType(IntWidth(w)) if w > 0 => ("", w)
@@ -82,7 +82,7 @@ object NativeCheckpointStateAccess {
     s"""// Generated native state/CE routing companion. Complete capture is unsupported.
 module $name (
 ${adapterPorts.getOrElse(root.ports).map(port).mkString(",\n")},
-  input wire capture_reset, capture_clock_mask, capture_read_enable,
+${if (observeRouterState) "  output wire [1:0] capture_router_state,\n" else ""}  input wire capture_reset, capture_clock_mask, capture_read_enable,
   input wire [${gates-1}:0] capture_captured_ce,
   output wire [${gates-1}:0] capture_logical_ce,
   input wire [31:0] capture_descriptor_entry,
@@ -124,7 +124,7 @@ $cases
   wire [15:0] endpoint_slot;
   wire [31:0] endpoint_address;
   CheckpointPhysicalStateRouter #(.ENTRIES(${entries.size}),.GATES($gates)) router(
-    .capture_state(),.restore_hold(1'b0),.restore_load(1'b0),.restore_state(2'b0),.restore_error(),
+    .capture_state(${if (observeRouterState) "capture_router_state" else ""}),.restore_hold(1'b0),.restore_load(1'b0),.restore_state(2'b0),.restore_error(),
     .clock($clock),.reset(capture_reset),
     .descriptor_entry(capture_descriptor_entry),.descriptor_valid(capture_descriptor_valid),
     .descriptor_bank(capture_descriptor_bank),.descriptor_slot(capture_descriptor_slot),
