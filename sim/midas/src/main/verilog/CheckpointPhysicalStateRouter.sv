@@ -3,10 +3,11 @@
 // source clock and reset. The upstream transport owns cut/abort/publication.
 // An accepted request pins its destination until the response is drained, even
 // if capture abort releases the owners or upstream selectors subsequently move.
-// This does not admit complete production ownership or supply a restore path.
+// The opt-in held restore owns only this router, never its endpoints/global cut.
 module CheckpointPhysicalStateRouter #(
     parameter integer ENTRIES = 1,
-    parameter integer GATES = 3
+    parameter integer GATES = 3,
+    parameter integer RESTORE_SUPPORTED = 0
 ) (
     input wire clock, reset,
     input wire [31:0] descriptor_entry,
@@ -37,7 +38,12 @@ module CheckpointPhysicalStateRouter #(
     input wire functional_response_valid, ce_response_valid,
     output wire functional_response_ready, ce_response_ready,
     input wire [63:0] functional_response_data, ce_response_data,
-    input wire functional_response_error, ce_response_error
+    input wire functional_response_error, ce_response_error,
+    // Complete original storage, including an inactive endpoint selection.
+    output wire [1:0] capture_state,
+    input wire restore_hold, restore_load,
+    input wire [1:0] restore_state,
+    output wire restore_error
 );
     // Physical bank 255 cannot alias a generated functional-bank descriptor.
     // Reject malformed CE layouts before the transport issues their reads.
@@ -60,30 +66,43 @@ module CheckpointPhysicalStateRouter #(
     assign descriptor_depth = !descriptor_valid ? 32'd0 : select_ce_descriptor ? ce_descriptor_depth : functional_descriptor_depth;
 
     reg pending, selected_ce;
+    wire holding = RESTORE_SUPPORTED != 0 && restore_hold;
+    wire loading = RESTORE_SUPPORTED != 0 && restore_load;
+    assign capture_state = {selected_ce, pending};
+    // The caller keeps hold through complete endpoint/owner readback. A load
+    // outside hold preserves all state and suppresses every handshake.
+    assign restore_error = loading && (!holding || !geometry_valid);
+    wire running = !reset && !holding && !restore_error;
     wire route_ce = bank == 8'd255;
     assign endpoint_bank = bank;
     assign endpoint_slot = slot;
     assign endpoint_address = address;
-    assign request_ready = !reset && !pending && geometry_valid &&
+    assign request_ready = running && !pending && geometry_valid &&
                            (route_ce ? ce_request_ready : functional_request_ready);
-    assign functional_request_valid = !reset && !pending && geometry_valid && request_valid && !route_ce;
-    assign ce_request_valid = !reset && !pending && geometry_valid && request_valid && route_ce;
-    assign response_valid = !reset && pending &&
+    assign functional_request_valid = running && !pending && geometry_valid && request_valid && !route_ce;
+    assign ce_request_valid = running && !pending && geometry_valid && request_valid && route_ce;
+    assign response_valid = running && pending &&
                             (selected_ce ? ce_response_valid : functional_response_valid);
     assign response_data = !response_valid ? 64'd0 : selected_ce ? ce_response_data : functional_response_data;
     assign response_error = response_valid && (selected_ce ? ce_response_error : functional_response_error);
-    assign functional_response_ready = !reset && pending && !selected_ce && response_ready;
-    assign ce_response_ready = !reset && pending && selected_ce && response_ready;
+    assign functional_response_ready = running && pending && !selected_ce && response_ready;
+    assign ce_response_ready = running && pending && selected_ce && response_ready;
     always @(posedge clock) begin
         if (reset) begin
             pending <= 0;
             selected_ce <= 0;
-        end else begin
+        end else if (loading && holding && !restore_error) begin
+            {selected_ce, pending} <= restore_state;
+        end else if (running) begin
             if (response_valid && response_ready) pending <= 0;
             if (request_valid && request_ready) begin
                 pending <= 1;
                 selected_ce <= route_ce;
             end
         end
+    end
+    initial begin
+        if (RESTORE_SUPPORTED != 0 && RESTORE_SUPPORTED != 1)
+            $fatal(1, "checkpoint physical router restore opt-in");
     end
 endmodule

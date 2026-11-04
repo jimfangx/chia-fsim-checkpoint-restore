@@ -193,6 +193,8 @@ class NativeFunctionalBankSpec extends AnyFlatSpec {
     val b = GeneratedStateBankAccess.generatePhysicalCompanion(s, m, p, d)
     val w = PhysicalClockCutWiring.generateNative(s, m, p, d, b)
     val files = NativeCheckpointStateAccess.emit(s, m, p, d, b, w)
+    val accessRTL = files.find(_.fileSuffix == ".native-state-access.sv").get.body
+    assert(accessRTL.contains(".capture_state(),.restore_hold(1'b0),.restore_load(1'b0),.restore_state(2'b0),.restore_error(),"))
     val rtl = files.head.body
     val binding = parse(files.find(_.fileSuffix == ".native-state-access.json").get.body)
     assert(rtl.contains("NativeStorage network(") && rtl.contains("NativeStorageCheckpointPhysicalCEBank ce_endpoint("))

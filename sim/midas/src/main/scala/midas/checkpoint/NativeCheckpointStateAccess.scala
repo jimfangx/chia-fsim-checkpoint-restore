@@ -124,6 +124,7 @@ $cases
   wire [15:0] endpoint_slot;
   wire [31:0] endpoint_address;
   CheckpointPhysicalStateRouter #(.ENTRIES(${entries.size}),.GATES($gates)) router(
+    .capture_state(),.restore_hold(1'b0),.restore_load(1'b0),.restore_state(2'b0),.restore_error(),
     .clock($clock),.reset(capture_reset),
     .descriptor_entry(capture_descriptor_entry),.descriptor_valid(capture_descriptor_valid),
     .descriptor_bank(capture_descriptor_bank),.descriptor_slot(capture_descriptor_slot),
