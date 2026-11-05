@@ -19,7 +19,8 @@ object NativeCheckpointRegionClockCut {
   val instance = "checkpoint_region_clock_cut"
   val definition = "CheckpointPhysicalClockCut"
   case class Result(state: CircuitState, graft: NativeCheckpointRegionGraft.Result,
-      files: Seq[GoldenGateOutputFileAnnotation], binding: String, observeRouterState: Boolean = false)
+      files: Seq[GoldenGateOutputFileAnnotation], binding: String, observeRouterState: Boolean = false,
+      restoreController: Boolean = false)
   private def check(ok: Boolean, why: String): Unit =
     require(ok, "native region common cut: " + why)
   private def all(s: Statement): Seq[Statement] = {
@@ -29,7 +30,7 @@ object NativeCheckpointRegionClockCut {
   }
 
   def generate(source: NativeCheckpointRegions.Result, owners: Seq[String],
-      observeRouterState: Boolean = false): Result = {
+      observeRouterState: Boolean = false, restoreController: Boolean = false): Result = {
     // Reconstruct all source, descriptors, CE bit order and graft endpoints.
     val graft = NativeCheckpointRegionGraft.generate(source, observeRouterState = observeRouterState)
     check(source.regions.nonEmpty && source.shells.isEmpty,
@@ -64,7 +65,7 @@ object NativeCheckpointRegionClockCut {
     val controller = ExtModule(NoInfo, definition,
       Seq(Port(NoInfo, "clock", Input, ClockType)) ++ controllerInputs ++ controllerOutputs, definition,
       Seq(IntParam("GATES", gates), IntParam("OWNERS", owners.size),
-        IntParam("EXTERNAL_CLOCK_NETWORK", 1), IntParam("RESTORE_ENABLE", 0)))
+        IntParam("EXTERNAL_CLOCK_NETWORK", 1), IntParam("RESTORE_ENABLE", if (restoreController) 1 else 0)))
     val owned = Map("capture_clock_mask" -> 1, "capture_read_enable" -> 1, "capture_captured_ce" -> gates)
     owned.foreach { case (n, w) =>
       check(root.ports.count(p => p.name == n && p.direction == Input && p.tpe == uint(w)) == 1,
@@ -76,6 +77,7 @@ object NativeCheckpointRegionClockCut {
     check(rawPorts.size == handshake.size, "missing readout handshake")
     def ref(n: String, t: Type = bit): Expression = WRef(n, t)
     def and(a: Expression, b: Expression): Expression = DoPrim(firrtl.PrimOps.And, Seq(a, b), Nil, bit)
+    def or(a: Expression, b: Expression): Expression = DoPrim(firrtl.PrimOps.Or, Seq(a, b), Nil, bit)
     def pin(n: String): Expression = WSubField(WRef(instance), n)
     def expr(e: Expression): Expression = e match {
       case r: WRef if raw.contains(r.name) => r.copy(name = raw(r.name))
@@ -88,14 +90,29 @@ object NativeCheckpointRegionClockCut {
     val accept = and(and(ref("capture_request_valid"), ref(raw("capture_request_ready"))), and(permission, requested))
     val finish = and(and(ref(raw("capture_response_valid")), ref("capture_response_ready")), permission)
     val one = UIntLiteral(1, IntWidth(1)); val zero = UIntLiteral(0, IntWidth(1))
+    val hold = ref(prefix + "restore_hold")
+    val loadPos = ref(prefix + "restore_load_pos")
+    val loadNeg = ref(prefix + "restore_load_neg")
+    // An unheld load is rejected but still parks the physical mask. The
+    // destination must hold from before its first raw edge, load both edge
+    // domains, read back the complete vector and keep holding permanently.
+    // There is deliberately no functional-resume contract on this interface.
+    val restoring = or(hold, or(loadPos, loadNeg))
+    val donor = ref(prefix + "restore_state", uint(gates + 71))
+    def slice(hi: Int, lo: Int): Expression =
+      DoPrim(firrtl.PrimOps.Bits, Seq(donor), Seq(BigInt(hi), BigInt(lo)), uint(hi - lo + 1))
+    val normalPending = Mux(accept, one, Mux(finish, zero, ref(pending), bit), bit)
+    val restoredPending = if (!restoreController) normalPending else
+      Mux(restoring, Mux(and(hold, loadPos), slice(gates + 70, gates + 70), ref(pending), bit), normalPending, bit)
     val pendingReg = DefRegister(NoInfo, pending, bit, ref(clock, ClockType), zero, ref(pending))
     val connections = Seq(
-      Connect(NoInfo, ref(pending), Mux(ref("capture_reset"), zero,
-        Mux(accept, one, Mux(finish, zero, ref(pending), bit), bit), bit)),
+      Connect(NoInfo, ref(pending), Mux(ref("capture_reset"), zero, restoredPending, bit)),
       Connect(NoInfo, pin("clock"), ref(clock, ClockType)), Connect(NoInfo, pin("reset"), ref("capture_reset")),
-      Connect(NoInfo, pin("restore_hold"), zero), Connect(NoInfo, pin("restore_load_pos"), zero),
-      Connect(NoInfo, pin("restore_load_neg"), zero),
-      Connect(NoInfo, pin("restore_state"), UIntLiteral(0, IntWidth(gates + 70))),
+      Connect(NoInfo, pin("restore_hold"), if (restoreController) restoring else zero),
+      Connect(NoInfo, pin("restore_load_pos"), if (restoreController) and(hold, loadPos) else zero),
+      Connect(NoInfo, pin("restore_load_neg"), if (restoreController) and(hold, loadNeg) else zero),
+      Connect(NoInfo, pin("restore_state"), if (restoreController) slice(gates + 69, 0)
+        else UIntLiteral(0, IntWidth(gates + 70))),
       Connect(NoInfo, pin("freeze_request"), DoPrim(firrtl.PrimOps.Or, Seq(requested, ref(pending)), Nil, bit)),
       Connect(NoInfo, pin("ce"), ref("capture_logical_ce", uint(gates))),
       Connect(NoInfo, pin("target_cycle"), ref(prefix + "target_cycle", uint(64))),
@@ -113,7 +130,10 @@ object NativeCheckpointRegionClockCut {
         Connect(NoInfo, ref(prefix + "pending"), ref(pending)),
         Connect(NoInfo, ref(prefix + "control_state", uint(gates + 71)),
           DoPrim(firrtl.PrimOps.Cat, Seq(ref(pending), pin("control_state")), Nil, uint(gates + 71))))
-    val extra = Seq(p(prefix + "freeze_request", Input), p(prefix + "target_cycle", Input, 64),
+    val restorePorts = if (!restoreController) Nil else Seq(p(prefix + "restore_hold", Input),
+      p(prefix + "restore_load_pos", Input), p(prefix + "restore_load_neg", Input),
+      p(prefix + "restore_state", Input, gates + 71))
+    val extra = restorePorts ++ Seq(p(prefix + "freeze_request", Input), p(prefix + "target_cycle", Input, 64),
       p(prefix + "owner_present", Input, owners.size), p(prefix + "stopped", Output), p(prefix + "failed", Output),
       p(prefix + "cycle", Output, 64), p(prefix + "error", Output, 3), p(prefix + "control_state", Output, gates + 71),
       p(prefix + "pending", Output))
@@ -129,7 +149,13 @@ object NativeCheckpointRegionClockCut {
     val resource = scala.io.Source.fromResource("CheckpointPhysicalClockCut.sv")
     val body = try resource.mkString finally resource.close()
     val file = GoldenGateOutputFileAnnotation(body, ".native-region-cut-controller.sv")
-    val binding = canonical(JObject(List("cut_version" -> JInt(1),
+    val restoreBinding = if (!restoreController) Nil else List(
+      "controller_restore_supported" -> JBool(true), "controller_restore_extra_storage_bits" -> JInt(0),
+      "controller_restore_contract" -> JString("complete_vector_raw_posedge_and_negedge_under_permanent_hold_before_first_raw_edge"),
+      "controller_restore_unheld_load" -> JString("reject_load_and_park_mask"),
+      "controller_restore_resume_supported" -> JBool(false),
+      "router_endpoint_functional_restore_supported" -> JBool(false))
+    val binding = canonical(JObject(List("cut_version" -> JInt(if (restoreController) 2 else 1),
       "scope" -> JString("selected_native_regions_common_low_phase_capture_only"),
       "regions_binding_sha256" -> JString(sha256(source.binding)),
       "graft_binding_sha256" -> JString(sha256(graft.binding)),
@@ -150,14 +176,13 @@ object NativeCheckpointRegionClockCut {
       "target_time_authority_proven" -> JBool(false), "external_writer_owners_bound" -> JBool(false),
       "reset_writer_owners_bound" -> JBool(false), "production_freeze_owners_bound" -> JBool(false),
       "controller_state_atomically_owned" -> JBool(false), "complete_fpga_capture" -> JBool(false),
-      "deployable_capture_image" -> JBool(false), "metasim_restore_supported" -> JBool(false))))
-    Result(graft.state.copy(circuit = flowed), graft, graft.files :+ file, binding, observeRouterState)
+      "deployable_capture_image" -> JBool(false), "metasim_restore_supported" -> JBool(false)) ++ restoreBinding))
+    Result(graft.state.copy(circuit = flowed), graft, graft.files :+ file, binding, observeRouterState, restoreController)
   }
 
   def validate(source: NativeCheckpointRegions.Result, owners: Seq[String], result: Result): Unit = {
-    val expected = generate(source, owners, result.observeRouterState)
-    check(result.state == expected.state && result.graft == expected.graft &&
-      result.files == expected.files && result.binding == expected.binding,
+    val expected = generate(source, owners, result.observeRouterState, result.restoreController)
+    check(result == expected,
       "attached common-cut circuit differs from independent regeneration")
   }
 }

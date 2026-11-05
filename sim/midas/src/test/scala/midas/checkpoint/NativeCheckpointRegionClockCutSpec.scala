@@ -81,6 +81,32 @@ class NativeCheckpointRegionClockCutSpec extends AnyFlatSpec {
       e.ports.find(_.name == "owner_present").get.tpe }.get == UIntType(IntWidth(2)))
   }
 
+  it should "restore the complete two-edge controller and accepted-request owner only under explicit held opt-in" in {
+    val restored = NativeCheckpointRegionClockCut.generate(regions, owners, restoreController = true)
+    NativeCheckpointRegionClockCut.validate(regions, owners, restored)
+    val root = restored.state.circuit.modules.find(_.name == "NativeHost").get.asInstanceOf[Module]
+    val connections = all(root.body).collect { case c: Connect => c.loc.serialize -> c.expr.serialize }.toMap
+    assert(root.ports.find(_.name == "capture_cut_restore_state").get.tpe == UIntType(IntWidth(75)))
+    assert(connections("checkpoint_region_clock_cut.restore_hold") ==
+      "or(capture_cut_restore_hold, or(capture_cut_restore_load_pos, capture_cut_restore_load_neg))")
+    assert(connections("checkpoint_region_clock_cut.restore_load_pos") ==
+      "and(capture_cut_restore_hold, capture_cut_restore_load_pos)")
+    assert(connections("checkpoint_region_clock_cut.restore_load_neg") ==
+      "and(capture_cut_restore_hold, capture_cut_restore_load_neg)")
+    assert(connections("checkpoint_region_clock_cut.restore_state") == "bits(capture_cut_restore_state, 73, 0)")
+    assert(connections("capture_cut_accepted_pending").contains("bits(capture_cut_restore_state, 74, 74)"))
+    assert(connections("capture_cut_accepted_pending").startsWith("mux(capture_reset, UInt<1>(\"h0\"), mux(or("))
+    assert((parse(restored.binding) \ "controller_restore_extra_storage_bits") == JInt(0))
+    Seq("controller_restore_resume_supported", "router_endpoint_functional_restore_supported",
+      "complete_fpga_capture", "deployable_capture_image").foreach(k => assert((parse(restored.binding) \ k) == JBool(false)))
+    assert(!cut.state.circuit.modules.find(_.name == "NativeHost").get.asInstanceOf[Module]
+      .ports.exists(_.name.startsWith("capture_cut_restore_")))
+    intercept[IllegalArgumentException](NativeCheckpointRegionClockCut.validate(regions, owners,
+      restored.copy(restoreController = false)))
+    intercept[IllegalArgumentException](NativeCheckpointRegionClockCut.validate(regions, owners,
+      restored.copy(state = cut.state)))
+  }
+
   it should "reject changed circuitry rehashed bindings owner order and source resources" in {
     val changed = cut.state.copy(circuit = cut.state.circuit.copy(info = FileInfo(StringLit("changed"))))
     val coherent = SemanticStateInventory.canonical(parse(cut.binding) merge JObject(List(
@@ -127,5 +153,26 @@ class NativeCheckpointRegionClockCutSpec extends AnyFlatSpec {
     write("attached.sv", emitted)
     assert(emitted.contains("CheckpointPhysicalClockCut #("))
     assert(emitted.contains("capture_cut_accepted_pending"))
+  }
+
+  it should "emit the complete held-controller attachment without changing original execution storage" in {
+    val restored = NativeCheckpointRegionClockCut.generate(regions, owners, restoreController = true)
+    save(regions, "native-regions-controller-restore")
+    val out = Paths.get(sys.env("CHECKPOINT_TEST_ARTIFACT_DIR")).resolve("native-regions-controller-restore")
+    def write(n: String, text: String): Unit = Files.write(out.resolve(n), text.getBytes(UTF_8))
+    write("attached.fir", restored.state.circuit.serialize)
+    write("cut-binding.json", restored.binding)
+    restored.files.filterNot(f => restored.graft.files.contains(f))
+      .foreach(f => write("FireSim-generated" + f.fileSuffix, f.body))
+    // Include the actual native graft resources and exact emitted clock constraints.
+    restored.graft.files.foreach(f => write("FireSim-generated" + f.fileSuffix, f.body))
+    val placement = midas.targetutils.xdc.XDCPathToCircuitAnnotation(None, Some("shell/CL"))
+    val constrained = midas.passes.WriteXDCFile.execute(restored.state.copy(annotations = restored.state.annotations :+ placement))
+    val emitter = new SemanticCleanEmitter
+    val emitted = new Compiler(Seq(firrtl.options.Dependency.fromTransform(emitter)), Forms.LowForm, Set(emitter))
+      .execute(constrained.copy(annotations = constrained.annotations :+ firrtl.EmitCircuitAnnotation(emitter.getClass)))
+      .getEmittedCircuit.value
+    write("attached.sv", emitted)
+    assert(emitted.contains(".RESTORE_ENABLE(1)"))
   }
 }
